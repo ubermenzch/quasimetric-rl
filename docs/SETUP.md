@@ -27,15 +27,7 @@ All supplied paths are relative to this directory. By default, external assets
 are stored in the sibling directory `../qrl-assets/`; set `QRL_ASSET_ROOT` only
 when a different asset location is needed.
 
-## Install System And Python Dependencies
-
-Install the graphics and build libraries on a Debian/Ubuntu host:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential git patchelf libgl1-mesa-glx \
-    libosmesa6-dev libglew-dev libglfw3 libglfw3-dev
-```
+## Automated Setup
 
 Confirm that the NVIDIA driver is available:
 
@@ -43,15 +35,24 @@ Confirm that the NVIDIA driver is available:
 nvidia-smi
 ```
 
-Create the isolated Python 3.9 environment:
+On a Debian/Ubuntu host with Python 3.9, the following command installs system
+packages, creates the Python environment, downloads MuJoCo 2.1.0 and all nine
+required D4RL datasets (about 1.6GB), verifies their checksums, and runs the
+CUDA/MuJoCo smoke test:
 
 ```bash
-PYTHON_BIN=python3.9 tools/bootstrap_environment.sh
+PYTHON_BIN=python3.9 tools/setup_environment.sh
 ```
 
-The bootstrap script installs PyTorch 2.8.0 from the CUDA 12.8 wheel index by
-default. This is a default, not a hardware requirement. Select a compatible
-wheel index when the target driver needs a different CUDA runtime:
+The script uses `sudo` only for Debian/Ubuntu system packages. `--skip-system`,
+`--skip-python`, `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow
+partial setup. It accepts `QRL_ASSET_ROOT` for a different asset location and
+URL overrides for an internal mirror. MuJoCo and every dataset are validated
+before use.
+
+The nested bootstrap script installs PyTorch 2.8.0 from the CUDA 12.8 wheel
+index by default. This is a default, not a hardware requirement. Select a
+compatible wheel index when the target driver needs a different CUDA runtime:
 
 ```bash
 TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
@@ -77,8 +78,8 @@ Use the following asset layout next to the clone:
     model/
 ```
 
-Copy the assets from a trusted machine or artifact store. For example, while in
-the repository root:
+`tools/setup_environment.sh` creates this layout automatically. To reuse an
+existing artifact store instead, copy the assets while in the repository root:
 
 ```bash
 mkdir -p ../qrl-assets/d4rl/datasets ../qrl-assets/mujoco
