@@ -19,6 +19,9 @@ export QRL_USER_GRAPHICS_PREFIX="$(realpath -m "${QRL_USER_GRAPHICS_PREFIX:-${QR
 if [[ -d "${QRL_USER_GRAPHICS_PREFIX}/include" ]]; then
     export CPATH="${QRL_USER_GRAPHICS_PREFIX}/include${CPATH:+:${CPATH}}"
 fi
+if [[ -x "${QRL_USER_GRAPHICS_PREFIX}/bin/patchelf" ]]; then
+    export PATH="${QRL_USER_GRAPHICS_PREFIX}/bin:${PATH}"
+fi
 # mujoco-py's EGL shim uses GLEW but never GLU. Avoid an unnecessary GLU
 # development-header dependency when it compiles this legacy extension.
 case " ${CFLAGS:-} " in

@@ -912,6 +912,11 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
         env["CPATH"] = str(graphics_include) + (
             os.pathsep + env["CPATH"] if env.get("CPATH") else ""
         )
+    graphics_patchelf = graphics_prefix / "bin/patchelf"
+    if graphics_patchelf.is_file():
+        env["PATH"] = str(graphics_patchelf.parent) + (
+            os.pathsep + env["PATH"] if env.get("PATH") else ""
+        )
     if "-DGLEW_NO_GLU" not in env.get("CFLAGS", "").split():
         env["CFLAGS"] = " ".join(
             part for part in ("-DGLEW_NO_GLU", env.get("CFLAGS", "")) if part
