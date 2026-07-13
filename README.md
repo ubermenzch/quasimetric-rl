@@ -47,6 +47,10 @@ https://github.com/quasimetric-learning/quasimetric-rl/blob/4f113239d7881eaba478
 >
 > `d4rl` depends on `mujoco_py` which can be difficult to install. The code lazily imports `mujoco_py` and  `d4rl` if the user requests such environments. Therefore, their installation is not necessary to run the QRL algorithm, e.g., on a custom environment. However, running QRL on the provided environments (`d4rl.maze2d` and `GCRL`) requires them.
 
+For the modified offline experiment suite, see
+[`docs/SETUP.md`](docs/SETUP.md). It records the portable Python environment,
+D4RL dataset manifest, MuJoCo asset layout, queue setup, and Git remote policy.
+
 ## Code structure
 
 + `quasimetric_rl.modules` implements the actor and critic components, as well as their associated QRL losses.

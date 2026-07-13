@@ -111,12 +111,24 @@ class MinDistLoss(ActorLossBase):
         with torch.no_grad():
             obs, goal, actor_obs_goal_critic_infos = self.gather_obs_goal_pairs(critic_batch_infos, data)
 
+        if actor.input_mode == 'latent':
+            actor_input_critic_idx = torch.randint(
+                len(actor_obs_goal_critic_infos),
+                (),
+                device=data.observations.device,
+            ).item()
+            actor_input_info = actor_obs_goal_critic_infos[actor_input_critic_idx]
+            obs = actor_input_info.zo.detach()
+            goal = actor_input_info.zg.detach()
         actor_distn = actor(obs, goal)
         action = actor_distn.rsample()
 
         info: Dict[str, torch.Tensor] = {}
 
         dists: List[torch.Tensor] = []
+
+        if actor.input_mode == 'latent':
+            info['latent_input_critic_idx'] = torch.as_tensor(actor_input_critic_idx, device=action.device)
 
         for idx, actor_obs_goal_critic_info in enumerate(actor_obs_goal_critic_infos):
             critic = actor_obs_goal_critic_info.critic

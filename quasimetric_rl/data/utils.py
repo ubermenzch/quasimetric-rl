@@ -73,7 +73,10 @@ class TensorCollectionAttrsMixin(abc.ABC):
         def cat_key(k: str):
             ty = types[k]
             field_values = [getattr(c, k) for c in collections]
-            if cls.is_tensor_type(ty):
+            if field_values[0] is None:
+                assert all(v is None for v in field_values)
+                return None
+            if isinstance(field_values[0], torch.Tensor) or cls.is_tensor_type(ty):
                 # torch.Tensor
                 return torch.cat(field_values, dim=dim)  # differ from torch.cat: no copy if len == 1
             elif cls.is_nested_tensor_mapping_type(ty):
@@ -125,6 +128,8 @@ class TensorCollectionAttrsMixin(abc.ABC):
     @staticmethod
     def _make_cvt_fn(elem_cvt_fn: Callable[[Union[torch.Tensor, TensorCollectionAttrsMixin]], Union[torch.Tensor, TensorCollectionAttrsMixin]]):
         def cvt_fn(x: FieldT) -> FieldT:
+            if x is None:
+                return None
             if isinstance(x, (torch.Tensor, TensorCollectionAttrsMixin)):
                 return elem_cvt_fn(x)
             else:

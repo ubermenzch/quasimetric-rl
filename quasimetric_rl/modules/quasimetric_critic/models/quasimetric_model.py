@@ -86,15 +86,22 @@ class QuasimetricModel(nn.Module):
         self.quasimetric_head = create_quasimetric_head_from_spec(quasimetric_head_spec)
         self.projector = MLP(input_size, self.quasimetric_head.input_size, hidden_sizes=projector_arch)
 
-    def forward(self, zx: LatentTensor, zy: LatentTensor, *, bidirectional: bool = False) -> torch.Tensor:
-        px = self.projector(zx)  # [B x D]
-        py = self.projector(zy)  # [B x D]
+    def project(self, z: LatentTensor) -> torch.Tensor:
+        return self.projector(z)
 
+    def forward_projected(self, px: torch.Tensor, py: torch.Tensor, *, bidirectional: bool = False) -> torch.Tensor:
         if bidirectional:
             px, py = torch.broadcast_tensors(px, py)
             px, py = torch.stack([px, py], dim=-2), torch.stack([py, px], dim=-2)  # [B x 2 x D]
 
         return self.quasimetric_head(px, py)
+
+    def forward(self, zx: LatentTensor, zy: LatentTensor, *, bidirectional: bool = False) -> torch.Tensor:
+        return self.forward_projected(
+            self.project(zx),
+            self.project(zy),
+            bidirectional=bidirectional,
+        )
 
     # for type hint
     def __call__(self, zx: LatentTensor, zy: LatentTensor, *, bidirectional: bool = False) -> torch.Tensor:

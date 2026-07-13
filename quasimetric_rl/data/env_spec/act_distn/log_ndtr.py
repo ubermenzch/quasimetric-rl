@@ -135,7 +135,17 @@ class LogNdtr(Function):
 log_ndtr = LogNdtr.apply
 
 def log_ndtr_general(x: torch.Tensor, mean: torch.Tensor, scale: torch.Tensor):
-    return log_ndtr((x - mean) / scale)
+    standardized = (x - mean) / scale
+    standardized = torch.nan_to_num(
+        standardized,
+        nan=0.0,
+        posinf=1e6,
+        neginf=-1e6,
+    )
+    standardized = standardized.clamp(min=-1e6, max=1e6)
+    if hasattr(torch.special, 'log_ndtr'):
+        return torch.special.log_ndtr(standardized)
+    return log_ndtr(standardized)
 
 
 def test_gradcheck():

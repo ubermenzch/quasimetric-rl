@@ -33,6 +33,10 @@ class BatchData(TensorCollectionAttrsMixin):  # TensorCollectionAttrsMixin has s
 
     future_observations: torch.Tensor  # sampled!
 
+    history_observations: Optional[torch.Tensor] = None  # [B, H + 1, *obs_shape], contiguous when available
+    history_actions: Optional[torch.Tensor] = None  # [B, H, *action_shape], aligned with history_observations
+    history_mask: Optional[torch.Tensor] = None  # [B, H], True where action and next observation are valid
+
     @property
     def device(self) -> torch.device:
         return self.observations.device
@@ -178,15 +182,18 @@ class Dataset:
             attrs.validators.ge(0.0),
             attrs.validators.le(1.0),
         ))
+        transition_history_length: int = attrs.field(default=0, validator=attrs.validators.ge(0))
 
         def make(self, *, dummy: bool = False) -> 'Dataset':
             return Dataset(self.kind, self.name,
                            future_observation_discount=self.future_observation_discount,
+                           transition_history_length=self.transition_history_length,
                            dummy=dummy)
 
     kind: str
     name: str
     future_observation_discount: float
+    transition_history_length: int
 
     # Computed Attributes::
 
@@ -215,16 +222,20 @@ class Dataset:
 
     def __init__(self, kind: str, name: str, *,
                  future_observation_discount: float,
+                 transition_history_length: int = 0,
                  dummy: bool = False,  # when you don't want to load data, e.g., in analysis
                  ) -> None:
         self.kind = kind
         self.name = name
         self.future_observation_discount = future_observation_discount
+        self.transition_history_length = transition_history_length
 
         self.env_spec = EnvSpec.from_env(self.create_env())
 
         assert 0 <= future_observation_discount
         self.future_observation_discount = future_observation_discount
+        assert transition_history_length >= 0
+        self.transition_history_length = transition_history_length
 
         if not dummy:
             episodes = tuple(self.load_episodes())
@@ -252,6 +263,29 @@ class Dataset:
     def get_observations(self, obs_indices: torch.Tensor):
         return self.raw_data.all_observations[obs_indices]
 
+    def get_transition_history(self, indices: torch.Tensor, history_length: int):
+        if history_length <= 0:
+            return None, None, None
+        eindices = self.indices_to_episode_indices[indices]
+        tindices = self.indices_to_episode_timesteps[indices]
+        epilengths = self.raw_data.episode_lengths[eindices]
+        obs_indices = indices + eindices
+        offsets = torch.arange(history_length, device=indices.device)
+        transition_indices = indices[:, None] + offsets
+        valid = (tindices[:, None] + offsets) < epilengths[:, None]
+        safe_transition_indices = torch.where(valid, transition_indices, indices[:, None])
+        safe_obs_indices = torch.where(valid, obs_indices[:, None] + offsets, obs_indices[:, None])
+        final_obs_indices = obs_indices[:, None] + torch.clamp(
+            history_length * torch.ones_like(tindices[:, None]),
+            max=(epilengths - tindices)[:, None],
+        )
+        history_observations = torch.cat([
+            self.get_observations(safe_obs_indices),
+            self.get_observations(final_obs_indices),
+        ], dim=1)
+        history_actions = self.raw_data.actions[safe_transition_indices]
+        return history_observations, history_actions, valid
+
     def __getitem__(self, indices: torch.Tensor) -> BatchData:
         indices = torch.as_tensor(indices)
         eindices = self.indices_to_episode_indices[indices]
@@ -274,12 +308,19 @@ class Dataset:
             probs=pdeltas,
         ).sample()
         future_observations = self.get_observations(obs_indices + 1 + deltas)
+        history_observations, history_actions, history_mask = self.get_transition_history(
+            indices,
+            self.transition_history_length,
+        )
 
         return BatchData(
             observations=obs,
             actions=self.raw_data.actions[indices],
             next_observations=nobs,
             future_observations=future_observations,
+            history_observations=history_observations,
+            history_actions=history_actions,
+            history_mask=history_mask,
             rewards=self.raw_data.rewards[indices],
             terminals=terminals,
             timeouts=self.raw_data.timeouts[indices],
@@ -294,6 +335,7 @@ class Dataset:
     kind={self.kind!r},
     name={self.name!r},
     future_observation_discount={self.future_observation_discount!r},
+    transition_history_length={self.transition_history_length!r},
     env_spec={self.env_spec!r},
 )""".lstrip('\n')
 

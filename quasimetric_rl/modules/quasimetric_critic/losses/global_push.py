@@ -42,7 +42,10 @@ class GlobalPushLoss(CriticLossBase):
     def forward(self, data: BatchData, critic_batch_info: CriticBatchInfo) -> LossResult:
         # To randomly pair zx, zy, we just roll over zy by 1, because zx and zy
         # are latents of randomly ordered random batches.
-        dists = critic_batch_info.critic.quasimetric_model(critic_batch_info.zx, torch.roll(critic_batch_info.zy, 1, dims=0))
+        dists = critic_batch_info.critic.quasimetric_model.forward_projected(
+            critic_batch_info.px,
+            torch.roll(critic_batch_info.py, 1, dims=0),
+        )
         # Sec 3.2. Transform so that we penalize large distances less.
         tsfm_dist: torch.Tensor = F.softplus(self.softplus_offset - dists, beta=self.softplus_beta)
         tsfm_dist = tsfm_dist.mean()

@@ -114,10 +114,28 @@ class BaseConf(abc.ABC):
                 self.agent.quasimetric_critic.model.quasimetric_model.quasimetric_head_spec,
                 f'dyn={self.agent.quasimetric_critic.losses.latent_dynamics.weight:g}',
             ]
+            if self.agent.quasimetric_critic.losses.latent_dynamics.distance != 'iqe':
+                specs.append(f'Tloss={self.agent.quasimetric_critic.losses.latent_dynamics.distance}')
+            if self.agent.quasimetric_critic.model.latent_dynamics.kind != 'mlp':
+                specs.append(f"T={self.agent.quasimetric_critic.model.latent_dynamics.kind}")
+            if self.agent.quasimetric_critic.losses.separate_latent_dynamics:
+                specs.append('Tsep')
+            if self.agent.training_schedule != 'joint':
+                specs.append(self.agent.training_schedule)
             if self.agent.num_critics > 1:
                 specs.append(f'{self.agent.num_critics}critic')
+            if self.agent.goal_set_distance.enabled:
+                specs.append(
+                    'GSD('
+                    f'n={self.agent.goal_set_distance.losses.num_goal_samples},'
+                    f'r={self.agent.goal_set_distance.losses.goal_condition_radius:g},'
+                    f'dims={":".join(map(str, self.agent.goal_set_distance.losses.goal_dims))}'
+                    ')'
+                )
             if self.agent.actor is not None:
                 aspecs = []
+                if self.agent.actor.model.input_mode != 'raw':
+                    aspecs.append(f'in={self.agent.actor.model.input_mode}')
                 if self.agent.actor.losses.min_dist.add_goal_as_future_state:
                     aspecs.append('goal=Rand+Future')
                 else:
@@ -143,6 +161,11 @@ class BaseConf(abc.ABC):
         if os.path.exists(self.completion_file):
             if self.overwrite_output:
                 logging.warning(f'Overwriting output directory {self.output_dir}')
+            elif getattr(self, 'resume_if_possible', False):
+                logging.warning(
+                    f'Output directory {self.output_dir} is complete; '
+                    'resuming from checkpoint because resume_if_possible=True'
+                )
             else:
                 raise RuntimeError(f'Output directory {self.output_dir} exists and is complete')
 

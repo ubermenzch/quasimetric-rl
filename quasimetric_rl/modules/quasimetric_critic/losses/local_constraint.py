@@ -50,7 +50,10 @@ class LocalConstraintLoss(CriticLossBase):
 
     def forward(self, data: BatchData, critic_batch_info: CriticBatchInfo) -> LossResult:
 
-        dist = critic_batch_info.critic.quasimetric_model(critic_batch_info.zx, critic_batch_info.zy)
+        dist = critic_batch_info.critic.quasimetric_model.forward_projected(
+            critic_batch_info.px,
+            critic_batch_info.py,
+        )
 
         lagrange_mult = F.softplus(self.raw_lagrange_multiplier)  # make positive
         # lagrange multiplier is minimax training, so grad_mul -1

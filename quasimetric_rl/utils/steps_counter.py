@@ -47,6 +47,23 @@ class StepsCounter(object):
         self._last_alert_steps = {k: -np.inf for k in self.alert_intervals.keys()}
         self._record_alerts()
 
+    def state_dict(self) -> dict:
+        return dict(
+            steps=self._steps,
+            last_alert_steps=dict(self._last_alert_steps),
+        )
+
+    def load_state_dict(self, state: Optional[dict]) -> None:
+        if not state:
+            return
+        self._steps = state.get('steps', self._steps)
+        for key, value in state.get('last_alert_steps', {}).items():
+            if key in self._last_alert_steps:
+                self._last_alert_steps[key] = value
+        self.alerts._clear()
+        for key in self.alert_intervals.keys():
+            self.alerts._set(key, False)
+
     def _record_alerts(self):
         # This method records alerts that can later be retrieved via
         # `self.alerts.X` for *just one time*.

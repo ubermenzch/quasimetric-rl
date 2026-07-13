@@ -5,6 +5,7 @@ from typing_extensions import Self
 import time
 import attrs
 import logging
+import contextlib
 
 import gym.spaces
 import numpy as np
@@ -14,7 +15,7 @@ import torch.utils.data
 from quasimetric_rl.modules import QRLConf, QRLAgent, QRLLosses, InfoT
 from quasimetric_rl.data import BatchData, EpisodeData, MultiEpisodeData
 from quasimetric_rl.data.online import ReplayBuffer, FixedLengthEnvWrapper
-from quasimetric_rl.utils import tqdm
+from quasimetric_rl.utils import TimingProfiler, tqdm
 
 
 def first_nonzero(arr: torch.Tensor, dim: bool = -1, invalid_val: int = -1):
@@ -67,6 +68,7 @@ class Trainer(object):
     num_rollouts_per_cycle: int
     num_eval_episodes: int
     exploration_eps: float
+    profiler: Optional[TimingProfiler]
 
     def get_total_optim_steps(self, total_env_steps: int):
         total_env_steps -= self.replay.num_episodes_realized * self.replay.episode_length
@@ -84,6 +86,7 @@ class Trainer(object):
                  replay: ReplayBuffer,
                  batch_size: int,
                  interaction_conf: InteractionConf,
+                 profiler: Optional[TimingProfiler] = None,
                  eval_seed: int = 416923159):
 
         self.device = device
@@ -97,10 +100,16 @@ class Trainer(object):
         self.num_rollouts_per_cycle = interaction_conf.num_rollouts_per_cycle
         self.num_eval_episodes = interaction_conf.num_eval_episodes
         self.num_prefill_episodes = interaction_conf.num_prefill_episodes
+        self.profiler = profiler
+        self.replay.transition_history_length = max(
+            self.replay.transition_history_length,
+            agent_conf.required_transition_history_length,
+        )
 
         self.agent, self.losses = agent_conf.make(
             env_spec=replay.env_spec,
-            total_optim_steps=self.get_total_optim_steps(interaction_conf.total_env_steps))
+            total_optim_steps=self.get_total_optim_steps(interaction_conf.total_env_steps),
+            profiler=profiler)
         self.agent.to(device)
         self.losses.to(device)
 
@@ -119,59 +128,78 @@ class Trainer(object):
         return env
 
     def sample(self) -> BatchData:
-        return self.replay.sample(
-            self.batch_size,
-        ).to(self.device)
+        with self._record('data/sample_replay'):
+            batch = self.replay.sample(self.batch_size)
+        with self._record('data/to_device'):
+            return batch.to(self.device)
+
+    def _record(self, name: str):
+        if self.profiler is None:
+            return contextlib.nullcontext()
+        return self.profiler.record(name)
 
     def collect_random_rollout(self, *, store: bool = True, env: Optional[FixedLengthEnvWrapper] = None) -> EpisodeData:
-        rollout = self.replay.collect_rollout(
-            lambda obs, goal, space: space.sample(),
-            env=env,
-        )
+        with self._record('env/random_rollout'):
+            rollout = self.replay.collect_rollout(
+                lambda obs, goal, space: space.sample(),
+                env=env,
+            )
         if store:
-            self.replay.add_rollout(rollout)
+            with self._record('env/add_rollout'):
+                self.replay.add_rollout(rollout)
         return rollout
 
     def collect_rollout(self, *, eval: bool = False, store: bool = True,
                         env: Optional[FixedLengthEnvWrapper] = None) -> EpisodeData:
         assert self.agent.actor is not None
 
-        @torch.no_grad()
         def actor(obs: torch.Tensor, goal: torch.Tensor, space: gym.spaces.Space):
-            with self.agent.mode(False):
-                adistn = self.agent.actor(obs[None].to(self.device), goal[None].to(self.device))
+            with self._record('env/actor_to_device'):
+                obs = obs[None].to(self.device)
+                goal = goal[None].to(self.device)
+            with self._record('env/actor_forward'):
+                adistn = self.agent.act(obs, goal)
             if eval:
-                a = adistn.mode.cpu().numpy()[0]
+                with self._record('env/action_to_cpu'):
+                    a = adistn.mode.cpu().numpy()[0]
             else:
-                a_t = adistn.sample()
-                if self.exploration_eps != 0:
-                    # FIXME: this only works with [-1, 1] range!  # a hack :)
-                    a_t += torch.randn_like(a_t).mul_(self.exploration_eps)
-                    a_t.clamp_(-1, 1)
-                a = a_t.cpu().numpy()[0]
+                with self._record('env/action_sample'):
+                    a_t = adistn.sample()
+                    if self.exploration_eps != 0:
+                        # FIXME: this only works with [-1, 1] range!  # a hack :)
+                        a_t += torch.randn_like(a_t).mul_(self.exploration_eps)
+                        a_t.clamp_(-1, 1)
+                with self._record('env/action_to_cpu'):
+                    a = a_t.cpu().numpy()[0]
             return a
 
-        rollout = self.replay.collect_rollout(actor, env=env)
+        with torch.no_grad(), self.agent.mode(False), \
+                self._record('env/policy_rollout_eval' if eval else 'env/policy_rollout_train'):
+            rollout = self.replay.collect_rollout(actor, env=env)
         if store:
-            self.replay.add_rollout(rollout)
+            with self._record('env/add_rollout'):
+                self.replay.add_rollout(rollout)
         return rollout
 
     def evaluate(self) -> EvalEpisodeResult:
-        env = self.make_evaluate_env()
+        with self._record('eval/make_env'):
+            env = self.make_evaluate_env()
         rollouts = []
-        for _ in tqdm(range(self.num_eval_episodes), desc='evaluate'):
-            rollouts.append(self.collect_rollout(eval=True, store=False, env=env))
-        mrollouts = MultiEpisodeData.cat(rollouts)
-        return EvalEpisodeResult.from_timestep_reward_is_success(
-            mrollouts.rewards.reshape(
-                self.num_eval_episodes, env.episode_length,
-            ),
-            mrollouts.transition_infos['is_success'].reshape(
-                self.num_eval_episodes, env.episode_length,
-            ),
-        )
+        with self._record('eval/rollouts'):
+            for _ in tqdm(range(self.num_eval_episodes), desc='evaluate'):
+                rollouts.append(self.collect_rollout(eval=True, store=False, env=env))
+        with self._record('eval/aggregate'):
+            mrollouts = MultiEpisodeData.cat(rollouts)
+            return EvalEpisodeResult.from_timestep_reward_is_success(
+                mrollouts.rewards.reshape(
+                    self.num_eval_episodes, env.episode_length,
+                ),
+                mrollouts.transition_infos['is_success'].reshape(
+                    self.num_eval_episodes, env.episode_length,
+                ),
+            )
 
-    def iter_training_data(self) -> Iterator[Tuple[int, bool, BatchData, InfoT]]:
+    def iter_training_data(self, *, start_cycle_sample: int = 0) -> Iterator[Tuple[int, bool, BatchData, InfoT]]:
         r"""
         Yield data to train on for each optimization iteration.
 
@@ -182,13 +210,20 @@ class Trainer(object):
             info,
         )
         """
-        def yield_data():
+        if not 0 <= start_cycle_sample <= self.num_samples_per_cycle:
+            raise ValueError(
+                f"start_cycle_sample={start_cycle_sample} must be in "
+                f"[0, {self.num_samples_per_cycle}]"
+            )
+
+        def yield_data(first_cycle_sample: int = 0):
             num_transitions = self.replay.num_transitions_realized
-            for icyc in tqdm(range(self.num_samples_per_cycle), desc=f"{num_transitions} env steps, train batches"):
+            for icyc in tqdm(range(first_cycle_sample, self.num_samples_per_cycle), desc=f"{num_transitions} env steps, train batches"):
                 data_t0 = time.time()
                 data = self.sample()
                 info = dict(
                     data_time=(time.time() - data_t0),
+                    cycle_sample=icyc,
                     num_episodes=self.replay.num_episodes_realized,
                     num_regular_transitions=self.replay.num_transitions_realized,
                     num_successes=self.replay.num_successful_transitions,
@@ -200,22 +235,39 @@ class Trainer(object):
 
         total_env_steps = self.total_env_steps
 
-        env = self.make_collect_env()  # always make fresh collect env before collecting. GCRL envs don't like reusing.
-        for _ in tqdm(range(self.num_prefill_episodes), desc='prefill'):
-            self.collect_random_rollout(env=env)
+        num_prefill_episodes = min(
+            self.num_prefill_episodes,
+            total_env_steps // self.replay.episode_length,
+        )
+        if self.replay.num_episodes_realized < num_prefill_episodes:
+            with self._record('env/make_collect_env'):
+                env = self.make_collect_env()  # always make fresh collect env before collecting. GCRL envs don't like reusing.
+            with self._record('env/prefill'):
+                for _ in tqdm(
+                        range(self.replay.num_episodes_realized, num_prefill_episodes),
+                        desc='prefill'):
+                    self.collect_random_rollout(env=env)
+        else:
+            logging.info(
+                f"Skipping prefill because replay already has "
+                f"{self.replay.num_transitions_realized} transitions"
+            )
         assert self.replay.num_transitions_realized <= total_env_steps
 
-        yield from yield_data()
+        yield from yield_data(start_cycle_sample)
 
         while self.replay.num_transitions_realized < total_env_steps:
-            env = self.make_collect_env()
-            for _ in range(self.num_rollouts_per_cycle):
-                self.collect_rollout(env=env)
+            with self._record('env/make_collect_env'):
+                env = self.make_collect_env()
+            with self._record('env/rollout_cycle'):
+                for _ in range(self.num_rollouts_per_cycle):
+                    self.collect_rollout(env=env)
 
-                if self.replay.num_transitions_realized >= total_env_steps:
-                    break
+                    if self.replay.num_transitions_realized >= total_env_steps:
+                        break
 
             yield from yield_data()
 
-    def train_step(self, data: BatchData, *, optimize: bool = True) -> InfoT:
-        return self.losses(self.agent, data, optimize=optimize).info
+    def train_step(self, data: BatchData, *, optimize: bool = True, phase: str = 'all') -> InfoT:
+        with self._record('train/losses_total'):
+            return self.losses(self.agent, data, optimize=optimize, phase=phase).info

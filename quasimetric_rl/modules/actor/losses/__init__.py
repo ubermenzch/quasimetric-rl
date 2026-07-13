@@ -1,6 +1,7 @@
 from typing import *
 
 import abc
+import contextlib
 import attrs
 
 import torch
@@ -54,6 +55,7 @@ class ActorLosses(ActorLossBase):
     actor_sched: torch.optim.lr_scheduler._LRScheduler
     entropy_weight_optim: OptimWrapper
     entropy_weight_sched: torch.optim.lr_scheduler._LRScheduler
+    profiler: Optional[Any]
 
     def __init__(self, actor: Actor, *, total_optim_steps: int,
                  min_dist: MinDistLoss, behavior_cloning: BCLoss,
@@ -67,21 +69,32 @@ class ActorLosses(ActorLossBase):
         self.entropy_weight_optim, self.entropy_weight_sched = entropy_weight_optim_spec.create_optim_scheduler(
             min_dist.parameters(), total_optim_steps)
         assert len(list(min_dist.parameters())) <= 1
+        self.profiler = None
+
+    def _record(self, name: str):
+        if self.profiler is None:
+            return contextlib.nullcontext()
+        return self.profiler.record(name)
 
     def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData, *,
                 optimize: bool = True) -> LossResult:
         with self.actor_optim.update_context(optimize=optimize), \
                 self.entropy_weight_optim.update_context(optimize=optimize):
 
-            result = LossResult.combine(dict(
-                min_dist=self.min_dist(actor, critic_batch_infos, data),
-                behavior_cloning=self.behavior_cloning(actor, critic_batch_infos, data),
-            ))
-            result.loss.backward()
+            loss_results = {}
+            with self._record('train/actor/min_dist'):
+                loss_results['min_dist'] = self.min_dist(actor, critic_batch_infos, data)
+            with self._record('train/actor/behavior_cloning'):
+                loss_results['behavior_cloning'] = self.behavior_cloning(actor, critic_batch_infos, data)
+            with self._record('train/actor/combine_losses'):
+                result = LossResult.combine(loss_results)
+            with self._record('train/actor/backward'):
+                result.loss.backward()
 
         if optimize:
-            self.actor_sched.step()
-            self.entropy_weight_sched.step()
+            with self._record('train/actor/scheduler_step'):
+                self.actor_sched.step()
+                self.entropy_weight_sched.step()
         return result
 
     # for type hints

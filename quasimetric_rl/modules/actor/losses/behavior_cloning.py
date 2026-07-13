@@ -33,10 +33,29 @@ class BCLoss(ActorLossBase):
     def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData) -> LossResult:
         if self.weight == 0:
             return LossResult(loss=0, info={})
-        actor_distn = actor(data.observations, data.future_observations)
+        info = {}
+        if actor.input_mode == 'latent':
+            critic_batch_infos = list(critic_batch_infos)
+            critic_idx = torch.randint(
+                len(critic_batch_infos),
+                (),
+                device=data.observations.device,
+            ).item()
+            critic = critic_batch_infos[critic_idx].critic
+            with torch.no_grad():
+                obs, goal = critic.encoder(torch.stack([
+                    data.observations,
+                    data.future_observations,
+                ], dim=0)).unbind(0)
+            info['latent_input_critic_idx'] = torch.as_tensor(critic_idx, device=data.observations.device)
+        else:
+            obs = data.observations
+            goal = data.future_observations
+        actor_distn = actor(obs, goal)
         log_prob: torch.Tensor = actor_distn.log_prob(data.actions).mean()
         loss = -log_prob * self.weight
-        return LossResult(loss=loss, info=dict(log_prob=log_prob))
+        info['log_prob'] = log_prob
+        return LossResult(loss=loss, info=info)
 
     def extra_repr(self) -> str:
         return f"weight={self.weight:g}"

@@ -1,0 +1,42 @@
+# Reproducible Python dependencies for the current offline D4RL experiments.
+#
+# Python: 3.9.25
+# PyTorch is installed separately by tools/bootstrap_environment.sh, so callers
+# can choose an index compatible with their CUDA driver. Do not install a
+# second (possibly CPU-only) torch wheel through this file.
+# D4RL is installed separately with --no-deps at the commit below because its
+# declared mjrl extra is not needed for this repository's Maze2D/AntMaze tasks.
+
+Cython==0.29.37
+Pillow==7.2.0
+PyOpenGL==3.1.10
+PyYAML==6.0.3
+absl-py==2.3.1
+antlr4-python3-runtime==4.9.3
+attrs==26.1.0
+cffi==2.0.0
+click==8.1.3
+cloudpickle==1.6.0
+dm-control==1.0.3
+dm-env==1.5
+dm-tree==0.1.7
+fasteners==0.20
+glfw==2.10.0
+gym==0.18.0
+h5py==3.7.0
+hydra-core==1.3.2
+imageio==2.6.1
+labmaze==1.0.5
+mujoco==2.3.6
+mujoco-py==2.1.2.14
+numpy==1.26.4
+omegaconf==2.3.0
+pybullet==3.2.5
+pyglet==1.5.0
+scipy==1.13.1
+tensorboard==2.21.0
+termcolor==1.1.0
+tqdm==4.68.3
+
+# Required by dm-control at runtime but absent from the original environment.
+requests>=2.31,<3

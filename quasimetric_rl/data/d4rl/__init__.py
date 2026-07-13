@@ -162,6 +162,7 @@ def convert_dict_to_EpisodeData_iter(sequence_dataset_episodes: Iterator[Mapping
         yield EpisodeData(**episode_dict)
 
 
+from . import antmaze  # register
 from . import maze2d  # register
 
 __all__ = ['D4RLDataset']

@@ -15,8 +15,9 @@ class ActorConf:
     model: Actor.Conf = Actor.Conf()
     losses: ActorLosses.Conf = ActorLosses.Conf()
 
-    def make(self, *, env_spec: EnvSpec, total_optim_steps: int) -> Tuple[Actor, ActorLosses]:
-        actor = self.model.make(env_spec=env_spec)
+    def make(self, *, env_spec: EnvSpec, total_optim_steps: int,
+             latent_size: Optional[int] = None) -> Tuple[Actor, ActorLosses]:
+        actor = self.model.make(env_spec=env_spec, latent_size=latent_size)
         return actor, self.losses.make(actor, total_optim_steps=total_optim_steps, env_spec=env_spec)
 
 

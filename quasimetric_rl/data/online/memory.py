@@ -113,6 +113,7 @@ class ReplayBuffer(Dataset):
             return ReplayBuffer(
                 self.kind, self.name,
                 future_observation_discount=self.future_observation_discount,
+                transition_history_length=self.transition_history_length,
                 load_offline_data=self.load_offline_data,
                 init_num_transitions=self.init_num_transitions,
                 increment_num_transitions=self.increment_num_transitions,
@@ -139,6 +140,10 @@ class ReplayBuffer(Dataset):
     def episodes_capacity(self) -> int:
         return self.raw_data.num_episodes
 
+    @property
+    def increment_num_episodes(self) -> int:
+        return int(np.ceil(self.increment_num_transitions / self.episode_length))
+
     def create_env(self) -> FixedLengthEnvWrapper:  # type hint
         env = super().create_env()
         assert isinstance(env, FixedLengthEnvWrapper), "not online env"
@@ -153,6 +158,7 @@ class ReplayBuffer(Dataset):
             yield get_empty_episode(self.env_spec, self.episode_length)
 
     def __init__(self, kind: str, name: str, *, future_observation_discount: float,
+                 transition_history_length: int = 0,
                  load_offline_data: bool, init_num_transitions: int, increment_num_transitions: int,
                  dummy: bool = False,  # when you don't want to load data, e.g., in analysis
                  ):
@@ -164,6 +170,7 @@ class ReplayBuffer(Dataset):
         self.env = self.create_env()
         super().__init__(
             kind, name, future_observation_discount=future_observation_discount,
+            transition_history_length=transition_history_length,
             dummy=dummy)
         self.num_episodes_realized = 0
         if load_offline_data and not dummy:  # load data if required.
@@ -203,6 +210,54 @@ class ReplayBuffer(Dataset):
         ], dim=0)
 
         logging.info(f'ReplayBuffer: Expanded from capacity={original_capacity} to {new_capacity} episodes')
+
+    def state_dict(self) -> dict[str, Any]:
+        n = self.num_episodes_realized
+        obs_n = n * (self.episode_length + 1)
+        trans_n = n * self.episode_length
+        observation_infos = {
+            key: value[:obs_n].clone()
+            for key, value in self.raw_data.observation_infos.items()
+        }
+        transition_infos = {
+            key: value[:trans_n].clone()
+            for key, value in self.raw_data.transition_infos.items()
+        }
+        return {
+            "num_episodes_realized": self.num_episodes_realized,
+            "num_successful_episodes": self.num_successful_episodes,
+            "num_successful_transitions": self.num_successful_transitions,
+            "episode_lengths": self.raw_data.episode_lengths[:n].clone(),
+            "all_observations": self.raw_data.all_observations[:obs_n].clone(),
+            "actions": self.raw_data.actions[:trans_n].clone(),
+            "rewards": self.raw_data.rewards[:trans_n].clone(),
+            "terminals": self.raw_data.terminals[:trans_n].clone(),
+            "timeouts": self.raw_data.timeouts[:trans_n].clone(),
+            "observation_infos": observation_infos,
+            "transition_infos": transition_infos,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        n = int(state["num_episodes_realized"])
+        if n < 0:
+            raise ValueError(f"invalid num_episodes_realized={n}")
+        while self.episodes_capacity < n:
+            self._expand()
+        obs_n = n * (self.episode_length + 1)
+        trans_n = n * self.episode_length
+        self.raw_data.episode_lengths[:n] = state["episode_lengths"]
+        self.raw_data.all_observations[:obs_n] = state["all_observations"]
+        self.raw_data.actions[:trans_n] = state["actions"]
+        self.raw_data.rewards[:trans_n] = state["rewards"]
+        self.raw_data.terminals[:trans_n] = state["terminals"]
+        self.raw_data.timeouts[:trans_n] = state["timeouts"]
+        for key, value in state.get("observation_infos", {}).items():
+            self.raw_data.observation_infos[key][:obs_n] = value
+        for key, value in state.get("transition_infos", {}).items():
+            self.raw_data.transition_infos[key][:trans_n] = value
+        self.num_episodes_realized = n
+        self.num_successful_episodes = int(state["num_successful_episodes"])
+        self.num_successful_transitions = int(state["num_successful_transitions"])
 
     def collect_rollout(self, actor: Callable[[torch.Tensor, torch.Tensor, gym.Space], np.ndarray], *,
                         env: Optional[FixedLengthEnvWrapper] = None) -> EpisodeData:

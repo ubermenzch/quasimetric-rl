@@ -25,3 +25,19 @@ __pycache__
 
 .vscode
 
+# Local Python environments and machine-specific assets.
+.venv/
+.venv_py39/
+.d4rl/
+.mujoco/
+qrl-assets/
+configs/qrl_queue.env
+
+# Generated experiment artifacts. Keep configurations, source code, and small
+# manifests under version control; store checkpoints and raw outputs elsewhere.
+analysis/
+logs/
+runs/
+online/results_queue/
+online/results_scaling_crl_small/
+results/
