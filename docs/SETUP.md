@@ -53,7 +53,8 @@ the host Python installation. `--skip-submodules`, `--skip-python`,
 It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
 for an internal mirror. Pip uses its default 15-second socket timeout and the
 bootstrap script uses 3 retries for package downloads. MuJoCo and every dataset
-are validated before use.
+are validated before use. Asset paths are normalized before launching
+`mujoco-py`, whose legacy loader requires canonical library paths.
 
 NVIDIA drivers and system EGL/OpenGL libraries cannot be installed in a Python
 virtual environment. They are normally already present on an AI server. The

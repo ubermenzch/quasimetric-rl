@@ -71,6 +71,7 @@ done
 if [[ "${ASSET_ROOT}" != /* ]]; then
     ASSET_ROOT="${ROOT_DIR}/${ASSET_ROOT}"
 fi
+ASSET_ROOT="$(realpath -m "${ASSET_ROOT}")"
 export QRL_ASSET_ROOT="${ASSET_ROOT}"
 MICROMAMBA_ROOT="${MICROMAMBA_ROOT:-${ASSET_ROOT}/micromamba}"
 MICROMAMBA_BIN="${MICROMAMBA_ROOT}/bin/micromamba"
@@ -154,13 +155,54 @@ import sys
 import time
 import urllib.request
 
+
+def format_size(num_bytes):
+    units = ("B", "KiB", "MiB", "GiB")
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def download_once(url, destination):
+    request = urllib.request.Request(url, headers={"User-Agent": "qrl-environment-setup"})
+    with urllib.request.urlopen(request) as response, destination.open("wb") as output:
+        content_length = response.headers.get("Content-Length")
+        total = int(content_length) if content_length and content_length.isdigit() else None
+        received = 0
+        start = last_update = time.monotonic()
+        while True:
+            block = response.read(1024 * 1024)
+            if not block:
+                break
+            output.write(block)
+            received += len(block)
+            now = time.monotonic()
+            if now - last_update >= 0.2 or (total is not None and received >= total):
+                speed = received / max(now - start, 1e-9)
+                if total is None:
+                    message = f"  {format_size(received)}  {format_size(speed)}/s"
+                else:
+                    percent = min(received / total * 100, 100.0)
+                    message = (
+                        f"  {percent:6.2f}%  {format_size(received)}/{format_size(total)}"
+                        f"  {format_size(speed)}/s"
+                    )
+                print(f"\r{message}", end="", flush=True)
+                last_update = now
+    print()
+
+
 url = sys.argv[1]
 destination = pathlib.Path(sys.argv[2])
 retries = int(sys.argv[3])
 last_error = None
 for attempt in range(retries):
     try:
-        urllib.request.urlretrieve(url, destination)
+        if attempt:
+            print(f"Retrying download ({attempt + 1}/{retries})")
+        download_once(url, destination)
         break
     except Exception as error:
         last_error = error
