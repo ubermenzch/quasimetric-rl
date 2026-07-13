@@ -58,6 +58,11 @@ fi
 ${PIP} install --retries "${PIP_RETRIES}" \
     --prefer-binary -r "${ROOT_DIR}/requirements/offline-py39.txt"
 
+# Gym 0.18.0 builds successfully with the pinned legacy build tools, but its
+# stale Pillow<=7.2.0 metadata would force Pillow to compile against system
+# JPEG headers. The dependencies it needs are pinned in the requirements file.
+${PIP} install --retries "${PIP_RETRIES}" --no-deps "gym==0.18.0"
+
 # D4RL's declared mjrl dependency is only used by unsupported hand/kitchen
 # suites. Install without dependency resolution to keep the point-maze setup
 # stable and avoid pulling mutable Git main branches.

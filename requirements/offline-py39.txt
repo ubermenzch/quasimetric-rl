@@ -24,7 +24,9 @@ dm-env==1.5
 dm-tree==0.1.7
 fasteners==0.20
 glfw==2.10.0
-gym==0.18.0
+# Gym 0.18.0 is installed separately by bootstrap_environment.sh with
+# --no-deps. Its obsolete Pillow<=7.2.0 upper bound conflicts with the Python
+# 3.9 binary Pillow wheel above, while the used Gym/D4RL APIs remain compatible.
 h5py==3.7.0
 hydra-core==1.3.2
 imageio==2.6.1

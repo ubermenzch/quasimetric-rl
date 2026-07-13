@@ -76,7 +76,10 @@ installed without dependency resolution because its declared `mjrl` dependency
 is not used by this repository's Maze2D and AntMaze experiments. The bootstrap
 script also pins pip, setuptools, and wheel because Gym 0.18.0 cannot be built
 with current setuptools releases. Pillow is pinned to a Python 3.9 binary-wheel
-release so setup does not require system JPEG development headers.
+release so setup does not require system JPEG development headers. Gym is
+installed separately without dependency resolution because its obsolete Pillow
+upper bound conflicts with that binary wheel; its required dependencies remain
+pinned in the requirements file.
 
 ## Place External Assets
 
