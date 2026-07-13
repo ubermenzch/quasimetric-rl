@@ -44,7 +44,9 @@ if [[ ! -f "${ROOT_DIR}/third_party/torch-quasimetric/setup.py" ]]; then
     exit 1
 fi
 
-${PIP} install --upgrade "pip==23.3.2" setuptools wheel
+# Gym 0.18.0's legacy setup metadata is rejected by newer setuptools.
+# Keep the build frontend at the versions used by the recorded environment.
+${PIP} install --upgrade "pip==23.3.2" "setuptools==65.7.0" "wheel==0.37.1"
 if [[ -n "${TORCH_INDEX_URL}" ]]; then
     ${PIP} install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"
 else

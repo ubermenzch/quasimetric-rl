@@ -71,7 +71,9 @@ TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
 Set `TORCH_INDEX_URL=` to use the default Python package index. The remaining
 direct dependencies are pinned in `requirements/offline-py39.txt`. D4RL is
 installed without dependency resolution because its declared `mjrl` dependency
-is not used by this repository's Maze2D and AntMaze experiments.
+is not used by this repository's Maze2D and AntMaze experiments. The bootstrap
+script also pins pip, setuptools, and wheel because Gym 0.18.0 cannot be built
+with current setuptools releases.
 
 ## Place External Assets
 
