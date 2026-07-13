@@ -33,6 +33,12 @@ def prepend_env_path(name: str, path: Path | str, *, require_exists: bool = Fals
         os.environ[name] = os.pathsep.join([value, *parts])
 
 
+def prepend_compiler_flag(name: str, flag: str) -> None:
+    flags = os.environ.get(name, "").split()
+    if flag not in flags:
+        os.environ[name] = " ".join((flag, *flags))
+
+
 def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> Path:
     """Set the legacy D4RL/MuJoCo defaults and return the asset root.
 
@@ -59,6 +65,7 @@ def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> P
     os.environ.setdefault("QRL_USER_GRAPHICS_PREFIX", str(graphics_prefix))
     graphics_include = graphics_prefix / "include"
     prepend_env_path("CPATH", graphics_include, require_exists=True)
+    prepend_compiler_flag("CFLAGS", "-DGLEW_NO_GLU")
     driver_library_dir = os.environ.get("QRL_DRIVER_LIBRARY_DIR", "")
     if not driver_library_dir:
         detected_driver_dir = default_nvidia_library_dir()

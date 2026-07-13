@@ -48,8 +48,8 @@ tools/setup_environment.sh
 All QRL Python dependencies are installed into `.venv`. If Python 3.9 is not
 already available, the script downloads micromamba into
 `../qrl-assets/micromamba/` and creates Python 3.9 there, without modifying
-the host Python installation. It also installs the X11 and GLEW development
-headers required by `mujoco-py` into
+the host Python installation. It also installs the X11 protocol, X11, and GLEW
+development headers required by `mujoco-py` into
 `../qrl-assets/micromamba/envs/graphics/`; this avoids requiring root access
 when a server lacks `X11/Xlib.h`. `--skip-submodules`, `--skip-python`,
 `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.

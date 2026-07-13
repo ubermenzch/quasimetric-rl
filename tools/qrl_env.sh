@@ -19,6 +19,12 @@ export QRL_USER_GRAPHICS_PREFIX="$(realpath -m "${QRL_USER_GRAPHICS_PREFIX:-${QR
 if [[ -d "${QRL_USER_GRAPHICS_PREFIX}/include" ]]; then
     export CPATH="${QRL_USER_GRAPHICS_PREFIX}/include${CPATH:+:${CPATH}}"
 fi
+# mujoco-py's EGL shim uses GLEW but never GLU. Avoid an unnecessary GLU
+# development-header dependency when it compiles this legacy extension.
+case " ${CFLAGS:-} " in
+    *" -DGLEW_NO_GLU "*) ;;
+    *) export CFLAGS="-DGLEW_NO_GLU${CFLAGS:+ ${CFLAGS}}" ;;
+esac
 
 # Match mujoco-py's legacy NVIDIA library discovery so its build-time path
 # validation succeeds on bare-metal hosts as well as container hosts.

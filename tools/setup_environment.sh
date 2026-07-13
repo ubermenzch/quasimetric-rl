@@ -284,6 +284,7 @@ install_user_graphics_dependencies() {
         return
     fi
     if [[ -f "${GRAPHICS_ENV}/include/X11/Xlib.h" &&
+          -f "${GRAPHICS_ENV}/include/X11/X.h" &&
           -f "${GRAPHICS_ENV}/include/GL/glew.h" ]]; then
         echo "User-local graphics headers already installed: ${GRAPHICS_ENV}"
         return
@@ -294,13 +295,14 @@ install_user_graphics_dependencies() {
     if [[ -d "${GRAPHICS_ENV}/conda-meta" ]]; then
         MAMBA_ROOT_PREFIX="${MICROMAMBA_ROOT}/root" "${MICROMAMBA_BIN}" install \
             --yes --prefix "${GRAPHICS_ENV}" --channel conda-forge \
-            xorg-libx11 glew
+            xorg-libx11 xorg-xorgproto glew
     else
         MAMBA_ROOT_PREFIX="${MICROMAMBA_ROOT}/root" "${MICROMAMBA_BIN}" create \
             --yes --prefix "${GRAPHICS_ENV}" --channel conda-forge \
-            xorg-libx11 glew
+            xorg-libx11 xorg-xorgproto glew
     fi
     if [[ ! -f "${GRAPHICS_ENV}/include/X11/Xlib.h" ||
+          ! -f "${GRAPHICS_ENV}/include/X11/X.h" ||
           ! -f "${GRAPHICS_ENV}/include/GL/glew.h" ]]; then
         echo "User-local graphics environment is incomplete: ${GRAPHICS_ENV}" >&2
         exit 1

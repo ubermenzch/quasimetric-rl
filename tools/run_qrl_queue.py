@@ -912,6 +912,10 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
         env["CPATH"] = str(graphics_include) + (
             os.pathsep + env["CPATH"] if env.get("CPATH") else ""
         )
+    if "-DGLEW_NO_GLU" not in env.get("CFLAGS", "").split():
+        env["CFLAGS"] = " ".join(
+            part for part in ("-DGLEW_NO_GLU", env.get("CFLAGS", "")) if part
+        )
     ld_paths = [str(mujoco_path / "bin")]
     driver_library_dir = cfg(config, "QRL_DRIVER_LIBRARY_DIR", "") or default_nvidia_library_dir()
     if driver_library_dir:
