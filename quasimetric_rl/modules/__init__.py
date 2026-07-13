@@ -108,10 +108,6 @@ class QRLLosses(Module):
                         phase=critic_phase,
                     )
 
-        if phase in ('all', 'actor') and self.actor_loss is not None:
-            with self._record('train/actor/total'):
-                loss_results['actor'] = self.actor_loss(agent.actor, critic_batch_infos, data, optimize=optimize)
-
         if phase in ('all', 'goal_set_distance') and self.goal_set_distance_loss is not None:
             if agent.goal_set_distance is None:
                 raise RuntimeError("Goal-set distance loss is enabled but agent.goal_set_distance is None")
@@ -120,6 +116,17 @@ class QRLLosses(Module):
                     agent.goal_set_distance,
                     critic_batch_infos,
                     data,
+                    optimize=optimize,
+                )
+
+        if phase in ('all', 'actor') and self.actor_loss is not None:
+            with self._record('train/actor/total'):
+                loss_results['actor'] = self.actor_loss(
+                    agent.actor,
+                    critic_batch_infos,
+                    data,
+                    goal_set_distance=agent.goal_set_distance,
+                    goal_set_distance_loss=self.goal_set_distance_loss,
                     optimize=optimize,
                 )
 
@@ -226,6 +233,8 @@ class QRLConf:
         goal_set_distance, goal_set_distance_loss = self.goal_set_distance.make(
             env_spec=env_spec,
             total_optim_steps=total_optim_steps,
+            latent_size=self.quasimetric_critic.model.encoder.latent_size,
+            num_critics=self.num_critics,
         )
         return QRLAgent(
             actor=actor,

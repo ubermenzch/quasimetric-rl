@@ -68,8 +68,9 @@ class MinDistLoss(ActorLossBase):
             self.register_parameter('raw_entropy_weight', None)
             self.target_entropy = None
 
-    def gather_obs_goal_pairs(self, critic_batch_infos: Collection[CriticBatchInfo],
-                                data: BatchData) -> Tuple[torch.Tensor, torch.Tensor, Collection[ActorObsGoalCriticInfo]]:
+    def gather_obs_goal_pairs(self, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData,
+                               *, goal_set_distance_loss: Optional[Any] = None) -> Tuple[
+                                   torch.Tensor, torch.Tensor, Collection[ActorObsGoalCriticInfo]]:
         r"""
         Returns (
             obs,
@@ -85,18 +86,26 @@ class MinDistLoss(ActorLossBase):
             goal = torch.stack([goal, data.future_observations], 0)
             obs = obs.expand_as(goal)
 
+        if goal_set_distance_loss is not None:
+            # Actor and GSD use the same goal-set representation: goal dims are
+            # retained while every non-goal dimension is zeroed.
+            goal = goal_set_distance_loss.padded_goal_state(goal)
+
         actor_obs_goal_critic_infos: List[ActorObsGoalCriticInfo] = []
 
         for critic_batch_info in critic_batch_infos:
             zo = critic_batch_info.zx
-            zg = torch.roll(critic_batch_info.zy, 1, dims=0)  # randomize in the same way:)
-
+            if goal_set_distance_loss is None:
+                zg = torch.roll(critic_batch_info.zy, 1, dims=0)  # randomize in the same way:)
+                if self.add_goal_as_future_state:
+                    # add future_observations
+                    zg = torch.stack([
+                        zg,
+                        critic_batch_info.critic.encoder(data.future_observations),
+                    ], 0)
+            else:
+                zg = critic_batch_info.critic.encoder(goal)
             if self.add_goal_as_future_state:
-                # add future_observations
-                zg = torch.stack([
-                    zg,
-                    critic_batch_info.critic.encoder(data.future_observations),
-                ], 0)
                 zo = zo.expand_as(zg)
 
             actor_obs_goal_critic_infos.append(ActorObsGoalCriticInfo(
@@ -107,9 +116,14 @@ class MinDistLoss(ActorLossBase):
 
         return obs, goal, actor_obs_goal_critic_infos
 
-    def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData) -> LossResult:
+    def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData, *,
+                goal_set_distance: Optional[Any] = None,
+                goal_set_distance_loss: Optional[Any] = None) -> LossResult:
+        if (goal_set_distance is None) != (goal_set_distance_loss is None):
+            raise RuntimeError('Goal-set model and loss must be enabled together')
         with torch.no_grad():
-            obs, goal, actor_obs_goal_critic_infos = self.gather_obs_goal_pairs(critic_batch_infos, data)
+            obs, goal, actor_obs_goal_critic_infos = self.gather_obs_goal_pairs(
+                critic_batch_infos, data, goal_set_distance_loss=goal_set_distance_loss)
 
         if actor.input_mode == 'latent':
             actor_input_critic_idx = torch.randint(
@@ -134,7 +148,13 @@ class MinDistLoss(ActorLossBase):
             critic = actor_obs_goal_critic_info.critic
             with critic.requiring_grad(False):
                 zp = critic.latent_dynamics(actor_obs_goal_critic_info.zo.detach(), action)
-                dist = critic.quasimetric_model(zp, actor_obs_goal_critic_info.zg.detach())
+                if goal_set_distance is None:
+                    dist = critic.quasimetric_model(zp, actor_obs_goal_critic_info.zg.detach())
+                else:
+                    # Freeze GSD parameters while retaining the action -> zp ->
+                    # GSD gradient used to optimize the actor.
+                    with goal_set_distance.requiring_grad(False):
+                        dist = goal_set_distance(idx, zp, actor_obs_goal_critic_info.zg.detach())
             info[f'dist_{idx:02d}'] = dist.mean()
             dists.append(dist)
 

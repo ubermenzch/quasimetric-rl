@@ -15,12 +15,14 @@ from ...optim import OptimWrapper, AdamWSpec
 
 class ActorLossBase(LossBase):
     @abc.abstractmethod
-    def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData) -> LossResult:
+    def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData,
+                **kwargs) -> LossResult:
         pass
 
     # for type hints
-    def __call__(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData) -> LossResult:
-        return super().__call__(actor, critic_batch_infos, data)
+    def __call__(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData,
+                 **kwargs) -> LossResult:
+        return super().__call__(actor, critic_batch_infos, data, **kwargs)
 
 
 from .min_dist import MinDistLoss
@@ -77,13 +79,21 @@ class ActorLosses(ActorLossBase):
         return self.profiler.record(name)
 
     def forward(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData, *,
+                goal_set_distance: Optional[Any] = None,
+                goal_set_distance_loss: Optional[Any] = None,
                 optimize: bool = True) -> LossResult:
         with self.actor_optim.update_context(optimize=optimize), \
                 self.entropy_weight_optim.update_context(optimize=optimize):
 
             loss_results = {}
             with self._record('train/actor/min_dist'):
-                loss_results['min_dist'] = self.min_dist(actor, critic_batch_infos, data)
+                loss_results['min_dist'] = self.min_dist(
+                    actor,
+                    critic_batch_infos,
+                    data,
+                    goal_set_distance=goal_set_distance,
+                    goal_set_distance_loss=goal_set_distance_loss,
+                )
             with self._record('train/actor/behavior_cloning'):
                 loss_results['behavior_cloning'] = self.behavior_cloning(actor, critic_batch_infos, data)
             with self._record('train/actor/combine_losses'):
@@ -99,5 +109,15 @@ class ActorLosses(ActorLossBase):
 
     # for type hints
     def __call__(self, actor: Actor, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData, *,
+                 goal_set_distance: Optional[Any] = None,
+                 goal_set_distance_loss: Optional[Any] = None,
                  optimize: bool = True) -> LossResult:
-        return torch.nn.Module.__call__(self, actor, critic_batch_infos, data, optimize=optimize)
+        return torch.nn.Module.__call__(
+            self,
+            actor,
+            critic_batch_infos,
+            data,
+            goal_set_distance=goal_set_distance,
+            goal_set_distance_loss=goal_set_distance_loss,
+            optimize=optimize,
+        )

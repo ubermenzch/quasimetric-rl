@@ -128,8 +128,8 @@ class BaseConf(abc.ABC):
                 specs.append(
                     'GSD('
                     f'n={self.agent.goal_set_distance.losses.num_goal_samples},'
-                    f'r={self.agent.goal_set_distance.losses.goal_condition_radius:g},'
-                    f'dims={":".join(map(str, self.agent.goal_set_distance.losses.goal_dims))}'
+                    f'dims={":".join(map(str, self.agent.goal_set_distance.losses.goal_dims))},'
+                    'non_goal=batch_uniform'
                     ')'
                 )
             if self.agent.actor is not None:
