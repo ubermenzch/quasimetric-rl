@@ -10,6 +10,12 @@ def default_asset_root(repo_root: Path) -> Path:
     return Path(os.environ.get("QRL_ASSET_ROOT", repo_root.parent / "qrl-assets"))
 
 
+def default_nvidia_library_dir() -> Path | None:
+    candidates = [Path("/usr/local/nvidia/lib64"), Path("/usr/lib/nvidia")]
+    candidates.extend(sorted(Path("/usr/lib").glob("nvidia-[0-9][0-9][0-9]")))
+    return next((path for path in candidates if path.is_dir()), None)
+
+
 def prepend_env_path(name: str, path: Path | str, *, require_exists: bool = False) -> None:
     value = str(path)
     if require_exists and not os.path.exists(value):
@@ -42,6 +48,9 @@ def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> P
         require_exists=require_library_paths,
     )
     driver_library_dir = os.environ.get("QRL_DRIVER_LIBRARY_DIR", "")
+    if not driver_library_dir:
+        detected_driver_dir = default_nvidia_library_dir()
+        driver_library_dir = str(detected_driver_dir) if detected_driver_dir is not None else ""
     if driver_library_dir:
         prepend_env_path(
             "LD_LIBRARY_PATH",

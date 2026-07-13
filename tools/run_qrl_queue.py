@@ -129,6 +129,15 @@ def resolve_path(value: str) -> Path:
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
+def default_nvidia_library_dir() -> str:
+    candidates = [Path("/usr/local/nvidia/lib64"), Path("/usr/lib/nvidia")]
+    candidates.extend(sorted(Path("/usr/lib").glob("nvidia-[0-9][0-9][0-9]")))
+    for candidate in candidates:
+        if candidate.is_dir():
+            return str(candidate)
+    return ""
+
+
 def read_tasks(path: Path) -> list[Task]:
     if not path.exists():
         return []
@@ -895,7 +904,7 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
     env["MUJOCO_PY_MUJOCO_PATH"] = str(mujoco_path)
     env["MUJOCO_PATH"] = str(resolve_path(cfg(config, "MUJOCO_PATH", str(mujoco_path))))
     ld_paths = [str(mujoco_path / "bin")]
-    driver_library_dir = cfg(config, "QRL_DRIVER_LIBRARY_DIR", "")
+    driver_library_dir = cfg(config, "QRL_DRIVER_LIBRARY_DIR", "") or default_nvidia_library_dir()
     if driver_library_dir:
         ld_paths.append(driver_library_dir)
     env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_paths) + (
