@@ -51,6 +51,14 @@ For the modified offline experiment suite, see
 [`docs/SETUP.md`](docs/SETUP.md). It records the portable Python environment,
 D4RL dataset manifest, MuJoCo asset layout, queue setup, and Git remote policy.
 
+This repository requires the `third_party/torch-quasimetric` Git submodule. If
+the repository was cloned without `--recurse-submodules`, run this from the
+repository root:
+
+```bash
+git submodule update --init --recursive
+```
+
 ## Code structure
 
 + `quasimetric_rl.modules` implements the actor and critic components, as well as their associated QRL losses.

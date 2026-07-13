@@ -15,7 +15,6 @@ MAZE2D_DATASET_URL="${MAZE2D_DATASET_URL:-http://rail.eecs.berkeley.edu/datasets
 ANTMAZE_V2_DATASET_URL="${ANTMAZE_V2_DATASET_URL:-http://rail.eecs.berkeley.edu/datasets/offline_rl/ant_maze_v2}"
 DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-3}"
 
-INSTALL_SYSTEM=1
 INSTALL_PYTHON=1
 INSTALL_MUJOCO=1
 INSTALL_DATASETS=1
@@ -26,11 +25,10 @@ usage() {
     cat <<'EOF'
 Usage: tools/setup_environment.sh [options]
 
-Install the system packages, Python environment, MuJoCo 2.1.0, and the D4RL
+Create the Python environment, install MuJoCo 2.1.0, and download the D4RL
 datasets required by the repository's Maze2D and AntMaze experiments.
 
 Options:
-  --skip-system     Do not install Debian/Ubuntu system packages.
   --skip-python     Do not create or install the Python virtual environment.
   --skip-mujoco     Do not download MuJoCo 2.1.0.
   --skip-datasets   Do not download D4RL datasets.
@@ -47,7 +45,6 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-system) INSTALL_SYSTEM=0 ;;
         --skip-python) INSTALL_PYTHON=0 ;;
         --skip-mujoco) INSTALL_MUJOCO=0 ;;
         --skip-datasets) INSTALL_DATASETS=0 ;;
@@ -79,29 +76,24 @@ require_command() {
 }
 
 
-run_privileged() {
-    if [[ "${EUID}" -eq 0 ]]; then
-        "$@"
-        return
-    fi
-    require_command sudo
-    sudo "$@"
-}
-
-
-install_system_packages() {
-    require_command apt-get
-    run_privileged apt-get update
-    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        build-essential curl git patchelf libgl1-mesa-glx libosmesa6-dev \
-        libglew-dev libglfw3 libglfw3-dev
-}
-
-
 sha256_matches() {
     local path="$1"
     local expected="$2"
-    [[ -f "${path}" ]] && [[ "$(sha256sum "${path}" | awk '{print $1}')" == "${expected}" ]]
+    "${SETUP_PYTHON}" - "${path}" "${expected}" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+if not path.is_file():
+    raise SystemExit(1)
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(block)
+raise SystemExit(0 if digest.hexdigest() == expected else 1)
+PY
 }
 
 
@@ -113,8 +105,29 @@ download_file() {
     mkdir -p "$(dirname "${destination}")"
     rm -f "${temporary}"
     echo "Downloading ${url}"
-    curl --fail --location --retry "${DOWNLOAD_RETRIES}" --retry-delay 2 \
-        --output "${temporary}" "${url}"
+    "${SETUP_PYTHON}" - "${url}" "${temporary}" "${DOWNLOAD_RETRIES}" <<'PY'
+import pathlib
+import sys
+import time
+import urllib.request
+
+url = sys.argv[1]
+destination = pathlib.Path(sys.argv[2])
+retries = int(sys.argv[3])
+last_error = None
+for attempt in range(retries):
+    try:
+        urllib.request.urlretrieve(url, destination)
+        break
+    except Exception as error:
+        last_error = error
+        destination.unlink(missing_ok=True)
+        if attempt + 1 == retries:
+            raise
+        time.sleep(2)
+if not destination.is_file():
+    raise RuntimeError(f"download did not create {destination}: {last_error}")
+PY
     mv "${temporary}" "${destination}"
 }
 
@@ -147,7 +160,16 @@ install_mujoco() {
     mkdir -p "${install_parent}"
     temporary_dir="$(mktemp -d "${install_parent}/.mujoco210.XXXXXX")"
     trap 'rm -rf "${temporary_dir}"' RETURN
-    tar -xzf "${archive}" -C "${temporary_dir}"
+    "${SETUP_PYTHON}" - "${archive}" "${temporary_dir}" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+with tarfile.open(archive, "r:gz") as tar:
+    tar.extractall(destination)
+PY
     if [[ ! -f "${temporary_dir}/mujoco210/bin/libmujoco210.so" ]]; then
         echo "MuJoCo archive does not contain bin/libmujoco210.so" >&2
         exit 1
@@ -176,8 +198,14 @@ dataset_is_valid() {
     local path="$1"
     local expected_size="$2"
     local expected_sha256="$3"
-    [[ -f "${path}" ]] && [[ "$(stat -c '%s' "${path}")" == "${expected_size}" ]] && \
+    "${SETUP_PYTHON}" - "${path}" "${expected_size}" <<'PY' && \
         sha256_matches "${path}" "${expected_sha256}"
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+raise SystemExit(0 if path.is_file() and path.stat().st_size == int(sys.argv[2]) else 1)
+PY
 }
 
 
@@ -189,8 +217,6 @@ install_datasets() {
     local destination
     local url
 
-    require_command sha256sum
-    require_command stat
     if [[ ! -f "${DATASET_MANIFEST}" ]]; then
         echo "Dataset manifest does not exist: ${DATASET_MANIFEST}" >&2
         exit 1
@@ -215,17 +241,15 @@ install_datasets() {
 }
 
 
-if [[ "${INSTALL_SYSTEM}" -eq 1 ]]; then
-    install_system_packages
-fi
-
-require_command curl
-require_command sha256sum
-require_command tar
-
 if [[ "${INSTALL_PYTHON}" -eq 1 ]]; then
     VENV_DIR="${VENV_DIR}" PYTHON_BIN="${PYTHON_BIN:-python3.9}" \
         "${ROOT_DIR}/tools/bootstrap_environment.sh"
+fi
+SETUP_PYTHON="${VENV_DIR}/bin/python"
+if [[ ! -x "${SETUP_PYTHON}" ]]; then
+    echo "Virtual environment Python is missing: ${SETUP_PYTHON}" >&2
+    echo "Run without --skip-python or set VENV_DIR to an existing environment." >&2
+    exit 1
 fi
 if [[ "${INSTALL_MUJOCO}" -eq 1 ]]; then
     install_mujoco

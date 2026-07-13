@@ -35,20 +35,25 @@ Confirm that the NVIDIA driver is available:
 nvidia-smi
 ```
 
-On a Debian/Ubuntu host with Python 3.9, the following command installs system
-packages, creates the Python environment, downloads MuJoCo 2.1.0 and all nine
-required D4RL datasets (about 1.6GB), verifies their checksums, and runs the
-CUDA/MuJoCo smoke test:
+On a host with Python 3.9, the following command creates the Python virtual
+environment, downloads MuJoCo 2.1.0 and all nine required D4RL datasets (about
+1.6GB), verifies their checksums, and runs the CUDA/MuJoCo smoke test. It does
+not require elevated privileges:
 
 ```bash
 PYTHON_BIN=python3.9 tools/setup_environment.sh
 ```
 
-The script uses `sudo` only for Debian/Ubuntu system packages. `--skip-system`,
-`--skip-python`, `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow
-partial setup. It accepts `QRL_ASSET_ROOT` for a different asset location and
-URL overrides for an internal mirror. MuJoCo and every dataset are validated
-before use.
+All Python dependencies are installed into `.venv`. `--skip-python`,
+`--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.
+It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
+for an internal mirror. MuJoCo and every dataset are validated before use.
+
+NVIDIA drivers and system EGL/OpenGL libraries cannot be installed in a Python
+virtual environment. They are normally already present on an AI server. The
+repository never invokes a system package manager or privileged command; if
+these host libraries are absent, ask the server administrator to provision
+them before running the setup script.
 
 The nested bootstrap script installs PyTorch 2.8.0 from the CUDA 12.8 wheel
 index by default. This is a default, not a hardware requirement. Select a
