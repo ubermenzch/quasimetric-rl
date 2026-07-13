@@ -903,6 +903,15 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
         env["__EGL_VENDOR_LIBRARY_FILENAMES"] = egl_vendor
     env["MUJOCO_PY_MUJOCO_PATH"] = str(mujoco_path)
     env["MUJOCO_PATH"] = str(resolve_path(cfg(config, "MUJOCO_PATH", str(mujoco_path))))
+    graphics_prefix = resolve_path(
+        cfg(config, "QRL_USER_GRAPHICS_PREFIX", str(asset_root / "micromamba/envs/graphics"))
+    )
+    env["QRL_USER_GRAPHICS_PREFIX"] = str(graphics_prefix)
+    graphics_include = graphics_prefix / "include"
+    if graphics_include.is_dir():
+        env["CPATH"] = str(graphics_include) + (
+            os.pathsep + env["CPATH"] if env.get("CPATH") else ""
+        )
     ld_paths = [str(mujoco_path / "bin")]
     driver_library_dir = cfg(config, "QRL_DRIVER_LIBRARY_DIR", "") or default_nvidia_library_dir()
     if driver_library_dir:

@@ -41,7 +41,7 @@ Options:
 
 Environment overrides:
   QRL_ASSET_ROOT, VENV_DIR, PYTHON_BIN, TORCH_INDEX_URL, BOOTSTRAP_PYTHON,
-  MICROMAMBA_URL, MICROMAMBA_ROOT,
+  MICROMAMBA_URL, MICROMAMBA_ROOT, QRL_USER_GRAPHICS_PREFIX,
   MUJOCO_URL, MUJOCO_ARCHIVE_SHA256, MAZE2D_DATASET_URL,
   ANTMAZE_V2_DATASET_URL, D4RL_DATASET_MANIFEST, DOWNLOAD_RETRIES.
 EOF
@@ -76,6 +76,7 @@ export QRL_ASSET_ROOT="${ASSET_ROOT}"
 MICROMAMBA_ROOT="${MICROMAMBA_ROOT:-${ASSET_ROOT}/micromamba}"
 MICROMAMBA_BIN="${MICROMAMBA_ROOT}/bin/micromamba"
 MICROMAMBA_ENV="${MICROMAMBA_ROOT}/envs/python39"
+GRAPHICS_ENV="${QRL_USER_GRAPHICS_PREFIX:-${MICROMAMBA_ROOT}/envs/graphics}"
 
 
 require_command() {
@@ -278,6 +279,35 @@ resolve_python39() {
 }
 
 
+install_user_graphics_dependencies() {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        return
+    fi
+    if [[ -f "${GRAPHICS_ENV}/include/X11/Xlib.h" &&
+          -f "${GRAPHICS_ENV}/include/GL/glew.h" ]]; then
+        echo "User-local graphics headers already installed: ${GRAPHICS_ENV}"
+        return
+    fi
+
+    install_micromamba
+    echo "Installing user-local X11 and GLEW development headers."
+    if [[ -d "${GRAPHICS_ENV}/conda-meta" ]]; then
+        MAMBA_ROOT_PREFIX="${MICROMAMBA_ROOT}/root" "${MICROMAMBA_BIN}" install \
+            --yes --prefix "${GRAPHICS_ENV}" --channel conda-forge \
+            xorg-libx11 glew
+    else
+        MAMBA_ROOT_PREFIX="${MICROMAMBA_ROOT}/root" "${MICROMAMBA_BIN}" create \
+            --yes --prefix "${GRAPHICS_ENV}" --channel conda-forge \
+            xorg-libx11 glew
+    fi
+    if [[ ! -f "${GRAPHICS_ENV}/include/X11/Xlib.h" ||
+          ! -f "${GRAPHICS_ENV}/include/GL/glew.h" ]]; then
+        echo "User-local graphics environment is incomplete: ${GRAPHICS_ENV}" >&2
+        exit 1
+    fi
+}
+
+
 install_mujoco() {
     local mujoco_dir="${ASSET_ROOT}/mujoco/mujoco210"
     local archive="${ASSET_ROOT}/downloads/mujoco210-linux-x86_64.tar.gz"
@@ -402,6 +432,7 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
     echo "Run without --skip-python or set VENV_DIR to an existing environment." >&2
     exit 1
 fi
+install_user_graphics_dependencies
 if [[ "${INSTALL_MUJOCO}" -eq 1 ]]; then
     install_mujoco
 fi

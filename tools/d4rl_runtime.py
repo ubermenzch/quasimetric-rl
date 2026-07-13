@@ -16,6 +16,14 @@ def default_nvidia_library_dir() -> Path | None:
     return next((path for path in candidates if path.is_dir()), None)
 
 
+def default_user_graphics_prefix(asset_root: Path) -> Path:
+    return Path(
+        os.environ.get(
+            "QRL_USER_GRAPHICS_PREFIX", asset_root / "micromamba/envs/graphics"
+        )
+    )
+
+
 def prepend_env_path(name: str, path: Path | str, *, require_exists: bool = False) -> None:
     value = str(path)
     if require_exists and not os.path.exists(value):
@@ -47,6 +55,10 @@ def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> P
         mujoco_path / "bin",
         require_exists=require_library_paths,
     )
+    graphics_prefix = default_user_graphics_prefix(asset_root)
+    os.environ.setdefault("QRL_USER_GRAPHICS_PREFIX", str(graphics_prefix))
+    graphics_include = graphics_prefix / "include"
+    prepend_env_path("CPATH", graphics_include, require_exists=True)
     driver_library_dir = os.environ.get("QRL_DRIVER_LIBRARY_DIR", "")
     if not driver_library_dir:
         detected_driver_dir = default_nvidia_library_dir()

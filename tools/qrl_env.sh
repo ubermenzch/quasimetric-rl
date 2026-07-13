@@ -13,6 +13,13 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export D4RL_SUPPRESS_IMPORT_ERROR="${D4RL_SUPPRESS_IMPORT_ERROR:-1}"
 export LD_LIBRARY_PATH="${MUJOCO_PY_MUJOCO_PATH}/bin${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+# `mujoco-py` compiles a legacy EGL extension on its first import. Keep the
+# required X11/GLEW headers in user space rather than requiring root access.
+export QRL_USER_GRAPHICS_PREFIX="$(realpath -m "${QRL_USER_GRAPHICS_PREFIX:-${QRL_ASSET_ROOT}/micromamba/envs/graphics}")"
+if [[ -d "${QRL_USER_GRAPHICS_PREFIX}/include" ]]; then
+    export CPATH="${QRL_USER_GRAPHICS_PREFIX}/include${CPATH:+:${CPATH}}"
+fi
+
 # Match mujoco-py's legacy NVIDIA library discovery so its build-time path
 # validation succeeds on bare-metal hosts as well as container hosts.
 QRL_DETECTED_DRIVER_LIBRARY_DIR="${QRL_DRIVER_LIBRARY_DIR:-}"

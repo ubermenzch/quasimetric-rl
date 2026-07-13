@@ -48,7 +48,10 @@ tools/setup_environment.sh
 All QRL Python dependencies are installed into `.venv`. If Python 3.9 is not
 already available, the script downloads micromamba into
 `../qrl-assets/micromamba/` and creates Python 3.9 there, without modifying
-the host Python installation. `--skip-submodules`, `--skip-python`,
+the host Python installation. It also installs the X11 and GLEW development
+headers required by `mujoco-py` into
+`../qrl-assets/micromamba/envs/graphics/`; this avoids requiring root access
+when a server lacks `X11/Xlib.h`. `--skip-submodules`, `--skip-python`,
 `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.
 It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
 for an internal mirror. Pip uses its default 15-second socket timeout and the
@@ -56,11 +59,11 @@ bootstrap script uses 3 retries for package downloads. MuJoCo and every dataset
 are validated before use. Asset paths are normalized before launching
 `mujoco-py`, whose legacy loader requires canonical library paths.
 
-NVIDIA drivers and system EGL/OpenGL libraries cannot be installed in a Python
-virtual environment. They are normally already present on an AI server. The
-repository never invokes a system package manager or privileged command; if
-these host libraries are absent, ask the server administrator to provision
-them before running the setup script.
+NVIDIA drivers and the driver-provided EGL/OpenGL runtime cannot be installed
+in a Python virtual environment. They are normally already present on an AI
+server. The repository supplies user-local build headers but never invokes a
+system package manager or privileged command; if the NVIDIA driver runtime is
+absent, ask the server administrator to provision it before running setup.
 
 The nested bootstrap script installs PyTorch 2.8.0 from the CUDA 12.8 wheel
 index by default. This is a default, not a hardware requirement. Select a
