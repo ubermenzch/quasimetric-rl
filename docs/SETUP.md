@@ -51,7 +51,9 @@ already available, the script downloads micromamba into
 the host Python installation. `--skip-submodules`, `--skip-python`,
 `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.
 It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
-for an internal mirror. MuJoCo and every dataset are validated before use.
+for an internal mirror. Pip uses its default 15-second socket timeout and the
+bootstrap script uses 3 retries for package downloads. MuJoCo and every dataset
+are validated before use.
 
 NVIDIA drivers and system EGL/OpenGL libraries cannot be installed in a Python
 virtual environment. They are normally already present on an AI server. The
@@ -73,7 +75,8 @@ direct dependencies are pinned in `requirements/offline-py39.txt`. D4RL is
 installed without dependency resolution because its declared `mjrl` dependency
 is not used by this repository's Maze2D and AntMaze experiments. The bootstrap
 script also pins pip, setuptools, and wheel because Gym 0.18.0 cannot be built
-with current setuptools releases.
+with current setuptools releases. Pillow is pinned to a Python 3.9 binary-wheel
+release so setup does not require system JPEG development headers.
 
 ## Place External Assets
 

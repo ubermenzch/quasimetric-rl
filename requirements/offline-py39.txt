@@ -8,7 +8,9 @@
 # declared mjrl extra is not needed for this repository's Maze2D/AntMaze tasks.
 
 Cython==0.29.37
-Pillow==7.2.0
+# Pillow 7.2.0 has no compatible CPython 3.9 manylinux wheel and therefore
+# requires system JPEG headers to build from source. This wheel is self-contained.
+Pillow==9.5.0
 PyOpenGL==3.1.10
 PyYAML==6.0.3
 absl-py==2.3.1

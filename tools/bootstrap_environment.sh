@@ -11,6 +11,7 @@ VENV_DIR="${VENV_DIR:-${ROOT_DIR}/.venv}"
 PIP="${VENV_DIR}/bin/python -m pip"
 D4RL_COMMIT="d842aa194b416e564e54b0730d9f934e3e32f854"
 TORCH_VERSION="${TORCH_VERSION:-2.8.0}"
+PIP_RETRIES="${PIP_RETRIES:-3}"
 # Override with a wheel index compatible with the target driver. Set this to an
 # empty string to install the selected torch version from the default index.
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
@@ -46,19 +47,24 @@ fi
 
 # Gym 0.18.0's legacy setup metadata is rejected by newer setuptools.
 # Keep the build frontend at the versions used by the recorded environment.
-${PIP} install --upgrade "pip==23.3.2" "setuptools==65.7.0" "wheel==0.37.1"
+${PIP} install --retries "${PIP_RETRIES}" --upgrade \
+    "pip==23.3.2" "setuptools==65.7.0" "wheel==0.37.1"
 if [[ -n "${TORCH_INDEX_URL}" ]]; then
-    ${PIP} install --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"
+    ${PIP} install --retries "${PIP_RETRIES}" \
+        --index-url "${TORCH_INDEX_URL}" "torch==${TORCH_VERSION}"
 else
-    ${PIP} install "torch==${TORCH_VERSION}"
+    ${PIP} install --retries "${PIP_RETRIES}" "torch==${TORCH_VERSION}"
 fi
-${PIP} install -r "${ROOT_DIR}/requirements/offline-py39.txt"
+${PIP} install --retries "${PIP_RETRIES}" \
+    --prefer-binary -r "${ROOT_DIR}/requirements/offline-py39.txt"
 
 # D4RL's declared mjrl dependency is only used by unsupported hand/kitchen
 # suites. Install without dependency resolution to keep the point-maze setup
 # stable and avoid pulling mutable Git main branches.
-${PIP} install --no-deps "d4rl @ git+https://github.com/rail-berkeley/d4rl@${D4RL_COMMIT}"
-${PIP} install -e "${ROOT_DIR}/third_party/torch-quasimetric"
+${PIP} install --retries "${PIP_RETRIES}" --no-deps \
+    "d4rl @ git+https://github.com/rail-berkeley/d4rl@${D4RL_COMMIT}"
+${PIP} install --retries "${PIP_RETRIES}" \
+    -e "${ROOT_DIR}/third_party/torch-quasimetric"
 
 echo "Environment created at ${VENV_DIR}"
 echo "Next: source tools/qrl_env.sh && ${VENV_DIR}/bin/python tools/verify_environment.py --smoke --require-cuda"
