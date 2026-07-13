@@ -28,6 +28,14 @@ PY
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+elif ! "${VENV_DIR}/bin/python" - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info[:2] == (3, 9) else 1)
+PY
+then
+    echo "Existing virtual environment is not Python 3.9: ${VENV_DIR}" >&2
+    echo "Remove it or set VENV_DIR to a different empty directory." >&2
+    exit 1
 fi
 
 if [[ ! -f "${ROOT_DIR}/third_party/torch-quasimetric/setup.py" ]]; then

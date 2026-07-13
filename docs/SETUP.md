@@ -35,16 +35,20 @@ Confirm that the NVIDIA driver is available:
 nvidia-smi
 ```
 
-On a host with Python 3.9, the following command creates the Python virtual
-environment, downloads MuJoCo 2.1.0 and all nine required D4RL datasets (about
-1.6GB), verifies their checksums, and runs the CUDA/MuJoCo smoke test. It does
-not require elevated privileges:
+On a host with any existing Python 3.8+ interpreter, the following command
+initializes Git submodules, creates a user-local Python 3.9 when needed,
+creates the project virtual environment, downloads MuJoCo 2.1.0 and all nine
+required D4RL datasets (about 1.6GB), verifies their checksums, and runs the
+CUDA/MuJoCo smoke test. It does not require elevated privileges:
 
 ```bash
-PYTHON_BIN=python3.9 tools/setup_environment.sh
+tools/setup_environment.sh
 ```
 
-All Python dependencies are installed into `.venv`. `--skip-python`,
+All QRL Python dependencies are installed into `.venv`. If Python 3.9 is not
+already available, the script downloads micromamba into
+`../qrl-assets/micromamba/` and creates Python 3.9 there, without modifying
+the host Python installation. `--skip-submodules`, `--skip-python`,
 `--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.
 It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
 for an internal mirror. MuJoCo and every dataset are validated before use.
