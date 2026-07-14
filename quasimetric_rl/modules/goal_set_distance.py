@@ -136,11 +136,6 @@ class GoalSetDistanceLoss(LossBase):
     def _gather_state_goal_pairs(self, data: BatchData) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         state = data.observations
         raw_goal = torch.roll(data.next_observations, 1, dims=0)
-        # Future states provide reachable goals in addition to shuffled batch goals.
-        raw_goal = torch.stack([raw_goal, data.future_observations], dim=0)
-        state = state.expand_as(raw_goal)
-        state = self._flatten_observations(state)
-        raw_goal = self._flatten_observations(raw_goal)
         return state, raw_goal, self.padded_goal_state(raw_goal)
 
     def set_observation_bounds_provider(

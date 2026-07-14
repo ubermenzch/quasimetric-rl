@@ -950,6 +950,7 @@ def gpu_accepts_more_jobs(
     current_jobs: int,
     apps: list[dict[str, str]] | None,
     running_queue_pids: set[str],
+    task: Task | None = None,
 ) -> bool:
     if gpu_state is None:
         return False
@@ -967,6 +968,12 @@ def gpu_accepts_more_jobs(
     max_used = as_int(cfg(config, "GPU_MAX_USED_MB", "0"), 0)
     if max_used > 0 and gpu_state.mem_used_mb >= max_used:
         return False
+    # GSD's first IQE batch needs roughly 15 GiB plus a multi-GiB temporary
+    # allocation. Do not co-locate it with an existing training process.
+    if task is not None and "_GSD_" in task.task_id:
+        gsd_max_used = as_int(cfg(config, "GSD_MAX_PRELAUNCH_MEM_MB", "4000"), 4000)
+        if gsd_max_used > 0 and gpu_state.mem_used_mb >= gsd_max_used:
+            return False
     if external_gpu_busy(config, gpu_state.gpu, apps, running_queue_pids):
         return False
     return True
@@ -996,9 +1003,10 @@ def choose_pending(
     active_task_ids: set[str],
     status_dir: Path,
     retry_failed: bool,
+    skip_task_ids: set[str] | None = None,
 ) -> Task | None:
     for task in tasks:
-        if task.task_id in active_task_ids:
+        if task.task_id in active_task_ids or (skip_task_ids and task.task_id in skip_task_ids):
             continue
         status = read_status(status_dir, task.task_id)
         state = status.get("state", "PENDING")
@@ -1297,6 +1305,7 @@ def main() -> int:
                         active_task_ids.add(task.task_id)
                         running_queue_pids.add(pid)
 
+            deferred_task_ids: set[str] = set()
             while True:
                 candidates = []
                 for gpu in allowed_gpus:
@@ -1307,6 +1316,25 @@ def main() -> int:
                         candidates.append(gpu)
                 if not candidates:
                     break
+                task = choose_pending(
+                    config, tasks, active_task_ids, status_dir, retry_failed, deferred_task_ids
+                )
+                if task is None:
+                    break
+                candidates = [
+                    gpu for gpu in candidates
+                    if gpu_accepts_more_jobs(
+                        config,
+                        gpu_states.get(gpu),
+                        len(running_by_gpu.get(gpu, set())),
+                        apps,
+                        running_queue_pids,
+                        task,
+                    )
+                ]
+                if not candidates:
+                    deferred_task_ids.add(task.task_id)
+                    continue
                 gpu = min(
                     candidates,
                     key=lambda candidate: gpu_schedule_key(
@@ -1314,9 +1342,6 @@ def main() -> int:
                         len(running_by_gpu.get(candidate, set())),
                     ),
                 )
-                task = choose_pending(config, tasks, active_task_ids, status_dir, retry_failed)
-                if task is None:
-                    break
                 if dry_run:
                     print(f"[{timestamp()}] DRY_RUN would launch {task.task_id} on GPU {gpu}", flush=True)
                     active_task_ids.add(task.task_id)
