@@ -109,9 +109,18 @@ class Trainer(object):
         self.agent, self.losses = agent_conf.make(
             env_spec=replay.env_spec,
             total_optim_steps=self.get_total_optim_steps(interaction_conf.total_env_steps),
-            profiler=profiler)
+            profiler=profiler,
+            goal_set_dims=(
+                replay.goal_set_dims
+                if agent_conf.goal_set_distance.enabled
+                and agent_conf.goal_set_distance.losses.goal_dims is None
+                else None
+            ),
+        )
         self.agent.to(device)
         self.losses.to(device)
+        if self.losses.goal_set_distance_loss is not None:
+            self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
 
         logging.info('Agent:\n\t' + str(self.agent).replace('\n', '\n\t') + '\n\n')
         logging.info('Losses:\n\t' + str(self.losses).replace('\n', '\n\t') + '\n\n')

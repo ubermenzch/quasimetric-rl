@@ -455,12 +455,24 @@ def extra_arg_value(extra_args: str, key: str) -> str:
 
 
 def task_variant(task: Task) -> str:
+    if "CDA_Tr" in task.task_id:
+        return "CDA-Tr"
+    if "_GSD_" in task.task_id:
+        return "GSD"
+    if "_Tmse_" in task.task_id:
+        return "Tmse"
+    if "_A-latent_" in task.task_id or "_Alatent_" in task.task_id:
+        return "A-latent"
+    if "_Sonly_" in task.task_id:
+        return "Sonly"
     if "TsepTr" in task.task_id:
         return "TsepTr"
     if "_Tr_" in task.task_id:
         return "Tr"
     if "Tsep" in task.task_id:
         return "Tsep"
+    if "_Base_" in task.task_id:
+        return "Base"
     return "base"
 
 

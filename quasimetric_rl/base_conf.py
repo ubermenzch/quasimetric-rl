@@ -125,11 +125,12 @@ class BaseConf(abc.ABC):
             if self.agent.num_critics > 1:
                 specs.append(f'{self.agent.num_critics}critic')
             if self.agent.goal_set_distance.enabled:
+                goal_dims = self.agent.goal_set_distance.losses.goal_dims
                 specs.append(
                     'GSD('
                     f'n={self.agent.goal_set_distance.losses.num_goal_samples},'
-                    f'dims={":".join(map(str, self.agent.goal_set_distance.losses.goal_dims))},'
-                    'non_goal=batch_uniform'
+                    f'dims={"auto" if goal_dims is None else ":".join(map(str, goal_dims))},'
+                    'non_goal=global_uniform'
                     ')'
                 )
             if self.agent.actor is not None:

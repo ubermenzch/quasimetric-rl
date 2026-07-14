@@ -17,18 +17,25 @@ class QRLAgent(Module):
     actor: Optional[actor.Actor]
     critics: Collection[quasimetric_critic.QuasimetricCritic]
     goal_set_distance: Optional[goal_set_distance_module.GoalSetDistance]
+    goal_set_dims: Optional[Tuple[int, ...]]
 
     def __init__(self, actor: Optional['actor.Actor'],
                  critics: Collection[quasimetric_critic.QuasimetricCritic],
-                 goal_set_distance: Optional['goal_set_distance_module.GoalSetDistance'] = None):
+                 goal_set_distance: Optional['goal_set_distance_module.GoalSetDistance'] = None,
+                 goal_set_dims: Optional[Tuple[int, ...]] = None):
         super().__init__()
         self.add_module('actor', actor)
         self.critics = torch.nn.ModuleList(critics)
         self.add_module('goal_set_distance', goal_set_distance)
+        self.goal_set_dims = goal_set_dims
 
     def act(self, obs: torch.Tensor, goal: torch.Tensor) -> torch.distributions.Distribution:
         if self.actor is None:
             raise RuntimeError("This agent has no actor.")
+        if self.goal_set_dims is not None:
+            padded_goal = torch.zeros_like(goal)
+            padded_goal[..., list(self.goal_set_dims)] = goal[..., list(self.goal_set_dims)]
+            goal = padded_goal
         if self.actor.input_mode == 'raw':
             return self.actor(obs, goal)
         if self.actor.input_mode != 'latent':
@@ -217,7 +224,13 @@ class QRLConf:
         return 0
 
     def make(self, *, env_spec: EnvSpec, total_optim_steps: int,
-             profiler: Optional[TimingProfiler] = None) -> Tuple[QRLAgent, QRLLosses]:
+             profiler: Optional[TimingProfiler] = None,
+             goal_set_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
+        if self.actor is not None and self.actor.model.input_mode == 'latent' and self.num_critics != 1:
+            raise ValueError(
+                'agent.actor.model.input_mode=latent requires agent.num_critics=1; '
+                'the latent actor must use a single, stable critic encoder.'
+            )
         if self.actor is None:
             actor = actor_losses = None
         else:
@@ -230,16 +243,25 @@ class QRLConf:
             self.quasimetric_critic.make(env_spec=env_spec, total_optim_steps=total_optim_steps)
             for _ in range(self.num_critics)
         ])
+        effective_goal_set_dims = None
+        if self.goal_set_distance.enabled:
+            effective_goal_set_dims = (
+                self.goal_set_distance.losses.goal_dims
+                if self.goal_set_distance.losses.goal_dims is not None
+                else goal_set_dims
+            )
         goal_set_distance, goal_set_distance_loss = self.goal_set_distance.make(
             env_spec=env_spec,
             total_optim_steps=total_optim_steps,
             latent_size=self.quasimetric_critic.model.encoder.latent_size,
             num_critics=self.num_critics,
+            goal_dims=effective_goal_set_dims,
         )
         return QRLAgent(
             actor=actor,
             critics=critics,
             goal_set_distance=goal_set_distance,
+            goal_set_dims=effective_goal_set_dims,
         ), QRLLosses(
             actor_loss=actor_losses,
             critic_losses=critic_losses,

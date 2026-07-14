@@ -64,19 +64,29 @@ class GoalSetDistanceLoss(LossBase):
         # construction samples non-goal dimensions from observed state support,
         # so this radius is intentionally not used.
         goal_condition_radius: float = attrs.field(default=0.5, validator=attrs.validators.gt(0))
-        goal_dims: Tuple[int, ...] = attrs.field(default=(0, 1), converter=tuple)
+        # If omitted, use the environment's registered goal-state dimensions.
+        # Set explicitly to override the built-in mapping for a custom task.
+        goal_dims: Optional[Tuple[int, ...]] = attrs.field(
+            default=None,
+            converter=lambda dims: None if dims is None else tuple(dims),
+        )
         include_goal_state: bool = False
         optim: AdamWSpec.Conf = AdamWSpec.Conf(lr=1e-4)
 
         def make(self, model: GoalSetDistance, total_optim_steps: int,
-                 env_spec: EnvSpec) -> 'GoalSetDistanceLoss':
+                 env_spec: EnvSpec, goal_dims: Optional[Tuple[int, ...]]) -> 'GoalSetDistanceLoss':
+            goal_dims = self.goal_dims if self.goal_dims is not None else goal_dims
+            if goal_dims is None:
+                raise ValueError(
+                    'GoalSetDistance requires goal_dims or an environment-provided default'
+                )
             return GoalSetDistanceLoss(
                 model,
                 total_optim_steps=total_optim_steps,
                 env_spec=env_spec,
                 weight=self.weight,
                 num_goal_samples=self.num_goal_samples,
-                goal_dims=self.goal_dims,
+                goal_dims=goal_dims,
                 include_goal_state=self.include_goal_state,
                 optim_spec=self.optim.make(),
             )
@@ -89,6 +99,7 @@ class GoalSetDistanceLoss(LossBase):
     optim: OptimWrapper
     sched: torch.optim.lr_scheduler._LRScheduler
     profiler: Optional[Any]
+    observation_bounds_provider: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]]
 
     def __init__(self, model: GoalSetDistance, *, total_optim_steps: int, env_spec: EnvSpec,
                  weight: float, num_goal_samples: int, goal_dims: Tuple[int, ...],
@@ -108,6 +119,7 @@ class GoalSetDistanceLoss(LossBase):
         self.include_goal_state = include_goal_state
         self.optim, self.sched = optim_spec.create_optim_scheduler(model.parameters(), total_optim_steps)
         self.profiler = None
+        self.observation_bounds_provider = None
 
     def _record(self, name: str):
         return contextlib.nullcontext() if self.profiler is None else self.profiler.record(name)
@@ -131,23 +143,24 @@ class GoalSetDistanceLoss(LossBase):
         raw_goal = self._flatten_observations(raw_goal)
         return state, raw_goal, self.padded_goal_state(raw_goal)
 
-    def _sample_goal_condition_states(self, raw_goal_states: torch.Tensor,
-                                      data: BatchData) -> torch.Tensor:
-        """Sample full states with fixed goal dims and random non-goal dims.
+    def set_observation_bounds_provider(
+            self, provider: Callable[..., Tuple[torch.Tensor, torch.Tensor]]) -> None:
+        """Set the dataset or replay-buffer source of global observation bounds."""
+        self.observation_bounds_provider = provider
 
-        Most MuJoCo wrappers declare unbounded Box observations. Sampling from
-        their formal bounds is impossible, so the valid range is estimated from
-        the current batch's observed, next, and future states.
-        """
-        support = torch.cat([
-            self._flatten_observations(data.observations),
-            self._flatten_observations(data.next_observations),
-            self._flatten_observations(data.future_observations),
-        ], dim=0)
-        low, high = support.amin(dim=0), support.amax(dim=0)
-        span = high - low
-        shape = (raw_goal_states.shape[0], self.num_goal_samples, support.shape[-1])
-        candidates = low + torch.rand(shape, device=support.device, dtype=support.dtype) * span
+    def _sample_goal_condition_states(self, raw_goal_states: torch.Tensor) -> torch.Tensor:
+        """Sample non-goal dimensions within dataset or replay-buffer bounds."""
+        if self.observation_bounds_provider is None:
+            raise RuntimeError('GoalSetDistanceLoss requires an observation-bounds provider')
+        num_pairs = raw_goal_states.shape[0]
+        low, high = self.observation_bounds_provider(
+            device=raw_goal_states.device,
+        )
+        low, high = low.to(dtype=raw_goal_states.dtype), high.to(dtype=raw_goal_states.dtype)
+        shape = (num_pairs, self.num_goal_samples, *self.observation_shape)
+        candidates = low + torch.rand(
+            shape, device=raw_goal_states.device, dtype=raw_goal_states.dtype,
+        ) * (high - low)
         candidates[..., list(self.goal_dims)] = raw_goal_states[:, None, list(self.goal_dims)]
         if self.include_goal_state:
             candidates = torch.cat([raw_goal_states[:, None, :], candidates], dim=1)
@@ -159,7 +172,7 @@ class GoalSetDistanceLoss(LossBase):
             raise RuntimeError('GoalSetDistance head count must match the critic count')
         with self._record('train/goal_set_distance/gather_pairs'):
             states, raw_goals, padded_goals = self._gather_state_goal_pairs(data)
-            candidates = self._sample_goal_condition_states(raw_goals, data)
+            candidates = self._sample_goal_condition_states(raw_goals)
 
         preds, targets = [], []
         with torch.no_grad(), self._record('train/goal_set_distance/critic_targets'):
@@ -215,11 +228,17 @@ class GoalSetDistanceConf:
     losses: GoalSetDistanceLoss.Conf = GoalSetDistanceLoss.Conf()
 
     def make(self, *, env_spec: EnvSpec, total_optim_steps: int, latent_size: int,
-             num_critics: int) -> Tuple[Optional[GoalSetDistance], Optional[GoalSetDistanceLoss]]:
+             num_critics: int, goal_dims: Optional[Tuple[int, ...]] = None) -> Tuple[
+                 Optional[GoalSetDistance], Optional[GoalSetDistanceLoss]]:
         if not self.enabled:
             return None, None
         model = self.model.make(latent_size=latent_size, num_critics=num_critics)
-        return model, self.losses.make(model, total_optim_steps=total_optim_steps, env_spec=env_spec)
+        return model, self.losses.make(
+            model,
+            total_optim_steps=total_optim_steps,
+            env_spec=env_spec,
+            goal_dims=goal_dims,
+        )
 
 
 __all__ = ['GoalSetDistance', 'GoalSetDistanceLoss', 'GoalSetDistanceConf']

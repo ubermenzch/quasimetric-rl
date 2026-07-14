@@ -23,7 +23,7 @@ args=(
     agent.actor.losses.actor_optim.lr=3e-5
     agent.actor.losses.min_dist.adaptive_entropy_regularizer=False
     agent.actor.losses.min_dist.add_goal_as_future_state=False
-    agent.actor.losses.behavior_cloning.weight=0.05
+    agent.actor.losses.behavior_cloning.weight=0
 )
 
 exec python -m offline.main "${args[@]}" "${@}"

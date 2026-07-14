@@ -120,6 +120,12 @@ def make_agent(result_dir: Path, checkpoint: Path, device: torch.device) -> tupl
     agent = agent_conf.make(
         env_spec=dataset.env_spec,
         total_optim_steps=int(conf.get("total_optim_steps", 1)),
+        goal_set_dims=(
+            dataset.goal_set_dims
+            if agent_conf.goal_set_distance.enabled
+            and agent_conf.goal_set_distance.losses.goal_dims is None
+            else None
+        ),
     )[0]
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     agent.load_state_dict(state["agent"])

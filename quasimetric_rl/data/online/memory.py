@@ -137,6 +137,21 @@ class ReplayBuffer(Dataset):
         return self.num_episodes_realized * self.episode_length
 
     @property
+    def num_observations_available(self) -> int:
+        return self.num_episodes_realized * (self.episode_length + 1)
+
+    def _update_observation_bounds_cache(self, observations: torch.Tensor) -> None:
+        low, high = observations.amin(dim=0), observations.amax(dim=0)
+        cached = getattr(self, '_observation_bounds_cache', None)
+        if cached is None:
+            self._observation_bounds_cache = (low, high)
+        else:
+            self._observation_bounds_cache = (
+                torch.minimum(cached[0], low),
+                torch.maximum(cached[1], high),
+            )
+
+    @property
     def episodes_capacity(self) -> int:
         return self.raw_data.num_episodes
 
@@ -258,6 +273,11 @@ class ReplayBuffer(Dataset):
         self.num_episodes_realized = n
         self.num_successful_episodes = int(state["num_successful_episodes"])
         self.num_successful_transitions = int(state["num_successful_transitions"])
+        self._observation_bounds_cache = None
+        if self.num_observations_available > 0:
+            self._update_observation_bounds_cache(
+                self.raw_data.all_observations[:self.num_observations_available],
+            )
 
     def collect_rollout(self, actor: Callable[[torch.Tensor, torch.Tensor, gym.Space], np.ndarray], *,
                         env: Optional[FixedLengthEnvWrapper] = None) -> EpisodeData:
@@ -320,6 +340,7 @@ class ReplayBuffer(Dataset):
         self.raw_data.all_observations.unflatten(
             0, [self.episodes_capacity, self.episode_length + 1],
         )[self.num_episodes_realized] = episode.all_observations
+        self._update_observation_bounds_cache(episode.all_observations)
 
         self.raw_data.actions.unflatten(
             0, [self.episodes_capacity, self.episode_length],

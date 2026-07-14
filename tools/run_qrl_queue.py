@@ -14,6 +14,8 @@ import argparse
 import csv
 import fcntl
 import getpass
+import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -27,6 +29,7 @@ TRANSIENT_FAILURE_PATTERNS = (
     "CUDA driver initialization failed",
 )
 TRANSIENT_LOG_TAIL_BYTES = 1024 * 1024
+TASK_MANIFEST_NAME = ".qrl_task.json"
 
 
 @dataclass
@@ -54,6 +57,26 @@ class GpuState:
     mem_used_mb: int
     mem_total_mb: int
     util_pct: int
+
+
+def normalized_task_definition(task: Task) -> dict[str, object]:
+    return {
+        "task_id": task.task_id,
+        "mode": task.mode,
+        "env_name": task.env_name,
+        "seed": task.seed,
+        "steps": task.steps,
+        "extra_args": task.extra_args.split(),
+    }
+
+
+def task_fingerprint(task: Task) -> str:
+    payload = json.dumps(
+        normalized_task_definition(task),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 class QueueLock:
@@ -108,6 +131,15 @@ def cfg(config: dict[str, str], key: str, default: str) -> str:
 
 def as_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def bool_arg_value(extra_args: list[str], key: str, default: bool) -> bool:
+    value = default
+    prefix = key + "="
+    for arg in extra_args:
+        if arg.startswith(prefix):
+            value = as_bool(arg[len(prefix):])
+    return value
 
 
 def as_int(value: str, default: int) -> int:
@@ -192,6 +224,7 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
         f"state={state}",
         f"updated_at={timestamp()}",
         f"task_id={task.task_id}",
+        f"task_fingerprint={task_fingerprint(task)}",
         f"mode={task.mode}",
         f"env_name={task.env_name}",
         f"seed={task.seed}",
@@ -480,6 +513,35 @@ def task_output_dir(config: dict[str, str], task: Task) -> Path:
     return results_root(config) / task.task_id
 
 
+def task_manifest_path(output_dir: Path) -> Path:
+    return output_dir / TASK_MANIFEST_NAME
+
+
+def write_task_manifest(output_dir: Path, task: Task) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = task_manifest_path(output_dir)
+    data = {
+        "fingerprint": task_fingerprint(task),
+        "task": normalized_task_definition(task),
+        "updated_at": timestamp(),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp_path.replace(path)
+
+
+def task_manifest_fingerprint(output_dir: Path) -> str:
+    path = task_manifest_path(output_dir)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return "invalid"
+    fingerprint = data.get("fingerprint") if isinstance(data, dict) else None
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else "invalid"
+
+
 def output_complete(output_dir: Path) -> bool:
     return (output_dir / "COMPLETE").exists()
 
@@ -524,9 +586,43 @@ def output_started(output_dir: Path) -> bool:
     if not output_dir.exists():
         return False
     try:
-        return any(output_dir.iterdir())
+        return any(path.name != TASK_MANIFEST_NAME for path in output_dir.iterdir())
     except OSError:
         return True
+
+
+def task_identity_issue(status: dict[str, str], output_dir: Path, task: Task) -> str:
+    expected = task_fingerprint(task)
+    if status:
+        recorded = status.get("task_fingerprint", "")
+        if not recorded:
+            return "missing_status_task_fingerprint"
+        if recorded != expected:
+            return "status_task_definition_mismatch"
+    if not output_started(output_dir):
+        return ""
+    recorded = task_manifest_fingerprint(output_dir)
+    if not recorded:
+        return "missing_output_task_manifest"
+    if recorded == "invalid":
+        return "invalid_output_task_manifest"
+    if recorded != expected:
+        return "output_task_definition_mismatch"
+    return ""
+
+
+def pause_for_identity_issue(
+    status_dir: Path,
+    task: Task,
+    output_dir: Path,
+    issue: str,
+) -> None:
+    write_status(status_dir, task, "PAUSED", {
+        "error": issue,
+        "output_dir": str(output_dir),
+        "output_task_fingerprint": task_manifest_fingerprint(output_dir),
+    })
+    print(f"[{timestamp()}] PAUSE_TASK_IDENTITY {task.task_id} reason={issue}", flush=True)
 
 
 def task_terminal(status: dict[str, str], retry_failed: bool) -> bool:
@@ -538,6 +634,15 @@ def sync_finished_outputs(config: dict[str, str], tasks: list[Task], status_dir:
     for task in tasks:
         status = read_status(status_dir, task.task_id)
         output_dir = task_output_dir(config, task)
+        issue = task_identity_issue(status, output_dir, task)
+        if issue:
+            # Do not relabel a process which may still be running under the old
+            # definition. Once it exits, normal reconciliation makes it terminal.
+            if status.get("state") == "RUNNING":
+                continue
+            if status.get("state") != "PAUSED" or status.get("error") != issue:
+                pause_for_identity_issue(status_dir, task, output_dir, issue)
+            continue
         if output_finished(output_dir) and status.get("state") != "DONE":
             write_status(status_dir, task, "DONE", {
                 "exit_code": status.get("exit_code", "0"),
@@ -853,6 +958,10 @@ def choose_pending(
         if state == "FAILED" and not retry_failed:
             continue
         output_dir = task_output_dir(config, task)
+        issue = task_identity_issue(status, output_dir, task)
+        if issue:
+            pause_for_identity_issue(status_dir, task, output_dir, issue)
+            continue
         if output_finished(output_dir):
             write_status(status_dir, task, "DONE", {
                 "exit_code": status.get("exit_code", "0"),
@@ -937,6 +1046,12 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
     output_dir = task_output_dir(config, task)
     output_dir.mkdir(parents=True, exist_ok=True)
     env = command_env(config, gpu)
+    extra = task.extra_args.split() if task.extra_args.strip() else []
+    resume_enabled = bool_arg_value(
+        extra,
+        "resume_if_possible",
+        as_bool(cfg(config, "RESUME_IF_POSSIBLE", "1")),
+    )
     common = [
         f"seed={task.seed}",
         f"device.index={cfg(config, 'DEVICE_INDEX', '0')}",
@@ -947,9 +1062,19 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
     if as_bool(cfg(config, "RESUME_IF_POSSIBLE", "1")):
         common.append("resume_if_possible=True")
     if task.mode == "online":
+        save_replay_buffer = bool_arg_value(
+            extra,
+            "save_replay_buffer",
+            as_bool(cfg(config, "ONLINE_SAVE_REPLAY_BUFFER", "False")),
+        )
+        if resume_enabled and not save_replay_buffer:
+            raise ValueError(
+                "online resume requires effective save_replay_buffer=True "
+                "(set ONLINE_SAVE_REPLAY_BUFFER=True and do not override it); "
+                "otherwise the replay buffer is empty after checkpoint restore"
+            )
         common.append(f"save_replay_buffer={cfg(config, 'ONLINE_SAVE_REPLAY_BUFFER', 'False')}")
         common.append(f"save_final_replay_buffer={cfg(config, 'ONLINE_SAVE_FINAL_REPLAY_BUFFER', 'True')}")
-    extra = task.extra_args.split() if task.extra_args.strip() else []
     if task.mode == "online":
         cmd = [
             str(python_bin), "-m", "online.main",
@@ -978,6 +1103,11 @@ def launch_task(config: dict[str, str], task: Task, gpu: str) -> ActiveJob | Non
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
     log_dir.mkdir(parents=True, exist_ok=True)
     output_dir = task_output_dir(config, task)
+    status = read_status(status_dir, task.task_id)
+    issue = task_identity_issue(status, output_dir, task)
+    if issue:
+        pause_for_identity_issue(status_dir, task, output_dir, issue)
+        return None
     if output_finished(output_dir):
         write_status(status_dir, task, "DONE", {
             "exit_code": "0",
@@ -988,6 +1118,7 @@ def launch_task(config: dict[str, str], task: Task, gpu: str) -> ActiveJob | Non
         print(f"[{timestamp()}] SKIP_FINISHED_OUTPUT {task.task_id}", flush=True)
         return None
     cmd, env, cwd, output_dir = build_command(config, task, gpu)
+    write_task_manifest(output_dir, task)
     log_file = log_dir / f"{task.task_id}_{time.strftime('%Y%m%d-%H%M%S')}.log"
     with log_file.open("w") as log:
         log.write(f"task_id: {task.task_id}\n")

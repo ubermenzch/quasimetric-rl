@@ -148,6 +148,29 @@ class EpisodeData(MultiEpisodeData):
 LOAD_EPISODES_REGISTRY: Mapping[Tuple[str, str], Callable[[], Iterator[EpisodeData]]] = {}
 CREATE_ENV_REGISTRY: Mapping[Tuple[str, str], Callable[[], gym.Env]] = {}
 
+# Coordinates in the state observation that define goal attainment for the
+# vector environments bundled with this repository.  They intentionally refer
+# to the state half of each goal-conditioned observation, not a padded goal.
+GOAL_SET_DIMS_REGISTRY: Mapping[Tuple[str, str], Tuple[int, ...]] = {
+    **{
+        ('d4rl', name): (0, 1)
+        for name in (
+            'maze2d-umaze-v1',
+            'maze2d-medium-v1',
+            'maze2d-large-v1',
+            'antmaze-umaze-v2',
+            'antmaze-umaze-diverse-v2',
+            'antmaze-medium-play-v2',
+            'antmaze-medium-diverse-v2',
+            'antmaze-large-play-v2',
+            'antmaze-large-diverse-v2',
+        )
+    },
+    ('gcrl', 'FetchReach'): (0, 1, 2),
+    ('gcrl', 'FetchPush'): (3, 4, 5),
+    ('gcrl', 'FetchSlide'): (3, 4, 5),
+}
+
 
 def register_offline_env(kind: str, spec: str, *, load_episodes_fn, create_env_fn):
     r"""
@@ -217,6 +240,17 @@ class Dataset:
     def create_env(self) -> gym.Env:
         return CREATE_ENV_REGISTRY[self.kind, self.name]()
 
+    @property
+    def goal_set_dims(self) -> Tuple[int, ...]:
+        """State coordinates used to define goal sets for supported vector tasks."""
+        try:
+            return GOAL_SET_DIMS_REGISTRY[self.kind, self.name]
+        except KeyError as exc:
+            raise ValueError(
+                f'No default goal-set dimensions for {(self.kind, self.name)!r}; '
+                'set agent.goal_set_distance.losses.goal_dims explicitly.'
+            ) from exc
+
     def load_episodes(self) -> Iterator[EpisodeData]:
         return LOAD_EPISODES_REGISTRY[self.kind, self.name]()
 
@@ -262,6 +296,25 @@ class Dataset:
 
     def get_observations(self, obs_indices: torch.Tensor):
         return self.raw_data.all_observations[obs_indices]
+
+    @property
+    def num_observations_available(self) -> int:
+        """Number of valid observations that can be sampled globally."""
+        return self.raw_data.all_observations.shape[0]
+
+    def observation_bounds(self, *, device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return cached per-dimension bounds over all available observations."""
+        if self.num_observations_available <= 0:
+            raise RuntimeError('Cannot compute bounds for an empty dataset')
+        cached = getattr(self, '_observation_bounds_cache', None)
+        if cached is None:
+            observations = self.raw_data.all_observations[:self.num_observations_available]
+            cached = (observations.amin(dim=0), observations.amax(dim=0))
+            self._observation_bounds_cache = cached
+        low, high = cached
+        if device is not None:
+            low, high = low.to(device), high.to(device)
+        return low, high
 
     def get_transition_history(self, indices: torch.Tensor, history_length: int):
         if history_length <= 0:
