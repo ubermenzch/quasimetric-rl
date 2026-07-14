@@ -33,9 +33,11 @@ class BatchData(TensorCollectionAttrsMixin):  # TensorCollectionAttrsMixin has s
 
     future_observations: torch.Tensor  # sampled!
 
-    history_observations: Optional[torch.Tensor] = None  # [B, H + 1, *obs_shape], contiguous when available
-    history_actions: Optional[torch.Tensor] = None  # [B, H, *action_shape], aligned with history_observations
-    history_mask: Optional[torch.Tensor] = None  # [B, H], True where action and next observation are valid
+    # H input state frames followed by the final prediction target. The final
+    # input frame is the sampled current state; earlier frames are its history.
+    history_observations: Optional[torch.Tensor] = None  # [B, H + 1, *obs_shape]
+    history_actions: Optional[torch.Tensor] = None  # [B, H, *action_shape]
+    history_mask: Optional[torch.Tensor] = None  # [B, H], True for valid in-episode transitions
 
     @property
     def device(self) -> torch.device:
@@ -321,20 +323,17 @@ class Dataset:
             return None, None, None
         eindices = self.indices_to_episode_indices[indices]
         tindices = self.indices_to_episode_timesteps[indices]
-        epilengths = self.raw_data.episode_lengths[eindices]
         obs_indices = indices + eindices
-        offsets = torch.arange(history_length, device=indices.device)
+        # The sampled transition is the final (current) input frame. Earlier
+        # frames provide history, so h=1 has no historical frame and h=2 has one.
+        offsets = torch.arange(history_length, device=indices.device) - (history_length - 1)
         transition_indices = indices[:, None] + offsets
-        valid = (tindices[:, None] + offsets) < epilengths[:, None]
+        valid = (tindices[:, None] + offsets) >= 0
         safe_transition_indices = torch.where(valid, transition_indices, indices[:, None])
         safe_obs_indices = torch.where(valid, obs_indices[:, None] + offsets, obs_indices[:, None])
-        final_obs_indices = obs_indices[:, None] + torch.clamp(
-            history_length * torch.ones_like(tindices[:, None]),
-            max=(epilengths - tindices)[:, None],
-        )
         history_observations = torch.cat([
             self.get_observations(safe_obs_indices),
-            self.get_observations(final_obs_indices),
+            self.get_observations((obs_indices + 1)[:, None]),
         ], dim=1)
         history_actions = self.raw_data.actions[safe_transition_indices]
         return history_observations, history_actions, valid
@@ -361,10 +360,12 @@ class Dataset:
             probs=pdeltas,
         ).sample()
         future_observations = self.get_observations(obs_indices + 1 + deltas)
-        history_observations, history_actions, history_mask = self.get_transition_history(
-            indices,
-            self.transition_history_length,
-        )
+        history_observations = history_actions = history_mask = None
+        if self.transition_history_length > 0:
+            history_observations, history_actions, history_mask = self.get_transition_history(
+                indices,
+                self.transition_history_length,
+            )
 
         return BatchData(
             observations=obs,

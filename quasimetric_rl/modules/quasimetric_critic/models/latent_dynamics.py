@@ -163,6 +163,8 @@ class LatentDynamics(nn.Module):
         kind: str = 'mlp'
         arch: Tuple[int, ...] = (512, 512)
         residual: bool = True
+        # Counts input state frames: h=1 is current state only; h=2 adds one
+        # historical state. The following state is the prediction target.
         history_length: int = attrs.field(default=8, validator=attrs.validators.gt(0))
         transformer_d_model: Optional[int] = attrs.field(
             default=None,

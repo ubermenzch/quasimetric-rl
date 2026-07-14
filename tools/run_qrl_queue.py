@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
-import getpass
 import hashlib
 import json
 import os
@@ -161,6 +160,12 @@ def resolve_path(value: str) -> Path:
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
+def resolve_executable(value: str) -> Path:
+    """Resolve a configured executable without dereferencing virtualenv links."""
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
+
 def default_nvidia_library_dir() -> str:
     candidates = [Path("/usr/local/nvidia/lib64"), Path("/usr/lib/nvidia")]
     candidates.extend(sorted(Path("/usr/lib").glob("nvidia-[0-9][0-9][0-9]")))
@@ -249,6 +254,14 @@ def process_owner(pid: int | str) -> str:
         return ""
 
 
+def is_queue_user_process(pid: int | str) -> bool:
+    # Ownership is fixed to the operating-system user that starts this runner.
+    try:
+        return Path(f"/proc/{pid}").stat().st_uid == os.geteuid()
+    except OSError:
+        return False
+
+
 def pid_alive(pid: int | str) -> bool:
     text = str(pid)
     return text.isdigit() and Path(f"/proc/{text}").exists()
@@ -289,10 +302,8 @@ def terminate_pid(pid: str, config: dict[str, str], grace_seconds: float) -> str
         return "invalid_pid"
     if not pid_alive(pid):
         return "not_alive"
-    queue_user = cfg(config, "QUEUE_USER", getpass.getuser())
-    owner = process_owner(pid)
-    if owner and owner != queue_user:
-        return f"owner_mismatch:{owner}"
+    if not is_queue_user_process(pid):
+        return f"owner_mismatch:{process_owner(pid) or 'unknown'}"
     pid_int = int(pid)
     try:
         os.kill(pid_int, signal.SIGTERM)
@@ -410,6 +421,8 @@ def legal_running_gpu_pids(
         expected_gpu = status.get("gpu", "").strip()
         if status.get("state") != "RUNNING" or not pid or expected_gpu not in allowed:
             continue
+        if not is_queue_user_process(pid):
+            continue
         if gpu_by_pid.get(pid) == expected_gpu:
             legal.add(pid)
     return legal
@@ -426,7 +439,6 @@ def kill_illegal_user_gpu_jobs(
     if not as_bool(cfg(config, "KILL_ILLEGAL_USER_GPU_JOBS", "1")):
         return False
     grace_seconds = termination_grace_seconds(config)
-    queue_user = cfg(config, "QUEUE_USER", getpass.getuser())
     killed_any = False
     for app in apps:
         gpu = app.get("gpu", "")
@@ -441,7 +453,7 @@ def kill_illegal_user_gpu_jobs(
                 flush=True,
             )
             continue
-        if process_owner(pid) != queue_user:
+        if not is_queue_user_process(pid):
             continue
         details = (
             f"gpu={gpu} pid={pid} process_name={app.get('process_name', '')} "
@@ -734,6 +746,24 @@ def reconcile_running_statuses(
         for task in tasks:
             status = read_status(status_dir, task.task_id)
             if status.get("state") == "RUNNING":
+                pid = status.get("pid", "")
+                if pid and pid_alive(pid) and not is_queue_user_process(pid):
+                    extra = {
+                        "error": "running_pid_owner_mismatch",
+                        "previous_gpu": status.get("gpu", ""),
+                        "previous_pid": pid,
+                        "actual_owner": process_owner(pid) or "unknown",
+                        "log_file": status.get("log_file", ""),
+                        "output_dir": status.get("output_dir", ""),
+                    }
+                    if not dry_run:
+                        write_status(status_dir, task, "PAUSED", extra)
+                    print(
+                        f"[{timestamp()}] PAUSE_FOREIGN_RUNNING_PID {task.task_id} "
+                        f"pid={pid} owner={extra['actual_owner']}",
+                        flush=True,
+                    )
+                    continue
                 gpu = status.get("gpu", "")
                 running_by_gpu.setdefault(gpu, set()).add(task.task_id)
         return running_by_gpu
@@ -763,6 +793,25 @@ def reconcile_running_statuses(
             continue
         pid = status.get("pid", "")
         expected_gpu = status.get("gpu", "")
+        if pid and pid_alive(pid) and not is_queue_user_process(pid):
+            extra = {
+                "error": "running_pid_owner_mismatch",
+                "previous_gpu": expected_gpu,
+                "previous_pid": pid,
+                "actual_owner": process_owner(pid) or "unknown",
+                "log_file": status.get("log_file", ""),
+                "output_dir": status.get("output_dir", ""),
+            }
+            if dry_run:
+                print(f"[{timestamp()}] DRY_RUN would pause foreign RUNNING pid {task.task_id}: {extra}", flush=True)
+                continue
+            write_status(status_dir, task, "PAUSED", extra)
+            print(
+                f"[{timestamp()}] PAUSE_FOREIGN_RUNNING_PID {task.task_id} "
+                f"pid={pid} owner={extra['actual_owner']}",
+                flush=True,
+            )
+            continue
         actual_gpu_all = gpu_by_pid_all.get(pid, "")
         actual_gpu = gpu_by_pid.get(pid, "")
         if expected_gpu and expected_gpu not in allowed:
@@ -882,15 +931,15 @@ def external_gpu_busy(
         return False
     if apps is None:
         return True
-    queue_user = cfg(config, "QUEUE_USER", getpass.getuser())
     for app in apps:
         pid = app.get("pid", "")
         if app.get("gpu") != gpu or not pid:
             continue
         if pid in running_queue_pids:
             continue
-        owner = process_owner(pid)
-        if owner != queue_user or not as_bool(cfg(config, "ALLOW_UNTRACKED_OWN_PROCESSES", "0")):
+        if not is_queue_user_process(pid):
+            return True
+        if not as_bool(cfg(config, "ALLOW_UNTRACKED_OWN_PROCESSES", "0")):
             return True
     return False
 
@@ -908,11 +957,11 @@ def gpu_accepts_more_jobs(
     if current_jobs >= max_jobs:
         return False
     util_limit = as_float(cfg(config, "GPU_UTIL_LIMIT_PCT", "50"), 50.0)
-    if gpu_state.util_pct >= util_limit:
+    if util_limit > 0.0 and gpu_state.util_pct >= util_limit:
         return False
     mem_limit = as_float(cfg(config, "GPU_MEM_LIMIT_PCT", "90"), 90.0)
     mem_pct = 100.0 * gpu_state.mem_used_mb / max(gpu_state.mem_total_mb, 1)
-    if mem_pct >= mem_limit:
+    if mem_pct > mem_limit:
         return False
     max_used = as_int(cfg(config, "GPU_MAX_USED_MB", "0"), 0)
     if max_used > 0 and gpu_state.mem_used_mb >= max_used:
@@ -922,9 +971,8 @@ def gpu_accepts_more_jobs(
     return True
 
 
-def gpu_schedule_key(gpu_state: GpuState, current_jobs: int) -> tuple[float, int, int, str]:
-    # Prefer lower utilization, then fewer queued jobs, then lower used memory.
-    return (float(gpu_state.util_pct), current_jobs, gpu_state.mem_used_mb, gpu_state.gpu)
+def gpu_schedule_key(gpu_state: GpuState, current_jobs: int) -> tuple[int, int, str]:
+    return (current_jobs, gpu_state.mem_used_mb, gpu_state.gpu)
 
 
 def refresh_gpu_state(gpu_states: dict[str, GpuState], gpu: str, apps: list[dict[str, str]] | None) -> None:
@@ -1042,7 +1090,7 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
 
 def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[str], dict[str, str], Path, Path]:
     qrl_dir = resolve_path(cfg(config, "QRL_OFFICIAL_DIR", "."))
-    python_bin = resolve_path(cfg(config, "QRL_PYTHON_BIN", ".venv/bin/python"))
+    python_bin = resolve_executable(cfg(config, "QRL_PYTHON_BIN", ".venv/bin/python"))
     output_dir = task_output_dir(config, task)
     output_dir.mkdir(parents=True, exist_ok=True)
     env = command_env(config, gpu)
@@ -1243,9 +1291,9 @@ def main() -> int:
             for task in tasks:
                 status = read_status(status_dir, task.task_id)
                 if status.get("state") == "RUNNING":
-                    active_task_ids.add(task.task_id)
                     pid = status.get("pid", "").strip()
-                    if pid:
+                    if pid and is_queue_user_process(pid):
+                        active_task_ids.add(task.task_id)
                         running_queue_pids.add(pid)
 
             while True:
