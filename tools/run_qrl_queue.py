@@ -953,15 +953,16 @@ def gpu_accepts_more_jobs(
 ) -> bool:
     if gpu_state is None:
         return False
-    max_jobs = max(1, as_int(cfg(config, "MAX_JOBS_PER_GPU", "8"), 8))
-    if current_jobs >= max_jobs:
+    # A non-positive value explicitly disables the per-GPU job-count limit.
+    max_jobs = as_int(cfg(config, "MAX_JOBS_PER_GPU", "8"), 8)
+    if max_jobs > 0 and current_jobs >= max_jobs:
         return False
     util_limit = as_float(cfg(config, "GPU_UTIL_LIMIT_PCT", "50"), 50.0)
     if util_limit > 0.0 and gpu_state.util_pct >= util_limit:
         return False
     mem_limit = as_float(cfg(config, "GPU_MEM_LIMIT_PCT", "90"), 90.0)
     mem_pct = 100.0 * gpu_state.mem_used_mb / max(gpu_state.mem_total_mb, 1)
-    if mem_pct > mem_limit:
+    if mem_pct >= mem_limit:
         return False
     max_used = as_int(cfg(config, "GPU_MAX_USED_MB", "0"), 0)
     if max_used > 0 and gpu_state.mem_used_mb >= max_used:
