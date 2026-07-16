@@ -274,6 +274,8 @@ class ReplayBuffer(Dataset):
         self.num_successful_episodes = int(state["num_successful_episodes"])
         self.num_successful_transitions = int(state["num_successful_transitions"])
         self._observation_bounds_cache = None
+        self._goal_condition_coordinate_caches = {}
+        self._goal_condition_grid_caches = {}
         if self.num_observations_available > 0:
             self._update_observation_bounds_cache(
                 self.raw_data.all_observations[:self.num_observations_available],

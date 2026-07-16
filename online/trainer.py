@@ -71,13 +71,21 @@ class Trainer(object):
     profiler: Optional[TimingProfiler]
 
     def get_total_optim_steps(self, total_env_steps: int):
-        total_env_steps -= self.replay.num_episodes_realized * self.replay.episode_length
-        total_env_steps -= self.num_prefill_episodes * self.replay.episode_length
-        num_cycles = 1
+        current_env_steps = self.replay.num_episodes_realized * self.replay.episode_length
+        prefill_env_steps = min(
+            self.num_prefill_episodes * self.replay.episode_length,
+            total_env_steps,
+        )
+        env_steps_after_prefill = max(current_env_steps, prefill_env_steps)
+        remaining_env_steps = max(total_env_steps - env_steps_after_prefill, 0)
 
-        if total_env_steps != 0:
+        # Training performs one optimization cycle immediately after prefill,
+        # then one more cycle after each group of policy rollouts.
+        num_cycles = 1
+        if remaining_env_steps != 0:
             assert self.num_rollouts_per_cycle > 0
-            num_cycles = int(np.ceil(total_env_steps / (self.num_rollouts_per_cycle * self.replay.episode_length)))
+            env_steps_per_cycle = self.num_rollouts_per_cycle * self.replay.episode_length
+            num_cycles += int(np.ceil(remaining_env_steps / env_steps_per_cycle))
 
         return self.num_samples_per_cycle * num_cycles
 
@@ -87,7 +95,8 @@ class Trainer(object):
                  batch_size: int,
                  interaction_conf: InteractionConf,
                  profiler: Optional[TimingProfiler] = None,
-                 eval_seed: int = 416923159):
+                 eval_seed: int = 416923159,
+                 candidate_seed: int = 0):
 
         self.device = device
         self.replay = replay
@@ -121,6 +130,10 @@ class Trainer(object):
         self.losses.to(device)
         if self.losses.goal_set_distance_loss is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
+            self.losses.goal_set_distance_loss.set_candidate_state_provider(
+                replay.sample_goal_conditioned_observations
+            )
+            self.losses.goal_set_distance_loss.set_candidate_seed(candidate_seed)
 
         logging.info('Agent:\n\t' + str(self.agent).replace('\n', '\n\t') + '\n\n')
         logging.info('Losses:\n\t' + str(self.losses).replace('\n', '\n\t') + '\n\n')

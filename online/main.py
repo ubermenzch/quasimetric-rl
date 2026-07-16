@@ -81,6 +81,7 @@ def train(dict_cfg: DictConfig):
             batch_size=cfg.batch_size,
             interaction_conf=cfg.interaction,
             profiler=profiler,
+            candidate_seed=cfg.seed,
         )
 
     val_results: List[dict] = []

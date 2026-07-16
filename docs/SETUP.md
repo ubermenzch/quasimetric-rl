@@ -142,8 +142,9 @@ CONFIG=configs/qrl_queue.env tools/run_qrl_queue.sh --once
 ```
 
 `configs/qrl_queue.env` is ignored by Git, so local GPU selection and runtime
-preferences do not leak into the repository. The one-critic AntMaze ablations
-are defined in `configs/qrl_tasks_1q_antmaze.tsv`.
+preferences do not leak into the repository. The setup script creates an empty
+runtime task list at `runs/qrl_queue/tasks.tsv`; add local task rows there
+before starting the scheduler.
 
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set

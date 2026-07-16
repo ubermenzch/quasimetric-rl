@@ -40,7 +40,7 @@ Options:
   -h, --help        Show this help message.
 
 Environment overrides:
-  QRL_ASSET_ROOT, VENV_DIR, PYTHON_BIN, TORCH_INDEX_URL, BOOTSTRAP_PYTHON,
+  QRL_ASSET_ROOT, QRL_QUEUE_TASKS_FILE, VENV_DIR, PYTHON_BIN, TORCH_INDEX_URL, BOOTSTRAP_PYTHON,
   MICROMAMBA_URL, MICROMAMBA_ROOT, QRL_USER_GRAPHICS_PREFIX,
   MUJOCO_URL, MUJOCO_ARCHIVE_SHA256, MAZE2D_DATASET_URL,
   ANTMAZE_V2_DATASET_URL, D4RL_DATASET_MANIFEST, DOWNLOAD_RETRIES.
@@ -77,6 +77,7 @@ MICROMAMBA_ROOT="${MICROMAMBA_ROOT:-${ASSET_ROOT}/micromamba}"
 MICROMAMBA_BIN="${MICROMAMBA_ROOT}/bin/micromamba"
 MICROMAMBA_ENV="${MICROMAMBA_ROOT}/envs/python39"
 GRAPHICS_ENV="${QRL_USER_GRAPHICS_PREFIX:-${MICROMAMBA_ROOT}/envs/graphics}"
+QUEUE_TASKS_FILE="${QRL_QUEUE_TASKS_FILE:-${ROOT_DIR}/runs/qrl_queue/tasks.tsv}"
 
 
 require_command() {
@@ -421,7 +422,22 @@ install_datasets() {
 }
 
 
+initialize_queue_tasks() {
+    if [[ -e "${QUEUE_TASKS_FILE}" ]]; then
+        echo "Queue task list already exists: ${QUEUE_TASKS_FILE}"
+        return
+    fi
+    mkdir -p "$(dirname "${QUEUE_TASKS_FILE}")"
+    printf '%s\n' \
+        '# Runtime queue task list. Add task rows locally before starting the scheduler.' \
+        '# Format: task_id<TAB>mode<TAB>env_name<TAB>seed<TAB>steps<TAB>extra_args' \
+        > "${QUEUE_TASKS_FILE}"
+    echo "Created empty queue task list: ${QUEUE_TASKS_FILE}"
+}
+
+
 DOWNLOAD_PYTHON="$(resolve_download_python)"
+initialize_queue_tasks
 if [[ "${INSTALL_SUBMODULES}" -eq 1 ]]; then
     initialize_submodules
 fi

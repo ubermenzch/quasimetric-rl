@@ -105,6 +105,9 @@ class ActorLosses(ActorLossBase):
             with self._record('train/actor/scheduler_step'):
                 self.actor_sched.step()
                 self.entropy_weight_sched.step()
+            if (goal_set_distance_loss is not None
+                    and goal_set_distance_loss.implementation == 'direct'):
+                goal_set_distance_loss.advance_candidate_step()
         return result
 
     # for type hints

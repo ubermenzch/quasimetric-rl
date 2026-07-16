@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import *
 
 import attrs
+import itertools
 
 import numpy as np
 import torch
@@ -150,9 +151,8 @@ class EpisodeData(MultiEpisodeData):
 LOAD_EPISODES_REGISTRY: Mapping[Tuple[str, str], Callable[[], Iterator[EpisodeData]]] = {}
 CREATE_ENV_REGISTRY: Mapping[Tuple[str, str], Callable[[], gym.Env]] = {}
 
-# Coordinates in the state observation that define goal attainment for the
-# vector environments bundled with this repository.  They intentionally refer
-# to the state half of each goal-conditioned observation, not a padded goal.
+# Coordinates in the raw state observation that define goal attainment for the
+# vector environments bundled with this repository.
 GOAL_SET_DIMS_REGISTRY: Mapping[Tuple[str, str], Tuple[int, ...]] = {
     **{
         ('d4rl', name): (0, 1)
@@ -317,6 +317,191 @@ class Dataset:
         if device is not None:
             low, high = low.to(device), high.to(device)
         return low, high
+
+    def _goal_condition_coordinates(self, goal_dims: Tuple[int, ...]) -> torch.Tensor:
+        """Return an incrementally maintained cache of valid goal coordinates."""
+        observations = self.raw_data.all_observations
+        available = self.num_observations_available
+        caches = getattr(self, '_goal_condition_coordinate_caches', None)
+        if caches is None:
+            caches = self._goal_condition_coordinate_caches = {}
+        cache_key = tuple(goal_dims)
+        cache = caches.get(cache_key)
+
+        needs_new_storage = (
+            cache is None
+            or cache['values'].shape[0] != observations.shape[0]
+            or cache['values'].device != observations.device
+            or cache['values'].dtype != observations.dtype
+        )
+        if needs_new_storage:
+            values = torch.empty(
+                (observations.shape[0], len(goal_dims)),
+                device=observations.device,
+                dtype=observations.dtype,
+            )
+            cached_count = 0
+            if cache is not None and cache['count'] <= available:
+                cached_count = min(cache['count'], cache['values'].shape[0], values.shape[0])
+                values[:cached_count].copy_(cache['values'][:cached_count])
+            cache = caches[cache_key] = dict(values=values, count=cached_count)
+        elif cache['count'] > available:
+            cache['count'] = 0
+
+        if cache['count'] < available:
+            goal_index = torch.as_tensor(goal_dims, device=observations.device)
+            cache['values'][cache['count']:available].copy_(
+                observations[cache['count']:available].index_select(-1, goal_index)
+            )
+            cache['count'] = available
+        return cache['values'][:available]
+
+    def _goal_condition_grid(
+            self, goal_dims: Tuple[int, ...], cell_size: float) -> Dict[str, Any]:
+        """Build or incrementally update a CPU grid over available observations."""
+        coordinates = self._goal_condition_coordinates(goal_dims)
+        if coordinates.device.type != 'cpu':
+            raise RuntimeError('Goal-conditioned dataset grids require CPU dataset storage')
+        caches = getattr(self, '_goal_condition_grid_caches', None)
+        if caches is None:
+            caches = self._goal_condition_grid_caches = {}
+        cache_key = (tuple(goal_dims), float(cell_size))
+        grid = caches.get(cache_key)
+        if grid is None or grid['count'] > coordinates.shape[0]:
+            grid = caches[cache_key] = dict(count=0, bins={})
+
+        start = grid['count']
+        if start < coordinates.shape[0]:
+            cells = torch.floor(coordinates[start:] / cell_size).to(torch.int64).numpy()
+            if cells.shape[0] > 0:
+                sort_keys = tuple(cells[:, dim] for dim in reversed(range(cells.shape[1])))
+                order = np.lexsort(sort_keys)
+                sorted_cells = cells[order]
+                boundaries = np.concatenate((
+                    np.array([0], dtype=np.int64),
+                    np.nonzero(np.any(sorted_cells[1:] != sorted_cells[:-1], axis=1))[0] + 1,
+                    np.array([sorted_cells.shape[0]], dtype=np.int64),
+                ))
+                for left, right in zip(boundaries[:-1], boundaries[1:]):
+                    cell = tuple(int(value) for value in sorted_cells[left])
+                    new_indices = torch.from_numpy(order[left:right].copy()).to(torch.int64).add_(start)
+                    existing = grid['bins'].get(cell)
+                    grid['bins'][cell] = (
+                        new_indices if existing is None else torch.cat([existing, new_indices])
+                    )
+            grid['count'] = coordinates.shape[0]
+        return grid
+
+    def sample_goal_conditioned_observations(
+            self, raw_goal_states: torch.Tensor, *, goal_dims: Tuple[int, ...],
+            num_samples: int, radius: float, seed: int,
+            max_attempts: int = 256) -> Tuple[torch.Tensor, float]:
+        """Sample ``num_samples`` exact-radius observations with replacement.
+
+        The grid only creates a local proposal pool. Every accepted observation
+        still passes the exact Euclidean-radius test. Slots that remain unresolved
+        after ``max_attempts`` keep the raw goal as their fallback candidate.
+        """
+        if self.num_observations_available <= 0:
+            raise RuntimeError('Cannot sample candidates from an empty dataset')
+        if num_samples <= 0 or radius <= 0 or max_attempts <= 0:
+            raise ValueError('num_samples, radius, and max_attempts must be positive')
+
+        observations = self.raw_data.all_observations[:self.num_observations_available]
+        if observations.ndim != 2 or raw_goal_states.shape[-1] != observations.shape[-1]:
+            raise ValueError(
+                f'Expected vector goals ending in {observations.shape[-1]} dimensions, '
+                f'got shape={tuple(raw_goal_states.shape)}'
+            )
+        if not goal_dims or min(goal_dims) < 0 or max(goal_dims) >= observations.shape[-1]:
+            raise ValueError(f'Invalid goal_dims={goal_dims!r}')
+
+        if observations.device.type != 'cpu':
+            raise RuntimeError('Goal-conditioned dataset sampling requires CPU dataset storage')
+        storage_device = observations.device
+        flat_goals = raw_goal_states.detach().reshape(-1, observations.shape[-1]).to(
+            device=storage_device,
+            dtype=observations.dtype,
+        )
+        num_pairs = flat_goals.shape[0]
+        sampled = flat_goals[:, None, :].expand(
+            num_pairs, num_samples, observations.shape[-1]
+        ).clone()
+        sampled_flat = sampled.reshape(-1, observations.shape[-1])
+        num_raw_goal_fallbacks = 0
+
+        goal_index = torch.as_tensor(goal_dims, device=storage_device)
+        observation_goals = self._goal_condition_coordinates(goal_dims)
+        query_goals = flat_goals.index_select(-1, goal_index)
+        grid = self._goal_condition_grid(goal_dims, radius)
+        generator = torch.Generator(device=storage_device)
+        generator.manual_seed(int(seed))
+
+        attempts_per_round = 16
+        radius_squared = radius * radius
+        goal_cells = torch.floor(query_goals / radius).to(torch.int64).numpy()
+        unique_cells, inverse = np.unique(goal_cells, axis=0, return_inverse=True)
+        neighbor_offsets = tuple(itertools.product((-1, 0, 1), repeat=len(goal_dims)))
+
+        for cell_number, cell_values in enumerate(unique_cells):
+            pair_indices_np = np.nonzero(inverse == cell_number)[0]
+            pair_indices = torch.from_numpy(pair_indices_np.copy()).to(torch.int64)
+            cell = tuple(int(value) for value in cell_values)
+            neighboring_bins = []
+            for offset in neighbor_offsets:
+                neighbor = tuple(value + delta for value, delta in zip(cell, offset))
+                indices = grid['bins'].get(neighbor)
+                if indices is not None:
+                    neighboring_bins.append(indices)
+            pool = (
+                torch.cat(neighboring_bins)
+                if neighboring_bins
+                else torch.empty(0, dtype=torch.int64)
+            )
+
+            if pool.numel() == 0:
+                num_raw_goal_fallbacks += pair_indices.numel() * num_samples
+                continue
+
+            group_size = pair_indices.numel()
+            local_pair_indices = torch.arange(group_size).repeat_interleave(num_samples)
+            destinations = pair_indices.repeat_interleave(num_samples) * num_samples
+            destinations += torch.arange(num_samples).repeat(group_size)
+            unresolved = torch.arange(group_size * num_samples)
+
+            attempts_used = 0
+            while unresolved.numel() > 0 and attempts_used < max_attempts:
+                attempts = min(attempts_per_round, max_attempts - attempts_used)
+                pool_positions = torch.randint(
+                    pool.numel(),
+                    (unresolved.numel(), attempts),
+                    generator=generator,
+                )
+                random_indices = pool[pool_positions]
+                unresolved_pairs = local_pair_indices[unresolved]
+                candidate_goals = observation_goals[random_indices]
+                goals = query_goals[pair_indices[unresolved_pairs]][:, None, :]
+                valid = (
+                    candidate_goals - goals
+                ).square().sum(dim=-1) <= radius_squared
+                has_match = valid.any(dim=-1)
+                matched_rows = torch.nonzero(has_match, as_tuple=False).squeeze(-1)
+                if matched_rows.numel() > 0:
+                    first_match = valid[matched_rows].to(torch.int64).argmax(dim=-1)
+                    source_indices = random_indices[matched_rows, first_match]
+                    target_indices = destinations[unresolved[matched_rows]]
+                    sampled_flat[target_indices] = observations[source_indices]
+                unresolved = unresolved[~has_match]
+                attempts_used += attempts
+
+            if unresolved.numel() > 0:
+                num_raw_goal_fallbacks += unresolved.numel()
+
+        candidates = sampled.reshape(
+            *raw_goal_states.shape[:-1], num_samples, observations.shape[-1]
+        ).to(device=raw_goal_states.device, dtype=raw_goal_states.dtype)
+        fallback_fraction = num_raw_goal_fallbacks / (num_pairs * num_samples)
+        return candidates, fallback_fraction
 
     def get_transition_history(self, indices: torch.Tensor, history_length: int):
         if history_length <= 0:

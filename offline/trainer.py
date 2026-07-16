@@ -117,6 +117,10 @@ class Trainer(object):
         self.losses.to(device)
         if self.losses.goal_set_distance_loss is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(dataset.observation_bounds)
+            self.losses.goal_set_distance_loss.set_candidate_state_provider(
+                dataset.sample_goal_conditioned_observations
+            )
+            self.losses.goal_set_distance_loss.set_candidate_seed(data_seed)
 
         logging.info('Agent:\n\t' + str(self.agent).replace('\n', '\n\t') + '\n\n')
         logging.info('Losses:\n\t' + str(self.losses).replace('\n', '\n\t') + '\n\n')

@@ -455,6 +455,31 @@ def extra_arg_value(extra_args: str, key: str) -> str:
 
 
 def task_variant(task: Task) -> str:
+    implementation = extra_arg_value(
+        task.extra_args, "agent.goal_set_distance.losses.implementation"
+    )
+    if not implementation and "_Direct-" in task.task_id:
+        implementation = "direct"
+    if implementation in {"direct", "learned"}:
+        aggregation = extra_arg_value(
+            task.extra_args, "agent.goal_set_distance.losses.aggregation"
+        ) or "hard_min"
+        sampler = extra_arg_value(
+            task.extra_args, "agent.goal_set_distance.losses.candidate_sampling"
+        ) or "uniform_bounds"
+        aggregation_label = {
+            "hard_min": "HardMin",
+            "lme_min": "LMEMin",
+            "median": "Median",
+            "hard_max": "HardMax",
+            "lme_max": "LMEMax",
+        }.get(aggregation, aggregation)
+        sampler_label = {
+            "uniform_bounds": "UniformBounds",
+            "dataset_radius": "DatasetRadius",
+        }.get(sampler, sampler)
+        implementation_label = implementation.capitalize()
+        return f"{implementation_label}/{aggregation_label}/{sampler_label}"
     if "CDA_Tr" in task.task_id:
         return "CDA-Tr"
     if "_GSD_" in task.task_id:
@@ -484,6 +509,12 @@ def task_history_length(task: Task) -> str:
     if match:
         return match.group(1)
     return "0"
+
+
+def display_status_timestamp(value: str) -> str:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", value):
+        return value[5:]
+    return value
 
 
 def render(config: dict[str, str]) -> None:
@@ -523,6 +554,8 @@ def render(config: dict[str, str]) -> None:
         latest = latest_eval(output_dir)
         succ = latest.get("succ_rate", "")
         err = status.get("error", "")
+        submitted_at = status.get("submitted_at") or status.get("started_at", "")
+        gpu_started_at = status.get("gpu_started_at") or status.get("started_at", "")
         rows.append([
             idx,
             state,
@@ -534,6 +567,11 @@ def render(config: dict[str, str]) -> None:
             task.mode,
             task.env_name,
             task.seed,
+            display_status_timestamp(submitted_at),
+            display_status_timestamp(gpu_started_at),
+            status.get("gpu_mem_peak_mb", ""),
+            status.get("oom_retry_count", ""),
+            status.get("oom_prelaunch_mem_limit_mb", ""),
             f"{progress.pct:.1f}" if progress.pct is not None else "",
             f"{eta:.2f}" if eta is not None else "",
             f"{display_elapsed:.2f}" if display_elapsed is not None else "",
@@ -551,9 +589,12 @@ def render(config: dict[str, str]) -> None:
     )
     headers = [
         "#", "state", "gpu", "pid", "task", "variant", "hist", "mode", "env", "seed",
-        "%", "eta_h", "elapsed_h", "progress", "succ", "err",
+        "submitted", "gpu_start", "peak_mb", "oom_n", "mem_cap", "%", "eta_h",
+        "elapsed_h", "progress", "succ", "err",
     ]
-    widths = [4, 8, 4, 8, 44, 8, 4, 7, 18, 6, 6, 7, 9, 17, 8, 18]
+    widths = [
+        4, 8, 4, 8, 44, 30, 4, 7, 18, 6, 14, 14, 8, 5, 8, 6, 7, 9, 17, 8, 18,
+    ]
     print(" ".join(fmt(h, w) for h, w in zip(headers, widths)))
     print(" ".join("-" * w for w in widths))
     for row in rows:

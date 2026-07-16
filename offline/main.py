@@ -102,10 +102,11 @@ def train(dict_cfg: DictConfig):
                 f"agent.training_schedule={cfg.agent.training_schedule} requires agent.actor to be enabled"
             )
     if cfg.agent.training_schedule == 'critic_then_dynamics_then_goal_set_distance_then_actor':
-        if not cfg.agent.goal_set_distance.enabled:
+        if (not cfg.agent.goal_set_distance.enabled
+                or cfg.agent.goal_set_distance.losses.implementation != 'learned'):
             raise RuntimeError(
                 "agent.training_schedule=critic_then_dynamics_then_goal_set_distance_then_actor requires "
-                "agent.goal_set_distance.enabled=true"
+                "a learned goal-set objective"
             )
     phases = training_phases(cfg.agent.training_schedule)
     if not phases:

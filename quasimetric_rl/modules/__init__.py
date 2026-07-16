@@ -95,6 +95,10 @@ class QRLLosses(Module):
                 phase: str = 'all') -> LossResult:
         if phase not in ('all', 'critic', 'latent_dynamics', 'actor', 'goal_set_distance'):
             raise ValueError(f"Unknown training phase: {phase!r}")
+        if (phase == 'goal_set_distance'
+                and self.goal_set_distance_loss is not None
+                and self.goal_set_distance_loss.implementation == 'direct'):
+            raise ValueError('Direct goal-set objectives have no standalone model-training phase')
 
         needs_critic_grad = phase in ('all', 'critic')
         if needs_critic_grad:
@@ -115,9 +119,11 @@ class QRLLosses(Module):
                         phase=critic_phase,
                     )
 
-        if phase in ('all', 'goal_set_distance') and self.goal_set_distance_loss is not None:
+        if (phase in ('all', 'goal_set_distance')
+                and self.goal_set_distance_loss is not None
+                and self.goal_set_distance_loss.implementation == 'learned'):
             if agent.goal_set_distance is None:
-                raise RuntimeError("Goal-set distance loss is enabled but agent.goal_set_distance is None")
+                raise RuntimeError("Learned goal-set objective has no GoalSetDistance model")
             with self._record('train/goal_set_distance/total'):
                 loss_results['goal_set_distance'] = self.goal_set_distance_loss(
                     agent.goal_set_distance,
@@ -154,10 +160,16 @@ class QRLLosses(Module):
                 entropy_weight_sched=self.actor_loss.entropy_weight_sched.state_dict(),
             )
         if self.goal_set_distance_loss is not None:
-            optim_scheds['goal_set_distance'] = dict(
-                optim=self.goal_set_distance_loss.optim.state_dict(),
-                sched=self.goal_set_distance_loss.sched.state_dict(),
+            goal_set_state = dict(
+                candidate_rng=self.goal_set_distance_loss.candidate_rng_state_dict(),
             )
+            if (self.goal_set_distance_loss.optim is not None
+                    and self.goal_set_distance_loss.sched is not None):
+                goal_set_state.update(
+                    optim=self.goal_set_distance_loss.optim.state_dict(),
+                    sched=self.goal_set_distance_loss.sched.state_dict(),
+                )
+            optim_scheds['goal_set_distance'] = goal_set_state
         for idx, critic_loss in enumerate(self.critic_losses):
             critic_optim_scheds = dict(
                 critic_optim=critic_loss.critic_optim.state_dict(),
@@ -185,8 +197,15 @@ class QRLLosses(Module):
             self.actor_loss.entropy_weight_optim.load_state_dict(optim_scheds['actor']['entropy_weight_optim'])
             self.actor_loss.entropy_weight_sched.load_state_dict(optim_scheds['actor']['entropy_weight_sched']),
         if self.goal_set_distance_loss is not None and 'goal_set_distance' in optim_scheds:
-            self.goal_set_distance_loss.optim.load_state_dict(optim_scheds['goal_set_distance']['optim'])
-            self.goal_set_distance_loss.sched.load_state_dict(optim_scheds['goal_set_distance']['sched'])
+            goal_set_state = optim_scheds['goal_set_distance']
+            if (self.goal_set_distance_loss.optim is not None
+                    and self.goal_set_distance_loss.sched is not None
+                    and 'optim' in goal_set_state):
+                self.goal_set_distance_loss.optim.load_state_dict(goal_set_state['optim'])
+                self.goal_set_distance_loss.sched.load_state_dict(goal_set_state['sched'])
+            self.goal_set_distance_loss.load_candidate_rng_state_dict(
+                goal_set_state.get('candidate_rng')
+            )
         for idx, critic_loss in enumerate(self.critic_losses):
             critic_loss.critic_optim.load_state_dict(optim_scheds[f"critic_{idx:02d}"]['critic_optim'])
             critic_loss.critic_sched.load_state_dict(optim_scheds[f"critic_{idx:02d}"]['critic_sched'])
@@ -231,6 +250,18 @@ class QRLConf:
                 'agent.actor.model.input_mode=latent requires agent.num_critics=1; '
                 'the latent actor must use a single, stable critic encoder.'
             )
+        if self.goal_set_distance.enabled:
+            implementation = self.goal_set_distance.losses.implementation
+            gsd_schedule = 'critic_then_dynamics_then_goal_set_distance_then_actor'
+            if implementation == 'learned' and self.training_schedule == 'critic_then_dynamics_then_actor':
+                raise ValueError(
+                    'Learned goal-set objectives require joint training or an explicit '
+                    'goal-set-distance training phase'
+                )
+            if implementation == 'direct' and self.training_schedule == gsd_schedule:
+                raise ValueError('Direct goal-set objectives have no goal-set-distance training phase')
+            if implementation == 'direct' and self.actor is None:
+                raise ValueError('Direct goal-set objectives require an actor')
         if self.actor is None:
             actor = actor_losses = None
         else:

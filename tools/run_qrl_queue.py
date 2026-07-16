@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -26,6 +27,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRANSIENT_FAILURE_PATTERNS = (
     "CUDA driver initialization failed",
+)
+CUDA_OOM_PATTERNS = (
+    "CUDA out of memory",
+    "torch.OutOfMemoryError",
 )
 TRANSIENT_LOG_TAIL_BYTES = 1024 * 1024
 TASK_MANIFEST_NAME = ".qrl_task.json"
@@ -141,6 +146,16 @@ def bool_arg_value(extra_args: list[str], key: str, default: bool) -> bool:
     return value
 
 
+def task_uses_goal_set_objective(task: Task) -> bool:
+    """Return whether a task enables either learned or direct goal sets."""
+    default = "_GSD_" in task.task_id or "_Direct-" in task.task_id
+    return bool_arg_value(
+        task.extra_args.split(),
+        "agent.goal_set_distance.enabled",
+        default,
+    )
+
+
 def as_int(value: str, default: int) -> int:
     try:
         return int(float(str(value).strip()))
@@ -212,22 +227,46 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
     status_dir.mkdir(parents=True, exist_ok=True)
     previous = read_status(status_dir, task.task_id)
     extra = dict(extra or {})
-    for key in ("transient_failure_count",):
+    now = timestamp()
+    for key in (
+        "transient_failure_count",
+        "submitted_at",
+        "gpu_mem_peak_mb",
+        "oom_retry_count",
+        "oom_last_prelaunch_mem_mb",
+        "oom_prelaunch_mem_limit_mb",
+        "prelaunch_gpu_mem_used_mb",
+    ):
         if previous.get(key) and key not in extra:
             extra[key] = previous[key]
+    if not extra.get("submitted_at"):
+        extra["submitted_at"] = previous.get("started_at") or previous.get("updated_at") or now
     if state == "RUNNING":
+        same_attempt = (
+            previous.get("state") == "RUNNING"
+            and previous.get("pid")
+            and previous.get("pid") == extra.get("pid", previous.get("pid"))
+        )
         if not extra.get("started_at"):
-            extra["started_at"] = timestamp()
+            extra["started_at"] = previous.get("started_at") if same_attempt else now
+        if not extra.get("gpu_started_at"):
+            extra["gpu_started_at"] = (
+                previous.get("gpu_started_at") or previous.get("started_at")
+                if same_attempt
+                else extra["started_at"]
+            )
     elif previous.get("started_at") and "started_at" not in extra:
         extra["started_at"] = previous["started_at"]
+    if state != "RUNNING" and previous.get("gpu_started_at") and "gpu_started_at" not in extra:
+        extra["gpu_started_at"] = previous["gpu_started_at"]
     if state in {"DONE", "FAILED", "PAUSED"} and not extra.get("finished_at"):
-        extra["finished_at"] = timestamp()
+        extra["finished_at"] = now
     if state != "RUNNING":
         extra.pop("gpu", None)
         extra.pop("pid", None)
     lines = [
         f"state={state}",
-        f"updated_at={timestamp()}",
+        f"updated_at={now}",
         f"task_id={task.task_id}",
         f"task_fingerprint={task_fingerprint(task)}",
         f"mode={task.mode}",
@@ -245,6 +284,55 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text("\n".join(lines) + "\n")
     tmp_path.replace(path)
+
+
+STATUS_MANAGED_KEYS = {
+    "state", "updated_at", "task_id", "task_fingerprint", "mode",
+    "env_name", "seed", "steps", "extra_args",
+}
+
+
+def status_extra_fields(status: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in status.items()
+        if key not in STATUS_MANAGED_KEYS
+    }
+
+
+def ensure_task_submission_statuses(
+    tasks: list[Task],
+    status_dir: Path,
+    submission_fallback: str = "",
+) -> None:
+    """Persist when each task first becomes visible to the scheduler."""
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        if status.get("submitted_at"):
+            continue
+        recorded_fingerprint = status.get("task_fingerprint")
+        if recorded_fingerprint and recorded_fingerprint != task_fingerprint(task):
+            continue
+        if not status:
+            write_status(
+                status_dir,
+                task,
+                "PENDING",
+                {"submitted_at": submission_fallback or timestamp()},
+            )
+            continue
+        extra = status_extra_fields(status)
+        candidates = [
+            value
+            for value in (
+                submission_fallback,
+                status.get("started_at", ""),
+                status.get("updated_at", ""),
+            )
+            if value
+        ]
+        extra["submitted_at"] = min(candidates) if candidates else timestamp()
+        write_status(status_dir, task, status.get("state", "PENDING"), extra)
 
 
 def process_owner(pid: int | str) -> str:
@@ -398,6 +486,72 @@ def gpu_compute_apps() -> list[dict[str, str]] | None:
         )
         return None
     return apps
+
+
+def parse_used_memory_mb(value: str) -> int | None:
+    match = re.search(r"\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return int(round(float(match.group(0)))) if match else None
+
+
+def update_running_gpu_memory_peaks(
+    tasks: list[Task],
+    status_dir: Path,
+    apps: list[dict[str, str]] | None,
+    dry_run: bool = False,
+) -> None:
+    """Persist the largest sampled per-process GPU allocation for each task."""
+    if apps is None or dry_run:
+        return
+    memory_by_process: dict[tuple[str, str], int] = {}
+    for app in apps:
+        pid = app.get("pid", "")
+        gpu = app.get("gpu", "")
+        used_memory = parse_used_memory_mb(app.get("used_memory", ""))
+        if not pid or not gpu or used_memory is None:
+            continue
+        key = (pid, gpu)
+        memory_by_process[key] = memory_by_process.get(key, 0) + used_memory
+
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        if status.get("state") != "RUNNING":
+            continue
+        current = memory_by_process.get((status.get("pid", ""), status.get("gpu", "")))
+        if current is None:
+            continue
+        previous_peak = as_int(status.get("gpu_mem_peak_mb", "0"), 0)
+        if current <= previous_peak:
+            continue
+        extra = status_extra_fields(status)
+        extra["gpu_mem_peak_mb"] = str(current)
+        write_status(status_dir, task, "RUNNING", extra)
+
+
+def sample_gpu_memory_during_wait(
+    config: dict[str, str],
+    tasks: list[Task],
+    status_dir: Path,
+    wait_seconds: float,
+    dry_run: bool,
+) -> None:
+    """Wait for the next allocation pass while sampling GPU memory peaks."""
+    wait_seconds = max(0.0, wait_seconds)
+    sample_seconds = max(
+        0.1,
+        as_float(cfg(config, "GPU_MEMORY_SAMPLE_SECONDS", "5"), 5.0),
+    )
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(sample_seconds, remaining))
+        update_running_gpu_memory_peaks(
+            tasks,
+            status_dir,
+            gpu_compute_apps(),
+            dry_run=dry_run,
+        )
 
 
 def legal_running_gpu_pids(
@@ -592,6 +746,101 @@ def transient_failure_reason(config: dict[str, str], job: ActiveJob, exit_code: 
         if pattern in tail:
             return pattern
     return ""
+
+
+def estimate_competing_gpu_memory_mb(log_text: str) -> int | None:
+    """Estimate memory already in use before this process from a PyTorch OOM."""
+    patterns = (
+        r"total capacity of ([\d.]+) GiB of which ([\d.]+) GiB is free.*?"
+        r"Including non-PyTorch memory, this process has ([\d.]+) GiB memory in use",
+        r"total capacity of ([\d.]+) GiB of which ([\d.]+) GiB is free.*?"
+        r"Process \d+ has ([\d.]+) GiB memory in use",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, log_text, flags=re.DOTALL)
+        if not matches:
+            continue
+        total_gib, free_gib, process_gib = map(float, matches[-1])
+        return max(0, int(round((total_gib - free_gib - process_gib) * 1024)))
+    return None
+
+
+def requeue_cuda_oom_status(
+    config: dict[str, str],
+    task: Task,
+    status_dir: Path,
+    status: dict[str, str],
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Turn a confirmed CUDA OOM into a stricter pending allocation."""
+    if not as_bool(cfg(config, "REQUEUE_CUDA_OOM", "1")):
+        return False
+    log_file = Path(status.get("log_file", ""))
+    tail = log_tail(log_file)
+    if not any(pattern in tail for pattern in CUDA_OOM_PATTERNS):
+        return False
+
+    prelaunch_memory = as_int(status.get("prelaunch_gpu_mem_used_mb", "-1"), -1)
+    if prelaunch_memory < 0:
+        estimated_memory = estimate_competing_gpu_memory_mb(tail)
+        prelaunch_memory = estimated_memory if estimated_memory is not None else -1
+    if prelaunch_memory < 0:
+        return False
+
+    previous_limit = as_int(status.get("oom_prelaunch_mem_limit_mb", "-1"), -1)
+    memory_limit = min(
+        value for value in (previous_limit, prelaunch_memory) if value >= 0
+    )
+    retry_count = as_int(status.get("oom_retry_count", "0"), 0) + 1
+    extra = status_extra_fields(status)
+    extra.pop("finished_at", None)
+    extra.update({
+        "exit_code": status.get("exit_code", "1"),
+        "previous_gpu": status.get("gpu") or status.get("previous_gpu", ""),
+        "previous_pid": status.get("pid") or status.get("previous_pid", ""),
+        "error": "cuda_oom_requeued",
+        "requeue_reason": "cuda_out_of_memory",
+        "oom_retry_count": str(retry_count),
+        "oom_last_prelaunch_mem_mb": str(prelaunch_memory),
+        "oom_prelaunch_mem_limit_mb": str(memory_limit),
+    })
+    if dry_run:
+        print(
+            f"[{timestamp()}] DRY_RUN would requeue CUDA OOM {task.task_id}: "
+            f"retry={retry_count} require_prelaunch_mem_below={memory_limit}MB",
+            flush=True,
+        )
+        return True
+    write_status(status_dir, task, "PENDING", extra)
+    print(
+        f"[{timestamp()}] REQUEUE_CUDA_OOM {task.task_id} retry={retry_count} "
+        f"last_prelaunch_mem={prelaunch_memory}MB "
+        f"require_prelaunch_mem_below={memory_limit}MB",
+        flush=True,
+    )
+    return True
+
+
+def requeue_existing_cuda_oom_failures(
+    config: dict[str, str],
+    tasks: list[Task],
+    status_dir: Path,
+    dry_run: bool,
+) -> None:
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        if status.get("state") != "FAILED":
+            continue
+        if status.get("task_fingerprint") != task_fingerprint(task):
+            continue
+        requeue_cuda_oom_status(
+            config,
+            task,
+            status_dir,
+            status,
+            dry_run=dry_run,
+        )
 
 
 def output_started(output_dir: Path) -> bool:
@@ -867,6 +1116,15 @@ def reconcile_running_statuses(
                 running_by_gpu.setdefault(expected_gpu, set()).add(task.task_id)
                 continue
 
+        if requeue_cuda_oom_status(
+            config,
+            task,
+            status_dir,
+            status,
+            dry_run=dry_run,
+        ):
+            continue
+
         extra = {
             "error": "stale_running_status",
             "previous_gpu": expected_gpu,
@@ -951,6 +1209,7 @@ def gpu_accepts_more_jobs(
     apps: list[dict[str, str]] | None,
     running_queue_pids: set[str],
     task: Task | None = None,
+    task_status: dict[str, str] | None = None,
 ) -> bool:
     if gpu_state is None:
         return False
@@ -968,11 +1227,15 @@ def gpu_accepts_more_jobs(
     max_used = as_int(cfg(config, "GPU_MAX_USED_MB", "0"), 0)
     if max_used > 0 and gpu_state.mem_used_mb >= max_used:
         return False
-    # GSD's first IQE batch needs roughly 15 GiB plus a multi-GiB temporary
-    # allocation. Do not co-locate it with an existing training process.
-    if task is not None and "_GSD_" in task.task_id:
+    # Goal-set objectives construct a multi-candidate IQE batch. Do not launch
+    # learned or direct variants on a GPU that is already substantially used.
+    if task is not None and task_uses_goal_set_objective(task):
         gsd_max_used = as_int(cfg(config, "GSD_MAX_PRELAUNCH_MEM_MB", "4000"), 4000)
         if gsd_max_used > 0 and gpu_state.mem_used_mb >= gsd_max_used:
+            return False
+    if task_status is not None:
+        oom_limit = as_int(task_status.get("oom_prelaunch_mem_limit_mb", "-1"), -1)
+        if oom_limit >= 0 and gpu_state.mem_used_mb >= oom_limit:
             return False
     if external_gpu_busy(config, gpu_state.gpu, apps, running_queue_pids):
         return False
@@ -1013,6 +1276,18 @@ def choose_pending(
         if state not in {"PENDING", "FAILED"}:
             continue
         if state == "FAILED" and not retry_failed:
+            continue
+        # Completion evidence is authoritative across scheduler restarts. A
+        # stale PENDING/FAILED state must not launch a second run for a task
+        # that was already recorded as complete.
+        if status.get("completion_evidence") and status.get("task_fingerprint") == task_fingerprint(task):
+            write_status(status_dir, task, "DONE", {
+                "exit_code": status.get("exit_code", "0"),
+                "output_dir": status.get("output_dir", str(task_output_dir(config, task))),
+                "completed_from_status": "1",
+                "completion_evidence": status.get("completion_evidence", ""),
+            })
+            print(f"[{timestamp()}] SKIP_COMPLETED_STATUS {task.task_id}", flush=True)
             continue
         output_dir = task_output_dir(config, task)
         issue = task_identity_issue(status, output_dir, task)
@@ -1155,7 +1430,12 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
     return cmd, env, qrl_dir, output_dir
 
 
-def launch_task(config: dict[str, str], task: Task, gpu: str) -> ActiveJob | None:
+def launch_task(
+    config: dict[str, str],
+    task: Task,
+    gpu: str,
+    prelaunch_gpu_mem_used_mb: int,
+) -> ActiveJob | None:
     log_dir = resolve_path(cfg(config, "LOG_DIR", "logs/qrl_queue"))
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1189,6 +1469,7 @@ def launch_task(config: dict[str, str], task: Task, gpu: str) -> ActiveJob | Non
         "pid": str(proc.pid),
         "log_file": str(log_file),
         "output_dir": str(output_dir),
+        "prelaunch_gpu_mem_used_mb": str(prelaunch_gpu_mem_used_mb),
     })
     print(f"[{timestamp()}] START {task.task_id} mode={task.mode} env={task.env_name} seed={task.seed} gpu={gpu}", flush=True)
     return ActiveJob(task=task, gpu=gpu, proc=proc, log_file=log_file, output_dir=output_dir)
@@ -1197,9 +1478,18 @@ def launch_task(config: dict[str, str], task: Task, gpu: str) -> ActiveJob | Non
 def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> None:
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
     finished = output_finished(job.output_dir)
+    previous = read_status(status_dir, job.task.task_id)
+    oom_status = dict(previous)
+    oom_status["exit_code"] = str(exit_code)
+    if not finished and exit_code != 0 and requeue_cuda_oom_status(
+        config,
+        job.task,
+        status_dir,
+        oom_status,
+    ):
+        return
     reason = transient_failure_reason(config, job, exit_code, finished)
     if reason:
-        previous = read_status(status_dir, job.task.task_id)
         count = as_int(previous.get("transient_failure_count", "0"), 0) + 1
         max_retries = as_int(cfg(config, "MAX_TRANSIENT_RETRIES", "10"), 10)
         if count <= max_retries:
@@ -1261,12 +1551,23 @@ def main() -> int:
     try:
         while True:
             config = parse_config(config_path)
-            tasks = read_tasks(resolve_path(cfg(config, "TASKS_FILE", "configs/qrl_tasks.tsv")))
+            tasks_path = resolve_path(cfg(config, "TASKS_FILE", "configs/qrl_tasks.tsv"))
+            tasks = read_tasks(tasks_path)
             status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
+            tasks_modified_at = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(tasks_path.stat().st_mtime),
+            ) if tasks_path.exists() else ""
+            ensure_task_submission_statuses(
+                tasks,
+                status_dir,
+                submission_fallback=tasks_modified_at,
+            )
             allowed_gpus = [gpu for gpu in cfg(config, "GPU_IDS", "0 1 2 3").split() if gpu.strip()]
             retry_failed = as_bool(cfg(config, "RETRY_FAILED", "0"))
             dry_run = as_bool(cfg(config, "DRY_RUN", "0"))
             stop_on_failure = as_bool(cfg(config, "STOP_ON_FAILURE", "0"))
+            requeue_existing_cuda_oom_failures(config, tasks, status_dir, dry_run)
 
             if args.sync_only:
                 sync_finished_outputs(config, tasks, status_dir)
@@ -1280,10 +1581,12 @@ def main() -> int:
                     continue
                 mark_finished(config, job, exit_code)
                 del active[task_id]
-                if exit_code != 0 and stop_on_failure:
+                finished_state = read_status(status_dir, job.task.task_id).get("state")
+                if exit_code != 0 and stop_on_failure and finished_state == "FAILED":
                     return exit_code
 
             apps = gpu_compute_apps()
+            update_running_gpu_memory_peaks(tasks, status_dir, apps, dry_run=dry_run)
             legal_pids = legal_running_gpu_pids(tasks, status_dir, allowed_gpus, apps)
             if kill_illegal_user_gpu_jobs(config, apps, legal_pids, dry_run):
                 apps = gpu_compute_apps()
@@ -1321,6 +1624,7 @@ def main() -> int:
                 )
                 if task is None:
                     break
+                task_status = read_status(status_dir, task.task_id)
                 candidates = [
                     gpu for gpu in candidates
                     if gpu_accepts_more_jobs(
@@ -1330,6 +1634,7 @@ def main() -> int:
                         apps,
                         running_queue_pids,
                         task,
+                        task_status,
                     )
                 ]
                 if not candidates:
@@ -1342,6 +1647,18 @@ def main() -> int:
                         len(running_by_gpu.get(candidate, set())),
                     ),
                 )
+                refresh_gpu_state(gpu_states, gpu, apps)
+                if not gpu_accepts_more_jobs(
+                    config,
+                    gpu_states.get(gpu),
+                    len(running_by_gpu.get(gpu, set())),
+                    apps,
+                    running_queue_pids,
+                    task,
+                    task_status,
+                ):
+                    deferred_task_ids.add(task.task_id)
+                    continue
                 if dry_run:
                     print(f"[{timestamp()}] DRY_RUN would launch {task.task_id} on GPU {gpu}", flush=True)
                     active_task_ids.add(task.task_id)
@@ -1350,7 +1667,12 @@ def main() -> int:
                     refresh_gpu_state(gpu_states, gpu, apps)
                     continue
                 try:
-                    job = launch_task(config, task, gpu)
+                    job = launch_task(
+                        config,
+                        task,
+                        gpu,
+                        gpu_states[gpu].mem_used_mb,
+                    )
                     if job is None:
                         active_task_ids.add(task.task_id)
                         continue
@@ -1374,7 +1696,13 @@ def main() -> int:
 
             if args.once:
                 return 0
-            time.sleep(as_float(cfg(config, "POLL_SECONDS", "30"), 30.0))
+            sample_gpu_memory_during_wait(
+                config,
+                tasks,
+                status_dir,
+                as_float(cfg(config, "POLL_SECONDS", "30"), 30.0),
+                dry_run,
+            )
     finally:
         lock.release()
 
