@@ -40,10 +40,10 @@ class QRLAgent(Module):
             return self.actor(obs, goal)
         if self.actor.input_mode != 'latent':
             raise ValueError(f"Unknown actor input_mode: {self.actor.input_mode!r}")
-        critic_idx = torch.randint(len(self.critics), (), device=obs.device).item()
-        critic = self.critics[critic_idx]
+        critic = self.critics[0]
         with torch.no_grad():
-            z_obs, z_goal = critic.encoder(torch.stack([obs, goal], dim=0)).unbind(0)
+            z_obs = critic.encoder(obs)
+            z_goal = critic.encoder.encode_actor_goal(goal)
         return self.actor(z_obs, z_goal)
 
 
@@ -245,11 +245,32 @@ class QRLConf:
     def make(self, *, env_spec: EnvSpec, total_optim_steps: int,
              profiler: Optional[TimingProfiler] = None,
              goal_set_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
+        encoder_conf = self.quasimetric_critic.model.encoder
+        latent_goal_mode = (
+            'none'
+            if self.actor is None
+            else self.actor.losses.min_dist.latent_goal_mode
+        )
         if self.actor is not None and self.actor.model.input_mode == 'latent' and self.num_critics != 1:
             raise ValueError(
                 'agent.actor.model.input_mode=latent requires agent.num_critics=1; '
                 'the latent actor must use a single, stable critic encoder.'
             )
+        if encoder_conf.kind == 'split' and self.goal_set_distance.enabled:
+            raise ValueError('SplitEncoder cannot be combined with GoalSetDistance')
+        if latent_goal_mode != 'none':
+            if self.num_critics != 1:
+                raise ValueError('Latent goal optimization requires agent.num_critics=1')
+            if self.actor.model.input_mode != 'latent':
+                raise ValueError(
+                    'Latent goal optimization requires agent.actor.model.input_mode=latent'
+                )
+            if encoder_conf.kind != 'split':
+                raise ValueError('Latent goal optimization requires encoder.kind=split')
+            if self.actor.losses.min_dist.add_goal_as_future_state:
+                raise ValueError(
+                    'Latent goal optimization requires add_goal_as_future_state=false'
+                )
         if self.goal_set_distance.enabled:
             implementation = self.goal_set_distance.losses.implementation
             gsd_schedule = 'critic_then_dynamics_then_goal_set_distance_then_actor'

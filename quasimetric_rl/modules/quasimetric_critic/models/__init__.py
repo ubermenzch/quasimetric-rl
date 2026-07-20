@@ -5,7 +5,7 @@ import attrs
 import torch
 import torch.nn as nn
 
-from .encoder import Encoder
+from .encoder import Encoder, SplitEncoder
 from .quasimetric_model import QuasimetricModel
 from .latent_dynamics import LatentDynamics
 
@@ -36,14 +36,16 @@ class QuasimetricCritic(Module):
             )
             return QuasimetricCritic(encoder, quasimetric_model, latent_dynamics)
 
-    encoder: Encoder
+    encoder: Union[Encoder, SplitEncoder]
     quasimetric_model: QuasimetricModel
     latent_dynamics: LatentDynamics
 
     raw_lagrange_multiplier: nn.Parameter  # for the QRL constrained optimization
 
 
-    def __init__(self, encoder: Encoder, quasimetric_model: QuasimetricModel, latent_dynamics: LatentDynamics):
+    def __init__(self, encoder: Union[Encoder, SplitEncoder],
+                 quasimetric_model: QuasimetricModel,
+                 latent_dynamics: LatentDynamics):
         super().__init__()
         self.encoder = encoder
         self.quasimetric_model = quasimetric_model

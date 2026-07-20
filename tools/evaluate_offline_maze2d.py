@@ -19,7 +19,11 @@ sys.path.insert(0, str(ROOT))
 
 from d4rl_runtime import configure_d4rl_runtime
 
-configure_d4rl_runtime(ROOT, require_library_paths=True)
+configure_d4rl_runtime(
+    ROOT,
+    require_library_paths=True,
+    reexec_if_library_path_changed=__name__ == "__main__",
+)
 
 import gym
 import numpy as np

@@ -31,6 +31,8 @@ __pycache__
 .d4rl/
 .mujoco/
 qrl-assets/
+base_qrl/
+offline_models/
 configs/qrl_queue.env
 
 # Generated experiment artifacts. Keep configurations, source code, and small

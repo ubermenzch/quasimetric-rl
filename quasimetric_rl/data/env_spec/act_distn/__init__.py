@@ -2,6 +2,7 @@ from typing import *
 from typing_extensions import Protocol, Final
 
 import abc
+import warnings
 
 import gym.spaces
 
@@ -78,8 +79,9 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
     input_size: Final[int]
 
     kind: str
-    mean: torch.Tensor
-    half_len: torch.Tensor
+    action_shape: torch.Size
+    _mean_values: Tuple[float, ...]
+    _half_len_values: Tuple[float, ...]
 
     @property
     def output_distn_ty(self) -> str:
@@ -90,12 +92,71 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
         self.input_size = torch.Size(action_space.shape).numel() * 2
         high = torch.as_tensor(action_space.high, dtype=torch.float32)
         low = torch.as_tensor(action_space.low, dtype=torch.float32)
-        self.register_buffer('mean', (high + low) / 2)
-        self.register_buffer('half_len', ((high - low) / 2).clamp_min(1e-3))
-        assert torch.as_tensor(action_space.bounded_above & action_space.bounded_below).all(), "Must have bounded action space"
+        mean = (high + low) / 2
+        half_len = ((high - low) / 2).clamp_min(1e-3)
+        self.action_shape = mean.shape
+        self._mean_values = tuple(
+            float(value) for value in mean.reshape(-1).tolist()
+        )
+        self._half_len_values = tuple(
+            float(value) for value in half_len.reshape(-1).tolist()
+        )
+        assert torch.as_tensor(
+            action_space.bounded_above & action_space.bounded_below
+        ).all(), "Must have bounded action space"
+
+    def _reference_tensor(self, values: Tuple[float, ...]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.float32).reshape(self.action_shape)
+
+    def _action_bounds_like(
+            self, feature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bounds = feature.new_tensor(
+            (self._mean_values, self._half_len_values)
+        ).reshape(2, *self.action_shape)
+        return bounds.unbind(dim=0)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        destination[prefix + 'mean'] = self._reference_tensor(self._mean_values)
+        destination[prefix + 'half_len'] = self._reference_tensor(
+            self._half_len_values
+        )
+
+    def _load_from_state_dict(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs):
+        for name, values in (
+                ('mean', self._mean_values),
+                ('half_len', self._half_len_values)):
+            key = prefix + name
+            loaded = state_dict.pop(key, None)
+            expected = self._reference_tensor(values)
+            if loaded is not None:
+                observed = loaded.detach().to(device='cpu', dtype=torch.float32)
+                if observed.shape != expected.shape or not torch.equal(
+                        observed, expected):
+                    warnings.warn(
+                        f'Ignoring checkpoint {key}={observed.tolist()}; '
+                        'action bounds are derived from the current environment '
+                        f'and expected {expected.tolist()}',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, feature: torch.Tensor) -> torch.distributions.Distribution:
-        gmean, grawstd = feature.view(*feature.shape[:-1], 2, *self.mean.shape).unbind(dim=-self.mean.ndim - 1)
+        gmean, grawstd = feature.view(
+            *feature.shape[:-1], 2, *self.action_shape
+        ).unbind(dim=-len(self.action_shape) - 1)
+        mean, half_len = self._action_bounds_like(feature)
         distn = torch.distributions.Normal(
             loc=gmean,
             scale=F.softplus(grawstd) + 1e-4,
@@ -110,7 +171,7 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
         )
         distn = torch.distributions.TransformedDistribution(
             distn,
-            torch.distributions.AffineTransform(loc=self.mean, scale=self.half_len),
+            torch.distributions.AffineTransform(loc=mean, scale=half_len),
             validate_args=FLAGS.DEBUG,
         )
         distn = torch.distributions.Independent(

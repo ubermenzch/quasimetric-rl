@@ -135,6 +135,14 @@ class BaseConf(abc.ABC):
                     f'sampler={goal_set_loss.candidate_sampling}'
                     ')'
                 )
+            encoder_conf = self.agent.quasimetric_critic.model.encoder
+            if encoder_conf.kind == 'split':
+                specs.append(
+                    'split('
+                    f'dims={":".join(map(str, encoder_conf.goal_dims or ()))},'
+                    f'z={encoder_conf.goal_latent_size}+{encoder_conf.non_goal_latent_size}'
+                    ')'
+                )
             if self.agent.actor is not None:
                 aspecs = []
                 if self.agent.actor.model.input_mode != 'raw':
@@ -145,6 +153,13 @@ class BaseConf(abc.ABC):
                     aspecs.append('goal=Rand')
                 if self.agent.actor.losses.min_dist.adaptive_entropy_regularizer:
                     aspecs.append('ent')
+                latent_goal_loss = self.agent.actor.losses.min_dist
+                if latent_goal_loss.latent_goal_mode != 'none':
+                    aspecs.append(
+                        f'latent_goal={latent_goal_loss.latent_goal_mode}:'
+                        f'{latent_goal_loss.latent_goal_optim}:'
+                        f'{latent_goal_loss.latent_goal_steps}x{latent_goal_loss.latent_goal_lr:g}'
+                    )
                 if self.agent.actor.losses.behavior_cloning.weight > 0:
                     aspecs.append(f'BC={self.agent.actor.losses.behavior_cloning.weight:g}')
                 specs.append('actor(' + ','.join(aspecs) + ')')

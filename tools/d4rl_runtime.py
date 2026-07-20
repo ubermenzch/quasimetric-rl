@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+
+RUNTIME_REEXEC_MARKER = "_QRL_D4RL_RUNTIME_REEXEC"
 
 
 def default_asset_root(repo_root: Path) -> Path:
@@ -39,13 +43,21 @@ def prepend_compiler_flag(name: str, flag: str) -> None:
         os.environ[name] = " ".join((flag, *flags))
 
 
-def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> Path:
+def configure_d4rl_runtime(
+    repo_root: Path,
+    *,
+    require_library_paths: bool,
+    reexec_if_library_path_changed: bool = False,
+) -> Path:
     """Set the legacy D4RL/MuJoCo defaults and return the asset root.
 
     Existing user-provided variables always win. `require_library_paths` keeps
     compatibility with scripts that historically ignored nonexistent library
-    directories.
+    directories. A process that needs to dynamically load MuJoCo should enable
+    `reexec_if_library_path_changed`: glibc reads LD_LIBRARY_PATH at process
+    startup, so mutating it in an already-running Python process is not enough.
     """
+    original_library_path = os.environ.get("LD_LIBRARY_PATH", "")
     asset_root = default_asset_root(repo_root)
     mujoco_path = asset_root / "mujoco/mujoco210"
 
@@ -79,4 +91,18 @@ def configure_d4rl_runtime(repo_root: Path, *, require_library_paths: bool) -> P
             driver_library_dir,
             require_exists=require_library_paths,
         )
+
+    library_path_changed = (
+        os.environ.get("LD_LIBRARY_PATH", "") != original_library_path
+    )
+    if (
+        reexec_if_library_path_changed
+        and library_path_changed
+        and os.environ.get(RUNTIME_REEXEC_MARKER) != "1"
+    ):
+        env = os.environ.copy()
+        env[RUNTIME_REEXEC_MARKER] = "1"
+        if getattr(sys.stdout, "write_through", False):
+            env.setdefault("PYTHONUNBUFFERED", "1")
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
     return asset_root
