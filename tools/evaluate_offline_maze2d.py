@@ -6,18 +6,21 @@ import csv
 import datetime as dt
 import json
 import math
+import multiprocessing as mp
 import os
 import random
 import re
 import sys
 import time
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from d4rl_runtime import configure_d4rl_runtime
+from tools.d4rl_runtime import configure_d4rl_runtime
 
 configure_d4rl_runtime(
     ROOT,
@@ -56,6 +59,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", default="final", help="'final', 'latest', or an explicit checkpoint path.")
     parser.add_argument("--num-episodes", type=int, default=100)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of environments advanced together for batched policy inference.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of spawn-based CPU environment workers. "
+            "0 keeps all environments in the evaluator process."
+        ),
+    )
     parser.add_argument("--max-episode-steps", type=int, default=0, help="0 means env.max_episode_steps.")
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -179,6 +197,226 @@ def make_goal(obs: np.ndarray, reset_obs: np.ndarray, target_xy: np.ndarray, goa
     return goal.astype(np.float32, copy=False)
 
 
+@dataclass
+class EpisodeAccumulator:
+    episode_idx: int
+    episode_seed: int
+    obs: np.ndarray
+    reset_obs: np.ndarray
+    target_xy: np.ndarray
+    rewards: list[float] = field(default_factory=list)
+    distances: list[float] = field(default_factory=list)
+    episode_return: float = 0.0
+    first_success_step: int = 0
+    terminated: bool = False
+    truncated: bool = False
+
+
+@dataclass
+class DatasetEnvFactory:
+    kind: str
+    name: str
+    _dataset: Dataset | None = field(default=None, init=False, repr=False)
+
+    def __call__(self) -> gym.Env:
+        if self._dataset is None:
+            self._dataset = Dataset.Conf(kind=self.kind, name=self.name).make(dummy=True)
+        return self._dataset.create_env()
+
+
+class LocalEnvPool:
+    def __init__(
+        self,
+        slot_ids: list[int],
+        env_factory: Callable[[], gym.Env],
+        *,
+        initial_env: gym.Env | None = None,
+    ) -> None:
+        self.envs: dict[int, gym.Env] = {}
+        for slot_id in slot_ids:
+            if slot_id == 0 and initial_env is not None:
+                self.envs[slot_id] = initial_env
+            else:
+                self.envs[slot_id] = env_factory()
+
+    def reset(self, requests: dict[int, int]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+        results: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for slot_id, episode_seed in sorted(requests.items()):
+            random.seed(episode_seed)
+            np.random.seed(episode_seed)
+            torch.manual_seed(episode_seed)
+            env = self.envs[slot_id]
+            obs = reset_env(env, episode_seed)
+            results[slot_id] = (obs, get_target(env))
+        return results
+
+    def step(
+        self, actions: dict[int, np.ndarray]
+    ) -> dict[int, tuple[np.ndarray, float, bool, bool]]:
+        results: dict[int, tuple[np.ndarray, float, bool, bool]] = {}
+        for slot_id, action in sorted(actions.items()):
+            env = self.envs[slot_id]
+            if isinstance(env.action_space, gym.spaces.Box):
+                action = np.clip(action, env.action_space.low, env.action_space.high)
+            obs, reward, terminated, truncated, _info = step_env(env, action)
+            results[slot_id] = (obs, reward, terminated, truncated)
+        return results
+
+    def close(self) -> None:
+        for env in self.envs.values():
+            close = getattr(env, "close", None)
+            if close is not None:
+                close()
+
+
+def env_worker_main(
+    connection: Any,
+    slot_ids: list[int],
+    env_factory: Callable[[], gym.Env],
+) -> None:
+    pool: LocalEnvPool | None = None
+    try:
+        pool = LocalEnvPool(slot_ids, env_factory)
+        connection.send(("ready", None))
+        while True:
+            command, payload = connection.recv()
+            if command == "close":
+                connection.send(("ok", None))
+                return
+            if command == "reset":
+                result = pool.reset(dict(payload))
+            elif command == "step":
+                result = pool.step(dict(payload))
+            else:
+                raise ValueError(f"Unknown environment worker command: {command!r}")
+            connection.send(("ok", result))
+    except BaseException:
+        try:
+            connection.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        if pool is not None:
+            pool.close()
+        connection.close()
+
+
+class ProcessEnvPool:
+    def __init__(
+        self,
+        num_envs: int,
+        num_workers: int,
+        env_factory: Callable[[], gym.Env],
+    ) -> None:
+        context = mp.get_context("spawn")
+        assignments = [list(range(worker_idx, num_envs, num_workers)) for worker_idx in range(num_workers)]
+        self.worker_for_slot: dict[int, int] = {}
+        self.connections: list[Any] = []
+        self.processes: list[mp.Process] = []
+        try:
+            for worker_idx, slot_ids in enumerate(assignments):
+                parent_connection, child_connection = context.Pipe()
+                process = context.Process(
+                    target=env_worker_main,
+                    args=(child_connection, slot_ids, env_factory),
+                    daemon=True,
+                )
+                process.start()
+                child_connection.close()
+                self.connections.append(parent_connection)
+                self.processes.append(process)
+                for slot_id in slot_ids:
+                    self.worker_for_slot[slot_id] = worker_idx
+            for worker_idx, connection in enumerate(self.connections):
+                self._receive(worker_idx, connection, expected_status="ready")
+        except BaseException:
+            self.close(force=True)
+            raise
+
+    @staticmethod
+    def _receive(worker_idx: int, connection: Any, *, expected_status: str = "ok") -> Any:
+        try:
+            status, payload = connection.recv()
+        except EOFError as exc:
+            raise RuntimeError(f"Environment worker {worker_idx} exited without a response") from exc
+        if status == "error":
+            raise RuntimeError(f"Environment worker {worker_idx} failed:\n{payload}")
+        if status != expected_status:
+            raise RuntimeError(
+                f"Environment worker {worker_idx} returned {status!r}; expected {expected_status!r}"
+            )
+        return payload
+
+    def _execute(self, command: str, payload: dict[int, Any]) -> dict[int, Any]:
+        grouped: dict[int, list[tuple[int, Any]]] = {}
+        for slot_id, value in sorted(payload.items()):
+            grouped.setdefault(self.worker_for_slot[slot_id], []).append((slot_id, value))
+        for worker_idx, items in grouped.items():
+            self.connections[worker_idx].send((command, items))
+        result: dict[int, Any] = {}
+        for worker_idx in sorted(grouped):
+            worker_result = self._receive(worker_idx, self.connections[worker_idx])
+            result.update(worker_result)
+        return result
+
+    def reset(self, requests: dict[int, int]) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+        return self._execute("reset", requests)
+
+    def step(
+        self, actions: dict[int, np.ndarray]
+    ) -> dict[int, tuple[np.ndarray, float, bool, bool]]:
+        return self._execute("step", actions)
+
+    def close(self, *, force: bool = False) -> None:
+        if not force:
+            for process, connection in zip(self.processes, self.connections):
+                if process.is_alive():
+                    try:
+                        connection.send(("close", None))
+                    except (BrokenPipeError, EOFError, OSError):
+                        pass
+            for worker_idx, (process, connection) in enumerate(zip(self.processes, self.connections)):
+                if process.is_alive():
+                    try:
+                        self._receive(worker_idx, connection)
+                    except (BrokenPipeError, EOFError, OSError, RuntimeError):
+                        pass
+        for process in self.processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        for connection in self.connections:
+            connection.close()
+
+
+def policy_actions(
+    agent: QRLAgent,
+    observations: np.ndarray,
+    goals: np.ndarray,
+    action_space: gym.Space,
+    device: torch.device,
+    action_mode: str,
+) -> np.ndarray:
+    if agent.actor is None:
+        raise RuntimeError("This checkpoint has no actor; policy rollout evaluation is not available.")
+    with torch.inference_mode():
+        obs_t = torch.as_tensor(observations, dtype=torch.float32, device=device)
+        goal_t = torch.as_tensor(goals, dtype=torch.float32, device=device)
+        dist = agent.act(obs_t, goal_t)
+        if action_mode == "mean":
+            action_t = dist.mean
+        elif action_mode == "sample":
+            action_t = dist.sample()
+        else:
+            action_t = dist.mode
+        actions = action_t.detach().cpu().numpy()
+
+    if isinstance(action_space, gym.spaces.Box):
+        actions = np.clip(actions, action_space.low, action_space.high)
+    return actions
+
+
 def policy_action(
     agent: QRLAgent,
     obs: np.ndarray,
@@ -187,23 +425,14 @@ def policy_action(
     device: torch.device,
     action_mode: str,
 ) -> np.ndarray:
-    if agent.actor is None:
-        raise RuntimeError("This checkpoint has no actor; policy rollout evaluation is not available.")
-    with torch.inference_mode():
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        goal_t = torch.as_tensor(goal, dtype=torch.float32, device=device).unsqueeze(0)
-        dist = agent.act(obs_t, goal_t)
-        if action_mode == "mean":
-            action_t = dist.mean
-        elif action_mode == "sample":
-            action_t = dist.sample()
-        else:
-            action_t = dist.mode
-        action = action_t.squeeze(0).detach().cpu().numpy()
-
-    if isinstance(action_space, gym.spaces.Box):
-        action = np.clip(action, action_space.low, action_space.high)
-    return action
+    return policy_actions(
+        agent,
+        obs[None],
+        goal[None],
+        action_space,
+        device,
+        action_mode,
+    )[0]
 
 
 def finite_or_none(value: float | None) -> float | None:
@@ -249,6 +478,204 @@ def summarize(result: dict[str, Any], episodes: list[dict[str, Any]], elapsed_s:
     return summary
 
 
+def start_episode(
+    episode_idx: int,
+    episode_seed: int,
+    obs: np.ndarray,
+    target_xy: np.ndarray,
+    max_steps: int,
+) -> EpisodeAccumulator:
+    initial_distance = float(np.linalg.norm(obs[: target_xy.shape[0]] - target_xy))
+    return EpisodeAccumulator(
+        episode_idx=episode_idx,
+        episode_seed=episode_seed,
+        obs=obs,
+        reset_obs=obs.copy(),
+        target_xy=target_xy,
+        distances=[initial_distance],
+        first_success_step=max_steps + 1,
+    )
+
+
+def finish_episode(
+    state: EpisodeAccumulator,
+    base_result: dict[str, Any],
+    normalizer_env: gym.Env,
+    success_radius: float,
+    max_steps: int,
+) -> dict[str, Any]:
+    success = state.first_success_step <= max_steps
+    normalized_score = None
+    if hasattr(normalizer_env, "get_normalized_score"):
+        normalized_score = float(normalizer_env.get_normalized_score(state.episode_return))
+    return dict(
+        **base_result,
+        episode_idx=state.episode_idx,
+        episode_seed=state.episode_seed,
+        episode_return=state.episode_return,
+        normalized_score=normalized_score,
+        normalized_score_x100=(None if normalized_score is None else normalized_score * 100.0),
+        episode_length=len(state.rewards),
+        success=success,
+        time_at_goal=int(
+            sum(
+                (distance <= success_radius) or (reward > 0)
+                for distance, reward in zip(state.distances[1:], state.rewards)
+            )
+        ),
+        first_success_step=state.first_success_step,
+        min_distance=min(state.distances),
+        final_distance=state.distances[-1],
+        terminated=state.terminated,
+        truncated=state.truncated,
+    )
+
+
+def rollout_episodes(
+    agent: QRLAgent,
+    dataset: Dataset,
+    args: argparse.Namespace,
+    device: torch.device,
+    details_f: Any,
+    base_result: dict[str, Any],
+) -> tuple[list[dict[str, Any]], float]:
+    num_envs = min(args.num_envs, args.num_episodes)
+    num_workers = min(args.num_workers, num_envs)
+    probe_env = dataset.create_env()
+    max_steps = base_result["max_episode_steps"]
+    pool: LocalEnvPool | ProcessEnvPool | None = None
+    probe_owned_by_pool = False
+    try:
+        if num_workers > 0:
+            env_factory = DatasetEnvFactory(kind=dataset.kind, name=dataset.name)
+            pool = ProcessEnvPool(num_envs, num_workers, env_factory)
+        else:
+            pool = LocalEnvPool(
+                list(range(num_envs)),
+                dataset.create_env,
+                initial_env=probe_env,
+            )
+            probe_owned_by_pool = True
+
+        action_space = probe_env.action_space
+        active: dict[int, EpisodeAccumulator] = {}
+        episode_records: list[dict[str, Any] | None] = [None] * args.num_episodes
+        next_episode_idx = 0
+        next_write_idx = 0
+        torch.manual_seed(args.seed)
+
+        def assign_episodes(slot_ids: list[int]) -> None:
+            nonlocal next_episode_idx
+            reset_requests: dict[int, int] = {}
+            assigned_indices: dict[int, int] = {}
+            for slot_id in sorted(slot_ids):
+                if next_episode_idx >= args.num_episodes:
+                    break
+                episode_idx = next_episode_idx
+                next_episode_idx += 1
+                assigned_indices[slot_id] = episode_idx
+                reset_requests[slot_id] = args.seed + episode_idx
+            if not reset_requests:
+                return
+            reset_results = pool.reset(reset_requests)
+            for slot_id, episode_idx in assigned_indices.items():
+                obs, target_xy = reset_results[slot_id]
+                active[slot_id] = start_episode(
+                    episode_idx,
+                    args.seed + episode_idx,
+                    obs,
+                    target_xy,
+                    max_steps,
+                )
+
+        start = time.time()
+        assign_episodes(list(range(num_envs)))
+        with tqdm(
+            total=args.num_episodes,
+            desc=f"eval {base_result['task_id']}",
+            dynamic_ncols=True,
+        ) as progress:
+            while active:
+                slot_ids = sorted(active)
+                observations = np.stack([active[slot_id].obs for slot_id in slot_ids])
+                goals = np.stack(
+                    [
+                        make_goal(
+                            active[slot_id].obs,
+                            active[slot_id].reset_obs,
+                            active[slot_id].target_xy,
+                            args.goal_mode,
+                        )
+                        for slot_id in slot_ids
+                    ]
+                )
+                action_batch = policy_actions(
+                    agent,
+                    observations,
+                    goals,
+                    action_space,
+                    device,
+                    args.action_mode,
+                )
+                step_results = pool.step(dict(zip(slot_ids, action_batch)))
+                freed_slots: list[int] = []
+                for slot_id in slot_ids:
+                    state = active[slot_id]
+                    obs, reward, terminated, truncated = step_results[slot_id]
+                    state.obs = obs
+                    state.episode_return += reward
+                    state.rewards.append(reward)
+                    state.terminated = terminated
+                    state.truncated = truncated
+                    distance = float(
+                        np.linalg.norm(obs[: state.target_xy.shape[0]] - state.target_xy)
+                    )
+                    state.distances.append(distance)
+                    if (
+                        (distance <= args.success_radius or reward > 0)
+                        and state.first_success_step == max_steps + 1
+                    ):
+                        state.first_success_step = len(state.rewards)
+
+                    if terminated or truncated or len(state.rewards) >= max_steps:
+                        episode_records[state.episode_idx] = finish_episode(
+                            state,
+                            base_result,
+                            probe_env,
+                            args.success_radius,
+                            max_steps,
+                        )
+                        del active[slot_id]
+                        freed_slots.append(slot_id)
+                        progress.update(1)
+
+                while (
+                    next_write_idx < len(episode_records)
+                    and episode_records[next_write_idx] is not None
+                ):
+                    print(
+                        json.dumps(episode_records[next_write_idx], sort_keys=True),
+                        file=details_f,
+                        flush=True,
+                    )
+                    next_write_idx += 1
+                assign_episodes(freed_slots)
+
+        episodes = [episode for episode in episode_records if episode is not None]
+        if len(episodes) != args.num_episodes:
+            raise RuntimeError(
+                f"Completed {len(episodes)} episodes; expected {args.num_episodes}"
+            )
+        return episodes, time.time() - start
+    finally:
+        if pool is not None:
+            pool.close()
+        if not probe_owned_by_pool:
+            close = getattr(probe_env, "close", None)
+            if close is not None:
+                close()
+
+
 def evaluate_one(
     result_dir: Path,
     args: argparse.Namespace,
@@ -257,8 +684,13 @@ def evaluate_one(
 ) -> dict[str, Any]:
     checkpoint = select_checkpoint(result_dir, args.checkpoint)
     agent, dataset, conf = make_agent(result_dir, checkpoint, device)
-    env = dataset.create_env()
-    max_steps = args.max_episode_steps or int(getattr(env, "max_episode_steps", 1000))
+    probe_env = dataset.create_env()
+    try:
+        max_steps = args.max_episode_steps or int(getattr(probe_env, "max_episode_steps", 1000))
+    finally:
+        close = getattr(probe_env, "close", None)
+        if close is not None:
+            close()
     env_name = conf["env"]["name"]
     base_result = dict(
         task_id=result_dir.name,
@@ -271,68 +703,18 @@ def evaluate_one(
         action_mode=args.action_mode,
         goal_mode=args.goal_mode,
         success_radius=args.success_radius,
+        num_envs=min(args.num_envs, args.num_episodes),
+        num_workers=min(args.num_workers, args.num_envs, args.num_episodes),
     )
-
-    episodes: list[dict[str, Any]] = []
-    start = time.time()
-    iterator = tqdm(range(args.num_episodes), desc=f"eval {result_dir.name}", dynamic_ncols=True)
-    for episode_idx in iterator:
-        episode_seed = args.seed + episode_idx
-        np.random.seed(episode_seed)
-        random.seed(episode_seed)
-        torch.manual_seed(episode_seed)
-        obs = reset_env(env, episode_seed)
-        reset_obs = obs.copy()
-        target_xy = get_target(env)
-
-        episode_return = 0.0
-        rewards: list[float] = []
-        distances = [float(np.linalg.norm(obs[: target_xy.shape[0]] - target_xy))]
-        first_success_step = max_steps + 1
-        terminated = False
-        truncated = False
-
-        for step in range(max_steps):
-            goal = make_goal(obs, reset_obs, target_xy, args.goal_mode)
-            action = policy_action(agent, obs, goal, env.action_space, device, args.action_mode)
-            obs, reward, terminated, truncated, _info = step_env(env, action)
-            reward = float(reward)
-            episode_return += reward
-            rewards.append(reward)
-
-            distance = float(np.linalg.norm(obs[: target_xy.shape[0]] - target_xy))
-            distances.append(distance)
-            is_success_step = (distance <= args.success_radius) or (reward > 0)
-            if is_success_step and first_success_step == max_steps + 1:
-                first_success_step = step + 1
-            if terminated or truncated:
-                break
-
-        success = first_success_step <= max_steps
-        normalized_score = None
-        if hasattr(env, "get_normalized_score"):
-            normalized_score = float(env.get_normalized_score(episode_return))
-
-        episode = dict(
-            **base_result,
-            episode_idx=episode_idx,
-            episode_seed=episode_seed,
-            episode_return=episode_return,
-            normalized_score=normalized_score,
-            normalized_score_x100=(None if normalized_score is None else normalized_score * 100.0),
-            episode_length=len(rewards),
-            success=success,
-            time_at_goal=int(sum((d <= args.success_radius) or (r > 0) for d, r in zip(distances[1:], rewards))),
-            first_success_step=first_success_step,
-            min_distance=min(distances),
-            final_distance=distances[-1],
-            terminated=terminated,
-            truncated=truncated,
-        )
-        episodes.append(episode)
-        print(json.dumps(episode, sort_keys=True), file=details_f, flush=True)
-
-    return summarize(base_result, episodes, time.time() - start)
+    episodes, elapsed_s = rollout_episodes(
+        agent,
+        dataset,
+        args,
+        device,
+        details_f,
+        base_result,
+    )
+    return summarize(base_result, episodes, elapsed_s)
 
 
 def write_outputs(summaries: list[dict[str, Any]], details_path: Path, summary_json: Path, summary_tsv: Path) -> None:
@@ -342,6 +724,8 @@ def write_outputs(summaries: list[dict[str, Any]], details_path: Path, summary_j
         "env_name",
         "seed",
         "num_episodes",
+        "num_envs",
+        "num_workers",
         "return_mean",
         "return_std",
         "normalized_score_x100_mean",
@@ -368,6 +752,12 @@ def main() -> None:
     args = parse_args()
     if args.num_episodes <= 0:
         raise ValueError("--num-episodes must be positive")
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be nonnegative")
+    if args.num_workers > args.num_envs:
+        raise ValueError("--num-workers cannot exceed --num-envs")
 
     device = torch.device(args.device)
     if device.type == "cuda":
