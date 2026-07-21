@@ -1,0 +1,296 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1680" viewBox="0 0 2400 1680" role="img" aria-label="Detailed 1Q SplitLatentMax8 architecture on Maze2D">
+
+<defs>
+  <filter id="shadow" x="-20%" y="-20%" width="150%" height="160%">
+    <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#17212B" flood-opacity="0.12"/>
+  </filter>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#17212B"/>
+  </marker>
+  <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#C6463D"/>
+  </marker>
+  <style>
+    text { font-family: Inter, "Noto Sans", "DejaVu Sans", Arial, sans-serif; fill: #17212B; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 15px; fill: #5B6773; }
+    .section { font-size: 15px; font-weight: 700; letter-spacing: 0; }
+    .block-title { font-size: 16px; font-weight: 700; }
+    .block-sub { font-size: 13px; fill: #263440; }
+    .small { font-size: 12px; fill: #5B6773; }
+    .tiny { font-size: 11px; fill: #5B6773; }
+    .math { font-family: "DejaVu Sans Mono", monospace; font-size: 13px; }
+  </style>
+</defs>
+
+<rect x="0" y="0" width="2400" height="1680" rx="6" fill="#FFFFFF" stroke="none" stroke-width="1.5"/>
+<text x="60" y="58" class="title" text-anchor="start">1Q SplitLatentMax8</text>
+<text x="60" y="86" class="subtitle" text-anchor="start">Maze2D-umaze-v1  |  one critic  |  full critic and actor training routes</text>
+<rect x="2147.0" y="34" width="193.0" height="34" rx="6" fill="#17212B" stroke="none" stroke-width="1.5"/>
+<text x="2243.5" y="57" class="block-sub" text-anchor="middle" style="fill:#FFFFFF" font-weight="700">LATEX SOURCE + PREVIEW</text>
+<line x1="60" y1="108" x2="2340" y2="108" stroke="#DCE2E7" stroke-width="1.5" fill="none"/>
+<rect x="40" y="128" width="2320" height="700" rx="6" fill="#F7F9FA" stroke="#DCE2E7" stroke-width="1.5"/>
+<rect x="40" y="128" width="8" height="700" rx="4" fill="#26799B" stroke="none" stroke-width="1.5"/>
+<text x="62" y="155" class="section" text-anchor="start" style="fill:#26799B">A. CRITIC TRAINING</text>
+<rect x="40" y="850" width="2320" height="350" rx="6" fill="#F7F9FA" stroke="#DCE2E7" stroke-width="1.5"/>
+<rect x="40" y="850" width="8" height="350" rx="4" fill="#347A3D" stroke="none" stroke-width="1.5"/>
+<text x="62" y="877" class="section" text-anchor="start" style="fill:#347A3D">B. ACTOR FORWARD</text>
+<rect x="40" y="1222" width="2320" height="395" rx="6" fill="#F7F9FA" stroke="#DCE2E7" stroke-width="1.5"/>
+<rect x="40" y="1222" width="8" height="395" rx="4" fill="#C6463D" stroke="none" stroke-width="1.5"/>
+<text x="62" y="1249" class="section" text-anchor="start" style="fill:#C6463D">C. MAX8 LATENT GOAL COMPLETION</text>
+<rect x="70" y="210" width="210" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="175.0" y="234" class="block-title" text-anchor="middle">current state  sₜ</text>
+<text x="175.0" y="254" class="small" text-anchor="middle">(xₜ,yₜ,vˣₜ,vʸₜ) in R⁴</text>
+<rect x="70" y="392" width="210" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="175.0" y="416" class="block-title" text-anchor="middle">dataset action  aₜ</text>
+<text x="175.0" y="436" class="small" text-anchor="middle">R²</text>
+<rect x="70" y="574" width="210" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="175.0" y="598" class="block-title" text-anchor="middle">next state  sₜ₊₁</text>
+<text x="175.0" y="618" class="small" text-anchor="middle">complete state in R⁴</text>
+<rect x="330" y="215" width="340" height="410" rx="6" fill="#DCEFF6" stroke="#26799B" stroke-width="1.6"/>
+<rect x="330" y="215" width="340" height="6" rx="3" fill="#26799B" stroke="none" stroke-width="1.5"/>
+<text x="500.0" y="245" class="block-title" text-anchor="middle" style="fill:#17212B">Shared Split Encoder  Eθ</text>
+<text x="500.0" y="270" class="block-sub" text-anchor="middle">
+<tspan x="500.0" dy="0">Position branch  Eᴳ</tspan>
+<tspan x="500.0" dy="18">2 → 384 → 384 → 64</tspan>
+<tspan x="500.0" dy="18">RMSNorm (no affine)</tspan>
+<tspan x="500.0" dy="18"></tspan>
+<tspan x="500.0" dy="18">Motion branch  Eᴺ</tspan>
+<tspan x="500.0" dy="18">2 → 384 → 384 → 64</tspan>
+<tspan x="500.0" dy="18">RMSNorm (no affine)</tspan>
+<tspan x="500.0" dy="18"></tspan>
+<tspan x="500.0" dy="18">Concatenate: 64 + 64 = 128</tspan>
+</text>
+<rect x="720" y="250" width="240" height="58" rx="8" fill="#EAF5F8" stroke="#83909C" stroke-width="1.5"/>
+<text x="840.0" y="274" class="block-title" text-anchor="middle">current-state latent  zₜ</text>
+<text x="840.0" y="294" class="small" text-anchor="middle">[zₜᴳ ; zₜᴺ] in R¹²⁸</text>
+<rect x="720" y="540" width="240" height="58" rx="8" fill="#EAF5F8" stroke="#83909C" stroke-width="1.5"/>
+<text x="840.0" y="564" class="block-title" text-anchor="middle">next-state latent  zₜ₊₁</text>
+<text x="840.0" y="584" class="small" text-anchor="middle">[zₜ₊₁ᴳ ; zₜ₊₁ᴺ] in R¹²⁸</text>
+<polyline points="280,239 305,239 305,290 330,290" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="280,603 305,603 305,550 330,550" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="670,290 690,290 690,279 720,279" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="670,550 690,550 690,569 720,569" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<rect x="1030" y="175" width="255" height="100" rx="6" fill="#FFFFFF" stroke="#83909C" stroke-width="1.6"/>
+<rect x="1030" y="175" width="255" height="6" rx="3" fill="#83909C" stroke="none" stroke-width="1.5"/>
+<text x="1157.5" y="205" class="block-title" text-anchor="middle" style="fill:#17212B">Adjacent pair</text>
+<text x="1157.5" y="230" class="block-sub" text-anchor="middle">
+<tspan x="1157.5" dy="0">(zₜ, zₜ₊₁)</tspan>
+</text>
+<rect x="1335" y="165" width="280" height="120" rx="6" fill="#EEE6F5" stroke="#70459A" stroke-width="1.6"/>
+<rect x="1335" y="165" width="280" height="6" rx="3" fill="#70459A" stroke="none" stroke-width="1.5"/>
+<text x="1475.0" y="195" class="block-title" text-anchor="middle" style="fill:#17212B">Shared  Pψ + IQE</text>
+<text x="1475.0" y="220" class="block-sub" text-anchor="middle">
+<tspan x="1475.0" dy="0">128 → 512 → 2048</tspan>
+<tspan x="1475.0" dy="18">IQE: 64 components</tspan>
+<tspan x="1475.0" dy="18">distance  dψ(zₜ, zₜ₊₁)</tspan>
+</text>
+<rect x="1665" y="155" width="365" height="140" rx="6" fill="#FFF4DB" stroke="#A96512" stroke-width="1.6"/>
+<rect x="1665" y="155" width="365" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="1681" y="185" class="block-title" text-anchor="start" style="fill:#17212B">Local constraint  Llocal</text>
+<text x="1681" y="210" class="block-sub" text-anchor="start">
+<tspan x="1681" dy="0">Adjacent distance ≤ step cost 1</tspan>
+<tspan x="1681" dy="18">λ ( mean ReLU(d − 1)² − 0.25² )</tspan>
+</text>
+<rect x="1030" y="340" width="255" height="100" rx="6" fill="#FFFFFF" stroke="#83909C" stroke-width="1.6"/>
+<rect x="1030" y="340" width="255" height="6" rx="3" fill="#83909C" stroke="none" stroke-width="1.5"/>
+<text x="1157.5" y="370" class="block-title" text-anchor="middle" style="fill:#17212B">Batch-random pair</text>
+<text x="1157.5" y="395" class="block-sub" text-anchor="middle">
+<tspan x="1157.5" dy="0">(zₜ, roll(zₜ₊₁, 1))</tspan>
+</text>
+<rect x="1335" y="330" width="280" height="120" rx="6" fill="#EEE6F5" stroke="#70459A" stroke-width="1.6"/>
+<rect x="1335" y="330" width="280" height="6" rx="3" fill="#70459A" stroke="none" stroke-width="1.5"/>
+<text x="1475.0" y="360" class="block-title" text-anchor="middle" style="fill:#17212B">Shared  Pψ + IQE</text>
+<text x="1475.0" y="385" class="block-sub" text-anchor="middle">
+<tspan x="1475.0" dy="0">same weights; IQE 64 components</tspan>
+<tspan x="1475.0" dy="18">distance to random target</tspan>
+</text>
+<rect x="1665" y="320" width="365" height="140" rx="6" fill="#FFF4DB" stroke="#A96512" stroke-width="1.6"/>
+<rect x="1665" y="320" width="365" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="1681" y="350" class="block-title" text-anchor="start" style="fill:#17212B">Global push  Lpush</text>
+<text x="1681" y="375" class="block-sub" text-anchor="start">
+<tspan x="1681" dy="0">Push unrelated pairs apart</tspan>
+<tspan x="1681" dy="18">mean softplus(15 − d; β = 0.1)</tspan>
+</text>
+<rect x="1020" y="540" width="285" height="125" rx="6" fill="#FBE7C9" stroke="#A96512" stroke-width="1.6"/>
+<rect x="1020" y="540" width="285" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="1162.5" y="570" class="block-title" text-anchor="middle" style="fill:#17212B">Residual dynamics  Fφ</text>
+<text x="1162.5" y="595" class="block-sub" text-anchor="middle">
+<tspan x="1162.5" dy="0">[zₜ, aₜ]: 130 → 512 → 512 → 128</tspan>
+<tspan x="1162.5" dy="18">prediction  ẑₜ₊₁ = zₜ + Δz</tspan>
+</text>
+<rect x="1350" y="550" width="220" height="105" rx="6" fill="#FFFFFF" stroke="#83909C" stroke-width="1.6"/>
+<rect x="1350" y="550" width="220" height="6" rx="3" fill="#83909C" stroke="none" stroke-width="1.5"/>
+<text x="1460.0" y="580" class="block-title" text-anchor="middle" style="fill:#17212B">Prediction pair</text>
+<text x="1460.0" y="605" class="block-sub" text-anchor="middle">
+<tspan x="1460.0" dy="0">(ẑₜ₊₁, zₜ₊₁)</tspan>
+</text>
+<rect x="1615" y="540" width="280" height="125" rx="6" fill="#EEE6F5" stroke="#70459A" stroke-width="1.6"/>
+<rect x="1615" y="540" width="280" height="6" rx="3" fill="#70459A" stroke="none" stroke-width="1.5"/>
+<text x="1755.0" y="570" class="block-title" text-anchor="middle" style="fill:#17212B">Shared  Pψ + IQE</text>
+<text x="1755.0" y="595" class="block-sub" text-anchor="middle">
+<tspan x="1755.0" dy="0">IQE: 64 components</tspan>
+<tspan x="1755.0" dy="18">bidirectional distances</tspan>
+<tspan x="1755.0" dy="18">d(ẑ,z′) and d(z′,ẑ)</tspan>
+</text>
+<rect x="1940" y="530" width="360" height="145" rx="6" fill="#FFF4DB" stroke="#A96512" stroke-width="1.6"/>
+<rect x="1940" y="530" width="360" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="1956" y="560" class="block-title" text-anchor="start" style="fill:#17212B">Dynamics loss  Ldyn</text>
+<text x="1956" y="585" class="block-sub" text-anchor="start">
+<tspan x="1956" dy="0">0.1 × mean of both squared</tspan>
+<tspan x="1956" dy="18">directional IQE distances</tspan>
+</text>
+<rect x="2075" y="175" width="225" height="280" rx="6" fill="#F8EAD4" stroke="#A96512" stroke-width="1.6"/>
+<rect x="2075" y="175" width="225" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="2187.5" y="205" class="block-title" text-anchor="middle" style="fill:#17212B">Joint critic update</text>
+<text x="2187.5" y="230" class="block-sub" text-anchor="middle">
+<tspan x="2187.5" dy="0">Lcritic =</tspan>
+<tspan x="2187.5" dy="18">Lpush + Llocal + Ldyn</tspan>
+<tspan x="2187.5" dy="18"></tspan>
+<tspan x="2187.5" dy="18">Updates encoder,</tspan>
+<tspan x="2187.5" dy="18">projector, IQE,</tspan>
+<tspan x="2187.5" dy="18">and dynamics together</tspan>
+</text>
+<polyline points="960,279 990,279 990,225 1030,225" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="960,569 1000,569 1000,245 1030,245" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="960,279 980,279 980,380 1030,380" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="960,569 995,569 995,420 1030,420" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="960,279 985,279 985,590 1020,590" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="280,421 300,421 300,710 985,710 985,630 1020,630" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="1285" y1="225" x2="1335" y2="225" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1615" y1="225" x2="1665" y2="225" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1285" y1="390" x2="1335" y2="390" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1615" y1="390" x2="1665" y2="390" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1305" y1="602" x2="1350" y2="602" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="960,569 1325,569 1325,625 1350,625" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="1570" y1="602" x2="1615" y2="602" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1895" y1="602" x2="1940" y2="602" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="2030" y1="225" x2="2075" y2="250" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="2030" y1="390" x2="2075" y2="350" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="2300,602 2330,602 2330,430 2300,430" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="1475" y1="285" x2="1475" y2="330" stroke="#70459A" stroke-width="2" fill="none" stroke-dasharray="5 5"/>
+<polyline points="1475,450 1475,490 1755,490 1755,540" stroke="#70459A" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" stroke-dasharray="5 5"/>
+<text x="1490" y="310" class="tiny" text-anchor="start" style="fill:#70459A">same Pψ + IQE weights</text>
+<rect x="70" y="910" width="200" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="170.0" y="934" class="block-title" text-anchor="middle">sampled state  s</text>
+<text x="170.0" y="954" class="small" text-anchor="middle">complete Maze2D state</text>
+<rect x="70" y="1055" width="200" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="170.0" y="1079" class="block-title" text-anchor="middle">random goal  g</text>
+<text x="170.0" y="1099" class="small" text-anchor="middle">roll(next states, 1)</text>
+<rect x="330" y="885" width="290" height="105" rx="6" fill="#DCEFF6" stroke="#26799B" stroke-width="1.6"/>
+<rect x="330" y="885" width="290" height="6" rx="3" fill="#26799B" stroke="none" stroke-width="1.5"/>
+<text x="475.0" y="915" class="block-title" text-anchor="middle" style="fill:#17212B">Shared Eᴳ and Eᴺ</text>
+<text x="475.0" y="940" class="block-sub" text-anchor="middle">
+<tspan x="475.0" dy="0">encode all four coordinates</tspan>
+</text>
+<rect x="330" y="1025" width="290" height="115" rx="6" fill="#DCEFF6" stroke="#26799B" stroke-width="1.6"/>
+<rect x="330" y="1025" width="290" height="6" rx="3" fill="#26799B" stroke="none" stroke-width="1.5"/>
+<text x="475.0" y="1055" class="block-title" text-anchor="middle" style="fill:#17212B">Shared Eᴳ only</text>
+<text x="475.0" y="1080" class="block-sub" text-anchor="middle">
+<tspan x="475.0" dy="0">encode goal (xᵍ,yᵍ)</tspan>
+<tspan x="475.0" dy="18">goal branch output in R⁶⁴</tspan>
+</text>
+<rect x="680" y="910" width="225" height="58" rx="8" fill="#EAF5F8" stroke="#83909C" stroke-width="1.5"/>
+<text x="792.5" y="934" class="block-title" text-anchor="middle">state latent  zₛ</text>
+<text x="792.5" y="954" class="small" text-anchor="middle">[zₛᴳ ; zₛᴺ] in R¹²⁸</text>
+<rect x="680" y="1055" width="225" height="58" rx="8" fill="#EAF5F8" stroke="#83909C" stroke-width="1.5"/>
+<text x="792.5" y="1079" class="block-title" text-anchor="middle">actor goal  zᵍᴳ</text>
+<text x="792.5" y="1099" class="small" text-anchor="middle">goal branch in R⁶⁴</text>
+<rect x="975" y="955" width="230" height="100" rx="6" fill="#FFFFFF" stroke="#83909C" stroke-width="1.6"/>
+<rect x="975" y="955" width="230" height="6" rx="3" fill="#83909C" stroke="none" stroke-width="1.5"/>
+<text x="1090.0" y="985" class="block-title" text-anchor="middle" style="fill:#17212B">Concatenate</text>
+<text x="1090.0" y="1010" class="block-sub" text-anchor="middle">
+<tspan x="1090.0" dy="0">[zₛ ; zᵍᴳ] in R¹⁹²</tspan>
+</text>
+<rect x="1260" y="945" width="265" height="120" rx="6" fill="#DCEEDC" stroke="#347A3D" stroke-width="1.6"/>
+<rect x="1260" y="945" width="265" height="6" rx="3" fill="#347A3D" stroke="none" stroke-width="1.5"/>
+<text x="1392.5" y="975" class="block-title" text-anchor="middle" style="fill:#17212B">Latent actor  πω</text>
+<text x="1392.5" y="1000" class="block-sub" text-anchor="middle">
+<tspan x="1392.5" dy="0">192 → 512 → 512 → 4</tspan>
+</text>
+<rect x="1580" y="955" width="190" height="100" rx="6" fill="#DCEEDC" stroke="#347A3D" stroke-width="1.6"/>
+<rect x="1580" y="955" width="190" height="6" rx="3" fill="#347A3D" stroke="none" stroke-width="1.5"/>
+<text x="1675.0" y="985" class="block-title" text-anchor="middle" style="fill:#17212B">Tanh Normal</text>
+<text x="1675.0" y="1010" class="block-sub" text-anchor="middle">
+<tspan x="1675.0" dy="0">sample action  a in R²</tspan>
+</text>
+<rect x="1830" y="945" width="280" height="120" rx="6" fill="#FBE7C9" stroke="#A96512" stroke-width="1.6"/>
+<rect x="1830" y="945" width="280" height="6" rx="3" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="1970.0" y="975" class="block-title" text-anchor="middle" style="fill:#17212B">Shared dynamics  Fφ</text>
+<text x="1970.0" y="1000" class="block-sub" text-anchor="middle">
+<tspan x="1970.0" dy="0">[zₛ, a] → predicted next latent</tspan>
+</text>
+<rect x="2170" y="976" width="160" height="58" rx="8" fill="#FBE7C9" stroke="#83909C" stroke-width="1.5"/>
+<text x="2250.0" y="1000" class="block-title" text-anchor="middle">prediction  ẑₛ′</text>
+<text x="2250.0" y="1020" class="small" text-anchor="middle">R¹²⁸</text>
+<line x1="270" y1="939" x2="330" y2="939" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="270" y1="1084" x2="330" y2="1084" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="620" y1="939" x2="680" y2="939" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="620" y1="1084" x2="680" y2="1084" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="905,939 940,939 940,985 975,985" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="905,1084 940,1084 940,1025 975,1025" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="1205" y1="1005" x2="1260" y2="1005" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1525" y1="1005" x2="1580" y2="1005" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1770" y1="1005" x2="1830" y2="1005" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="905,939 925,939 925,1160 1800,1160 1800,1040 1830,1040" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="2110" y1="1005" x2="2170" y2="1005" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="2115" y="1090" class="small" text-anchor="start">Critic frozen for actor update.</text>
+<text x="2115" y="1115" class="small" text-anchor="start">Gradients reach Fφ, action, and πω.</text>
+<rect x="70" y="1295" width="240" height="58" rx="8" fill="#EAF5F8" stroke="#83909C" stroke-width="1.5"/>
+<text x="190.0" y="1319" class="block-title" text-anchor="middle">fixed target position  zᵍᴳ</text>
+<text x="190.0" y="1339" class="small" text-anchor="middle">RMSNorm(Eᴳ(xᵍ,yᵍ))</text>
+<rect x="70" y="1455" width="240" height="58" rx="8" fill="#FCE8E6" stroke="#83909C" stroke-width="1.5"/>
+<text x="190.0" y="1479" class="block-title" text-anchor="middle">sampled motion  h₀</text>
+<text x="190.0" y="1499" class="small" text-anchor="middle">RMSNorm(Eᴺ(vₓᵍ,vᵧᵍ))</text>
+<rect x="380" y="1340" width="290" height="120" rx="6" fill="#FCE8E6" stroke="#C6463D" stroke-width="1.6"/>
+<rect x="380" y="1340" width="290" height="6" rx="3" fill="#C6463D" stroke="none" stroke-width="1.5"/>
+<text x="525.0" y="1370" class="block-title" text-anchor="middle" style="fill:#17212B">Candidate completed goal</text>
+<text x="525.0" y="1395" class="block-sub" text-anchor="middle">
+<tspan x="525.0" dy="0">h̄ₖ = RMSNorm(hₖ)</tspan>
+<tspan x="525.0" dy="18">z̃ᵍ⁽ᵏ⁾ = [zᵍᴳ ; h̄ₖ] in R¹²⁸</tspan>
+</text>
+<rect x="735" y="1328" width="335" height="145" rx="6" fill="#EEE6F5" stroke="#70459A" stroke-width="1.6"/>
+<rect x="735" y="1328" width="335" height="6" rx="3" fill="#70459A" stroke="none" stroke-width="1.5"/>
+<text x="902.5" y="1358" class="block-title" text-anchor="middle" style="fill:#17212B">Shared Pψ + IQE</text>
+<text x="902.5" y="1383" class="block-sub" text-anchor="middle">
+<tspan x="902.5" dy="0">dₖ = dψ(stopgrad(ẑₛ′), z̃ᵍ⁽ᵏ⁾)</tspan>
+<tspan x="902.5" dy="18">prediction is fixed inside loop</tspan>
+</text>
+<rect x="1140" y="1328" width="330" height="145" rx="6" fill="#F9D8D5" stroke="#C6463D" stroke-width="1.6"/>
+<rect x="1140" y="1328" width="330" height="6" rx="3" fill="#C6463D" stroke="none" stroke-width="1.5"/>
+<text x="1305.0" y="1358" class="block-title" text-anchor="middle" style="fill:#17212B">Adam gradient ascent</text>
+<text x="1305.0" y="1383" class="block-sub" text-anchor="middle">
+<tspan x="1305.0" dy="0">gradient passes through RMSNorm</tspan>
+<tspan x="1305.0" dy="18">hₖ₊₁ = AdamAsc(hₖ, ∇ₕdₖ)</tspan>
+<tspan x="1305.0" dy="18">k = 0,…,7;  lr = 0.01</tspan>
+</text>
+<rect x="1535" y="1371" width="235" height="58" rx="8" fill="#FCE8E6" stroke="#83909C" stroke-width="1.5"/>
+<text x="1652.5" y="1395" class="block-title" text-anchor="middle">best goal  zᵍ⋆</text>
+<text x="1652.5" y="1415" class="small" text-anchor="middle">best of h̄₀,…,h̄₈</text>
+<rect x="1830" y="1328" width="315" height="145" rx="6" fill="#EEE6F5" stroke="#70459A" stroke-width="1.6"/>
+<rect x="1830" y="1328" width="315" height="6" rx="3" fill="#70459A" stroke="none" stroke-width="1.5"/>
+<text x="1987.5" y="1358" class="block-title" text-anchor="middle" style="fill:#17212B">Final shared metric</text>
+<text x="1987.5" y="1383" class="block-sub" text-anchor="middle">
+<tspan x="1987.5" dy="0">d final = dψ(ẑₛ′, stopgrad(zᵍ⋆))</tspan>
+<tspan x="1987.5" dy="18">gradient restored through prediction</tspan>
+</text>
+<rect x="2200" y="1340" width="130" height="120" rx="6" fill="#DCEEDC" stroke="#347A3D" stroke-width="1.6"/>
+<rect x="2200" y="1340" width="130" height="6" rx="3" fill="#347A3D" stroke="none" stroke-width="1.5"/>
+<text x="2265.0" y="1370" class="block-title" text-anchor="middle" style="fill:#17212B">Actor loss</text>
+<text x="2265.0" y="1395" class="block-sub" text-anchor="middle">
+<tspan x="2265.0" dy="0">min  mean</tspan>
+<tspan x="2265.0" dy="18">of d final</tspan>
+</text>
+<polyline points="310,1324 340,1324 340,1375 380,1375" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="310,1484 350,1484 350,1430 380,1430" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="670" y1="1400" x2="735" y2="1400" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1070" y1="1400" x2="1140" y2="1400" stroke="#C6463D" stroke-width="2.7" fill="none" marker-end="url(#arrow-red)"/>
+<polyline points="1305,1473 1305,1545 190,1545 190,1513" stroke="#C6463D" stroke-width="2.7" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow-red)"/>
+<text x="750" y="1570" class="small" text-anchor="middle" style="fill:#C6463D">normalize every candidate; retain the per-sample best of steps 0 through 8</text>
+<line x1="1470" y1="1400" x2="1535" y2="1400" stroke="#C6463D" stroke-width="2.7" fill="none" marker-end="url(#arrow-red)"/>
+<line x1="1770" y1="1400" x2="1830" y2="1400" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="2145" y1="1400" x2="2200" y2="1400" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="2250,1034 2250,1260 900,1260 900,1328" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="2250,1034 2280,1034 2280,1295 1990,1295 1990,1328" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<text x="1455" y="1248" class="small" text-anchor="middle">The .tex file is the authoritative source; all mathematical labels use LaTeX math mode.</text>
+</svg>

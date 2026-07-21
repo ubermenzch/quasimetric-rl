@@ -27,6 +27,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRANSIENT_FAILURE_PATTERNS = (
     "CUDA driver initialization failed",
+    "CUDA unknown error",
+    "Setting the available devices to be zero.",
 )
 CUDA_OOM_PATTERNS = (
     "CUDA out of memory",
@@ -736,16 +738,59 @@ def log_tail(log_file: Path, max_bytes: int = TRANSIENT_LOG_TAIL_BYTES) -> str:
         return ""
 
 
-def transient_failure_reason(config: dict[str, str], job: ActiveJob, exit_code: int, finished: bool) -> str:
-    if exit_code == 0 or finished:
-        return ""
+def transient_failure_reason_from_log(config: dict[str, str], log_file: Path) -> str:
     if not as_bool(cfg(config, "REQUEUE_TRANSIENT_FAILURES", "1")):
         return ""
-    tail = log_tail(job.log_file)
+    tail = log_tail(log_file)
     for pattern in TRANSIENT_FAILURE_PATTERNS:
         if pattern in tail:
             return pattern
     return ""
+
+
+def requeue_transient_status(
+    config: dict[str, str],
+    task: Task,
+    status_dir: Path,
+    status: dict[str, str],
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Requeue a confirmed transient failure without adding an OOM limit."""
+    log_file = Path(status.get("log_file", ""))
+    reason = transient_failure_reason_from_log(config, log_file)
+    if not reason:
+        return False
+
+    retry_count = as_int(status.get("transient_failure_count", "0"), 0) + 1
+    max_retries = as_int(cfg(config, "MAX_TRANSIENT_RETRIES", "10"), 10)
+    if retry_count > max_retries:
+        return False
+
+    extra = status_extra_fields(status)
+    extra.pop("finished_at", None)
+    extra.update({
+        "exit_code": status.get("exit_code", "1"),
+        "previous_gpu": status.get("gpu") or status.get("previous_gpu", ""),
+        "previous_pid": status.get("pid") or status.get("previous_pid", ""),
+        "error": "transient_failure_requeued",
+        "requeue_reason": reason,
+        "transient_failure_count": str(retry_count),
+    })
+    if dry_run:
+        print(
+            f"[{timestamp()}] DRY_RUN would requeue transient failure {task.task_id}: "
+            f"retry={retry_count}/{max_retries} reason={reason}",
+            flush=True,
+        )
+        return True
+    write_status(status_dir, task, "PENDING", extra)
+    print(
+        f"[{timestamp()}] REQUEUE_TRANSIENT_FAILURE {task.task_id} "
+        f"retry={retry_count}/{max_retries} reason={reason}",
+        flush=True,
+    )
+    return True
 
 
 def estimate_competing_gpu_memory_mb(log_text: str) -> int | None:
@@ -835,6 +880,27 @@ def requeue_existing_cuda_oom_failures(
         if status.get("task_fingerprint") != task_fingerprint(task):
             continue
         requeue_cuda_oom_status(
+            config,
+            task,
+            status_dir,
+            status,
+            dry_run=dry_run,
+        )
+
+
+def requeue_existing_transient_failures(
+    config: dict[str, str],
+    tasks: list[Task],
+    status_dir: Path,
+    dry_run: bool,
+) -> None:
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        if status.get("state") != "FAILED":
+            continue
+        if status.get("task_fingerprint") != task_fingerprint(task):
+            continue
+        requeue_transient_status(
             config,
             task,
             status_dir,
@@ -1488,28 +1554,22 @@ def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> Non
         oom_status,
     ):
         return
-    reason = transient_failure_reason(config, job, exit_code, finished)
-    if reason:
-        count = as_int(previous.get("transient_failure_count", "0"), 0) + 1
-        max_retries = as_int(cfg(config, "MAX_TRANSIENT_RETRIES", "10"), 10)
-        if count <= max_retries:
-            write_status(status_dir, job.task, "PENDING", {
-                "exit_code": str(exit_code),
-                "previous_gpu": job.gpu,
-                "previous_pid": str(job.proc.pid),
-                "log_file": str(job.log_file),
-                "output_dir": str(job.output_dir),
-                "error": "transient_failure_requeued",
-                "requeue_reason": reason,
-                "transient_failure_count": str(count),
-                "completion_evidence": completion_evidence(job.output_dir),
-            })
-            print(
-                f"[{timestamp()}] REQUEUE_TRANSIENT_FAILURE {job.task.task_id} "
-                f"exit_code={exit_code} retry={count}/{max_retries} reason={reason}",
-                flush=True,
-            )
-            return
+    transient_status = dict(previous)
+    transient_status.update({
+        "exit_code": str(exit_code),
+        "gpu": job.gpu,
+        "pid": str(job.proc.pid),
+        "log_file": str(job.log_file),
+        "output_dir": str(job.output_dir),
+        "completion_evidence": completion_evidence(job.output_dir),
+    })
+    if not finished and exit_code != 0 and requeue_transient_status(
+        config,
+        job.task,
+        status_dir,
+        transient_status,
+    ):
+        return
 
     state = "DONE" if finished else "FAILED"
     extra = {
@@ -1568,6 +1628,7 @@ def main() -> int:
             dry_run = as_bool(cfg(config, "DRY_RUN", "0"))
             stop_on_failure = as_bool(cfg(config, "STOP_ON_FAILURE", "0"))
             requeue_existing_cuda_oom_failures(config, tasks, status_dir, dry_run)
+            requeue_existing_transient_failures(config, tasks, status_dir, dry_run)
 
             if args.sync_only:
                 sync_finished_outputs(config, tasks, status_dir)

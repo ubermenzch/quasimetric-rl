@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1080" viewBox="0 0 2000 1080" role="img" aria-label="1Q Base architecture on Maze2D">
+
+<defs>
+  <filter id="shadow" x="-20%" y="-20%" width="150%" height="160%">
+    <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#17212B" flood-opacity="0.12"/>
+  </filter>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#17212B"/>
+  </marker>
+  <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#C6463D"/>
+  </marker>
+  <style>
+    text { font-family: Inter, "Noto Sans", "DejaVu Sans", Arial, sans-serif; fill: #17212B; }
+    .title { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 15px; fill: #5B6773; }
+    .section { font-size: 15px; font-weight: 700; letter-spacing: 0; }
+    .block-title { font-size: 16px; font-weight: 700; }
+    .block-sub { font-size: 13px; fill: #263440; }
+    .small { font-size: 12px; fill: #5B6773; }
+    .tiny { font-size: 11px; fill: #5B6773; }
+    .math { font-family: "DejaVu Sans Mono", monospace; font-size: 13px; }
+  </style>
+</defs>
+
+<rect x="0" y="0" width="2000" height="1080" rx="6" fill="#FFFFFF" stroke="none" stroke-width="1.5"/>
+<text x="60" y="58" class="title" text-anchor="start">1Q Base</text>
+<text x="60" y="86" class="subtitle" text-anchor="start">Maze2D-umaze-v1  |  raw-input actor  |  one quasimetric critic</text>
+<rect x="1784.5" y="34" width="155.5" height="34" rx="6" fill="#17212B" stroke="none" stroke-width="1.5"/>
+<text x="1862.25" y="57" class="block-sub" text-anchor="middle" style="fill:#FFFFFF" font-weight="700">MAZE2D / 1 CRITIC</text>
+<line x1="60" y1="108" x2="1940" y2="108" stroke="#DCE2E7" stroke-width="1.5" fill="none"/>
+<rect x="45" y="132" width="1910" height="260" rx="6" fill="#F7F9FA" stroke="#DCE2E7" stroke-width="1.5"/>
+<rect x="45" y="132" width="8" height="260" rx="4" fill="#347A3D" stroke="none" stroke-width="1.5"/>
+<text x="67" y="159" class="section" text-anchor="start" style="fill:#347A3D">POLICY FORWARD</text>
+<rect x="45" y="418" width="1910" height="474" rx="6" fill="#F7F9FA" stroke="#DCE2E7" stroke-width="1.5"/>
+<rect x="45" y="418" width="8" height="474" rx="4" fill="#A96512" stroke="none" stroke-width="1.5"/>
+<text x="67" y="445" class="section" text-anchor="start" style="fill:#A96512">ONE QUASIMETRIC CRITIC</text>
+<polyline points="200,205 300,205 300,235 348,235" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="200,325 300,325 300,235 348,235" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="384" y1="235" x2="452" y2="235" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="750" y1="235" x2="812" y2="235" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="992" y1="235" x2="1052" y2="235" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="1142,264 1142,477 736,477 736,527" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<rect x="70" y="176" width="130" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="135.0" y="200" class="block-title" text-anchor="middle">state s_t</text>
+<text x="135.0" y="220" class="small" text-anchor="middle">R^4: x,y,vx,vy</text>
+<rect x="70" y="296" width="130" height="58" rx="8" fill="#E8EDF1" stroke="#83909C" stroke-width="1.5"/>
+<text x="135.0" y="320" class="block-title" text-anchor="middle">goal g</text>
+<text x="135.0" y="340" class="small" text-anchor="middle">R^4</text>
+<circle cx="366" cy="235" r="18" fill="#FFFFFF" stroke="#17212B" stroke-width="1.5"/>
+<text x="366" y="240" class="math" text-anchor="middle" font-weight="700">||</text>
+<text x="366" y="270" class="tiny" text-anchor="middle">raw concat: R^8</text>
+<g>
+<polygon points="452,176 464,164 762,164 750,176" fill="#FFFFFF" stroke="#71AF77" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="750,176 762,164 762,282 750,294" fill="#71AF77" stroke="#71AF77" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="452" y="176" width="298" height="118" rx="4" fill="#AFD6B2" stroke="#71AF77" stroke-width="1.5"/>
+</g>
+<text x="601.0" y="206" class="block-title" text-anchor="middle">Actor pi</text>
+<text x="601.0" y="231" class="block-sub" text-anchor="middle">
+<tspan x="601.0" dy="0">8 -&gt; 1024 x 4 -&gt; 4</tspan>
+<tspan x="601.0" dy="18">ReLU; zero-init output</tspan>
+</text>
+<g>
+<polygon points="812,186 821,177 1001,177 992,186" fill="#FFFFFF" stroke="#71AF77" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="992,186 1001,177 1001,275 992,284" fill="#71AF77" stroke="#71AF77" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="812" y="186" width="180" height="98" rx="4" fill="#D8EBD9" stroke="#71AF77" stroke-width="1.5"/>
+</g>
+<text x="902.0" y="216" class="block-title" text-anchor="middle">Tanh Normal</text>
+<text x="902.0" y="241" class="block-sub" text-anchor="middle">
+<tspan x="902.0" dy="0">mean + raw std</tspan>
+<tspan x="902.0" dy="18">bounded action</tspan>
+</text>
+<rect x="1052" y="206" width="180" height="58" rx="8" fill="#EDF6EE" stroke="#83909C" stroke-width="1.5"/>
+<text x="1142.0" y="230" class="block-title" text-anchor="middle">action a_t</text>
+<text x="1142.0" y="250" class="small" text-anchor="middle">R^2</text>
+<text x="1255" y="226" class="small" text-anchor="start">Actor consumes raw (s_t, g), not critic latents.</text>
+<polyline points="200,205 242,205 242,545 350,545" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="200,325 258,325 258,650 350,650" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="650" y1="545" x2="718" y2="545" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="650" y1="650" x2="718" y2="650" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="754" y1="545" x2="812" y2="545" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<polyline points="754,650 1195,650 1195,686 1280,686" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<polyline points="1082,545 1168,545 1168,580 1280,580" stroke="#17212B" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" fill="none" marker-end="url(#arrow)"/>
+<line x1="1530" y1="633" x2="1594" y2="633" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<line x1="1764" y1="633" x2="1820" y2="633" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<g>
+<polygon points="350,487 362,475 662,475 650,487" fill="#FFFFFF" stroke="#68AEC9" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="650,487 662,475 662,685 650,697" fill="#68AEC9" stroke="#68AEC9" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="350" y="487" width="300" height="210" rx="4" fill="#A9D7E8" stroke="#68AEC9" stroke-width="1.5"/>
+</g>
+<text x="500.0" y="517" class="block-title" text-anchor="middle">Shared encoder E_theta</text>
+<text x="500.0" y="542" class="block-sub" text-anchor="middle">
+<tspan x="500.0" dy="0">4 -&gt; 1024 -&gt; 1024</tspan>
+<tspan x="500.0" dy="18">-&gt; 1024 -&gt; 256</tspan>
+<tspan x="500.0" dy="18">same weights for s_t and g</tspan>
+</text>
+<text x="366" y="550" class="small" text-anchor="middle">s_t</text>
+<text x="366" y="655" class="small" text-anchor="middle">g</text>
+<circle cx="736" cy="545" r="18" fill="#FFFFFF" stroke="#17212B" stroke-width="1.5"/>
+<text x="736" y="550" class="math" text-anchor="middle" font-weight="700">||</text>
+<text x="736" y="580" class="tiny" text-anchor="middle">[z_s, a_t]: R^258</text>
+<text x="736" y="676" class="small" text-anchor="middle">z_g: R^256</text>
+<g>
+<polygon points="812,512 824,500 1094,500 1082,512" fill="#FFFFFF" stroke="#D9993E" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="1082,512 1094,500 1094,626 1082,638" fill="#D9993E" stroke="#D9993E" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="812" y="512" width="270" height="126" rx="4" fill="#F2C27E" stroke="#D9993E" stroke-width="1.5"/>
+</g>
+<text x="947.0" y="542" class="block-title" text-anchor="middle">Residual dynamics F_phi</text>
+<text x="947.0" y="567" class="block-sub" text-anchor="middle">
+<tspan x="947.0" dy="0">[z_s, a_t]: 258</tspan>
+<tspan x="947.0" dy="18">258 -&gt; 1024 x 3 -&gt; 256</tspan>
+<tspan x="947.0" dy="18">z_hat = z_s + Delta z</tspan>
+</text>
+<text x="1148" y="535" class="math" text-anchor="middle">z_hat_(t+1)</text>
+<g>
+<polygon points="1280,548 1292,536 1542,536 1530,548" fill="#FFFFFF" stroke="#9B78BF" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="1530,548 1542,536 1542,712 1530,724" fill="#9B78BF" stroke="#9B78BF" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="1280" y="548" width="250" height="176" rx="4" fill="#D6C4E9" stroke="#9B78BF" stroke-width="1.5"/>
+</g>
+<text x="1405.0" y="578" class="block-title" text-anchor="middle">Shared projector P_psi</text>
+<text x="1405.0" y="603" class="block-sub" text-anchor="middle">
+<tspan x="1405.0" dy="0">256 -&gt; 1024 -&gt; 1024</tspan>
+<tspan x="1405.0" dy="18">-&gt; 2048</tspan>
+<tspan x="1405.0" dy="18">applied to z_hat and z_g</tspan>
+</text>
+<g>
+<polygon points="1594,582 1603,573 1773,573 1764,582" fill="#FFFFFF" stroke="#9B78BF" stroke-width="1.5" stroke-linejoin="round"/>
+<polygon points="1764,582 1773,573 1773,675 1764,684" fill="#9B78BF" stroke="#9B78BF" stroke-width="1.5" stroke-linejoin="round"/>
+<rect x="1594" y="582" width="170" height="102" rx="4" fill="#E7DCF1" stroke="#9B78BF" stroke-width="1.5"/>
+</g>
+<text x="1679.0" y="612" class="block-title" text-anchor="middle">IQE head</text>
+<text x="1679.0" y="637" class="block-sub" text-anchor="middle">
+<tspan x="1679.0" dy="0">dim 2048</tspan>
+<tspan x="1679.0" dy="18">64 components</tspan>
+</text>
+<rect x="1820" y="604" width="100" height="58" rx="8" fill="#F0EBF6" stroke="#83909C" stroke-width="1.5"/>
+<text x="1870.0" y="628" class="block-title" text-anchor="middle">d</text>
+<text x="1870.0" y="648" class="small" text-anchor="middle">scalar</text>
+<rect x="300" y="752" width="1380" height="94" rx="6" fill="#FFFFFF" stroke="#DCE2E7" stroke-width="1.5"/>
+<text x="330" y="780" class="section" text-anchor="start" style="fill:#347A3D">Actor objective</text>
+<text x="480" y="780" class="math" text-anchor="start">min  d(F(E(s_t), pi(s_t,g)), E(g))</text>
+<text x="330" y="814" class="section" text-anchor="start" style="fill:#A96512">Critic training</text>
+<text x="480" y="814" class="block-sub" text-anchor="start">global push + local transition constraint + latent-dynamics loss</text>
+<line x1="70" y1="935" x2="108" y2="935" stroke="#17212B" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<text x="120" y="940" class="small" text-anchor="start">forward / differentiable path</text>
+<line x1="370" y1="935" x2="408" y2="935" stroke="#17212B" stroke-width="2" fill="none" stroke-dasharray="5 5"/>
+<text x="420" y="940" class="small" text-anchor="start">shared parameters</text>
+<text x="70" y="990" class="small" text-anchor="start">Configuration basis: Maze2D Base network settings from the existing 2Q run, with num_critics changed to 1.</text>
+<text x="70" y="1017" class="small" text-anchor="start">BC weight = 0; adaptive entropy regularization = off; goal-as-future-state = off; joint training.</text>
+</svg>

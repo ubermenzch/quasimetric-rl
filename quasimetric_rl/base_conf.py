@@ -141,7 +141,12 @@ class BaseConf(abc.ABC):
                     'split('
                     f'dims={":".join(map(str, encoder_conf.goal_dims or ()))},'
                     f'z={encoder_conf.goal_latent_size}+{encoder_conf.non_goal_latent_size}'
-                    ')'
+                    + (
+                        f',norm={encoder_conf.branch_normalization}'
+                        if encoder_conf.branch_normalization != 'none'
+                        else ''
+                    )
+                    + ')'
                 )
             if self.agent.actor is not None:
                 aspecs = []
@@ -159,6 +164,12 @@ class BaseConf(abc.ABC):
                         f'latent_goal={latent_goal_loss.latent_goal_mode}:'
                         f'{latent_goal_loss.latent_goal_optim}:'
                         f'{latent_goal_loss.latent_goal_steps}x{latent_goal_loss.latent_goal_lr:g}'
+                        + (':best' if latent_goal_loss.latent_goal_keep_best else '')
+                        + (
+                            f':residual-r{latent_goal_loss.latent_goal_residual_radius:g}'
+                            if latent_goal_loss.latent_goal_search == 'bounded_residual'
+                            else ''
+                        )
                     )
                 if self.agent.actor.losses.behavior_cloning.weight > 0:
                     aspecs.append(f'BC={self.agent.actor.losses.behavior_cloning.weight:g}')

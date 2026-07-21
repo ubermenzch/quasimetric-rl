@@ -9,7 +9,6 @@ import math
 import multiprocessing as mp
 import os
 import random
-import re
 import sys
 import time
 import traceback
@@ -57,7 +56,11 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_RESULT_DIRS),
         help="Result directories. Defaults to the three official_qrl_maze2d_*_s1000 dirs.",
     )
-    parser.add_argument("--checkpoint", default="final", help="'final', 'latest', or an explicit checkpoint path.")
+    parser.add_argument(
+        "--checkpoint",
+        default="final",
+        help="'final', 'latest', an Agent-checkpoint step, or an explicit path.",
+    )
     parser.add_argument("--num-episodes", type=int, default=100)
     parser.add_argument(
         "--num-envs",
@@ -94,29 +97,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def checkpoint_key(path: Path) -> tuple[int, int, int]:
-    match = re.match(r"checkpoint_(\d+)_(\d+)(?:_final)?\.pth$", path.name)
-    if match is None:
-        return (-1, -1, 0)
-    epoch, it = int(match.group(1)), int(match.group(2))
-    is_final = int(path.name.endswith("_final.pth"))
-    return (epoch, it, is_final)
-
-
 def select_checkpoint(result_dir: Path, requested: str) -> Path:
     explicit = Path(requested)
     if requested not in ("final", "latest") and explicit.exists():
         return explicit
 
-    ckpts = sorted(result_dir.glob("checkpoint_*.pth"), key=checkpoint_key)
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoint_*.pth found in {result_dir}")
+    if requested.isdigit():
+        agent_checkpoint = result_dir / quasimetric_rl.utils.agent_checkpoint_filename(
+            int(requested)
+        )
+        if agent_checkpoint.exists():
+            return agent_checkpoint
+        raise FileNotFoundError(
+            f"No Agent checkpoint for optim_steps={int(requested)} in {result_dir}"
+        )
 
-    if requested == "final":
-        finals = [path for path in ckpts if path.name.endswith("_final.pth")]
-        if finals:
-            return finals[-1]
-    return ckpts[-1]
+    parsed_full_ckpts = [
+        (key, path)
+        for path in result_dir.glob("checkpoint_*.pth")
+        if (key := quasimetric_rl.utils.full_checkpoint_key(path)) is not None
+    ]
+    full_ckpts = [path for _key, path in sorted(parsed_full_ckpts)]
+    parsed_agent_ckpts = [
+        (step, path)
+        for path in result_dir.glob("agent_checkpoint_step*.pth")
+        if (step := quasimetric_rl.utils.agent_checkpoint_step(path)) is not None
+    ]
+    agent_ckpts = [path for _step, path in sorted(parsed_agent_ckpts)]
+    if not full_ckpts and not agent_ckpts:
+        raise FileNotFoundError(f"No evaluation checkpoint found in {result_dir}")
+
+    finals = [path for path in full_ckpts if path.name.endswith("_final.pth")]
+    if requested in ("final", "latest") and finals:
+        return finals[-1]
+    if agent_ckpts:
+        return agent_ckpts[-1]
+    return full_ckpts[-1]
 
 
 def load_yaml(path: Path) -> dict[str, Any]:

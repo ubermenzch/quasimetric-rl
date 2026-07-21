@@ -8,6 +8,7 @@ from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
 from tools.run_qrl_queue import read_status
 from tools.run_qrl_queue import requeue_cuda_oom_status
+from tools.run_qrl_queue import requeue_existing_transient_failures
 from tools.run_qrl_queue import task_uses_goal_set_objective
 from tools.run_qrl_queue import update_running_gpu_memory_peaks
 from tools.run_qrl_queue import write_status
@@ -189,6 +190,49 @@ class QueueTaskClassificationTest(unittest.TestCase):
                 GpuState("0", 3000, 24000, 0),
                 *common_args[1:],
             ))
+
+    def test_existing_cuda_unknown_error_requeues_without_oom_limit(self):
+        task = RunnerTask(
+            task_id="cuda_unknown_task",
+            mode="offline",
+            env_name="maze2d-umaze-v1",
+            seed="1001",
+            steps="40000",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_dir = root / "status"
+            log_file = root / "cuda_unknown.log"
+            log_file.write_text(
+                "RuntimeError: CUDA unknown error - this may be due to an "
+                "incorrectly set up environment. Setting the available "
+                "devices to be zero.\n"
+            )
+            write_status(status_dir, task, "FAILED", {
+                "exit_code": "1",
+                "log_file": str(log_file),
+                "prelaunch_gpu_mem_used_mb": "10397",
+                "error": "nonzero_exit",
+            })
+
+            requeue_existing_transient_failures(
+                {
+                    "REQUEUE_TRANSIENT_FAILURES": "1",
+                    "MAX_TRANSIENT_RETRIES": "10",
+                },
+                [task],
+                status_dir,
+                False,
+            )
+
+            pending = read_status(status_dir, task.task_id)
+            self.assertEqual(pending["state"], "PENDING")
+            self.assertEqual(pending["error"], "transient_failure_requeued")
+            self.assertEqual(pending["requeue_reason"], "CUDA unknown error")
+            self.assertEqual(pending["transient_failure_count"], "1")
+            self.assertNotIn("finished_at", pending)
+            self.assertNotIn("oom_retry_count", pending)
+            self.assertNotIn("oom_prelaunch_mem_limit_mb", pending)
 
 
 if __name__ == "__main__":

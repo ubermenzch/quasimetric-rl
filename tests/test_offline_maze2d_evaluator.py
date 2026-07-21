@@ -2,12 +2,47 @@ import argparse
 import io
 import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import gym
 import numpy as np
 import torch
 
-from tools.evaluate_offline_maze2d import ProcessEnvPool, rollout_episodes
+from tools.evaluate_offline_maze2d import (
+    ProcessEnvPool,
+    rollout_episodes,
+    select_checkpoint,
+)
+
+
+class CheckpointSelectionTest(unittest.TestCase):
+    def test_selects_agent_steps_but_never_rolling_resume(self):
+        with TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            agent_10k = result_dir / "agent_checkpoint_step00010000.pth"
+            agent_20k = result_dir / "agent_checkpoint_step00020000.pth"
+            rolling = result_dir / "checkpoint_resume_latest.pth"
+            malformed = result_dir / "checkpoint_broken.pth"
+            for path in (agent_10k, agent_20k, rolling, malformed):
+                path.touch()
+
+            self.assertEqual(select_checkpoint(result_dir, "10000"), agent_10k)
+            self.assertEqual(select_checkpoint(result_dir, "latest"), agent_20k)
+
+            final = result_dir / "checkpoint_00184_00104_final.pth"
+            final.touch()
+            self.assertEqual(select_checkpoint(result_dir, "final"), final)
+            self.assertEqual(select_checkpoint(result_dir, "latest"), final)
+
+    def test_ignores_malformed_and_rolling_checkpoints(self):
+        with TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            (result_dir / "checkpoint_resume_latest.pth").touch()
+            (result_dir / "checkpoint_broken.pth").touch()
+
+            with self.assertRaisesRegex(FileNotFoundError, "No evaluation checkpoint"):
+                select_checkpoint(result_dir, "latest")
 
 
 class FakeMazeEnv:

@@ -12,20 +12,28 @@ from ...data.env_spec.input_encoding import InputEncoding
 from ...data.env_spec.act_distn import ActionOutputConverter
 
 
+ACTOR_INPUT_MODES = ('raw', 'latent', 'split_latent')
+
+
 class Actor(nn.Module):
     @attrs.define(kw_only=True)
     class Conf:
         # config / argparse uses this to specify behavior
 
         arch: Tuple[int, ...] = (512, 512)
-        input_mode: str = attrs.field(default='raw', validator=attrs.validators.in_(('raw', 'latent')))
+        input_mode: str = attrs.field(
+            default='raw', validator=attrs.validators.in_(ACTOR_INPUT_MODES)
+        )
 
-        def make(self, *, env_spec: EnvSpec, latent_size: Optional[int] = None) -> 'Actor':
+        def make(
+                self, *, env_spec: EnvSpec, latent_size: Optional[int] = None,
+                goal_latent_size: Optional[int] = None) -> 'Actor':
             return Actor(
                 env_spec=env_spec,
                 arch=self.arch,
                 input_mode=self.input_mode,
                 latent_size=latent_size,
+                goal_latent_size=goal_latent_size,
             )
 
     observation_shape: torch.Size
@@ -34,8 +42,10 @@ class Actor(nn.Module):
     backbone: MLP
     action_output: ActionOutputConverter
 
-    def __init__(self, *, env_spec: EnvSpec, arch: Tuple[int, ...],
-                 input_mode: str, latent_size: Optional[int] = None, **kwargs):
+    def __init__(
+            self, *, env_spec: EnvSpec, arch: Tuple[int, ...],
+            input_mode: str, latent_size: Optional[int] = None,
+            goal_latent_size: Optional[int] = None, **kwargs):
         super().__init__(**kwargs)
         self.observation_shape = env_spec.observation_shape
         self.input_mode = input_mode
@@ -44,10 +54,16 @@ class Actor(nn.Module):
         self.action_output = env_spec.make_action_output_distn()
         if input_mode == 'raw':
             backbone_input_size = self.observation_encoding.output_size * 2  # add goal
-        elif input_mode == 'latent':
+        elif input_mode in ('latent', 'split_latent'):
             if latent_size is None:
-                raise ValueError("latent actor input_mode requires latent_size")
-            backbone_input_size = latent_size * 2
+                raise ValueError(f"{input_mode} actor input_mode requires latent_size")
+            if input_mode == 'split_latent' and goal_latent_size is None:
+                raise ValueError(
+                    'split_latent actor input_mode requires goal_latent_size'
+                )
+            if goal_latent_size is None:
+                goal_latent_size = latent_size
+            backbone_input_size = latent_size + goal_latent_size
         else:
             raise ValueError(f"Unknown actor input_mode: {input_mode!r}")
         self.backbone = MLP(backbone_input_size, self.action_output.input_size, hidden_sizes=arch,

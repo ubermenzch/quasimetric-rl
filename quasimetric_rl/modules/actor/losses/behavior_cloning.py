@@ -34,7 +34,7 @@ class BCLoss(ActorLossBase):
         if self.weight == 0:
             return LossResult(loss=0, info={})
         info = {}
-        if actor.input_mode == 'latent':
+        if actor.input_mode in ('latent', 'split_latent'):
             critic_batch_infos = list(critic_batch_infos)
             critic_idx = torch.randint(
                 len(critic_batch_infos),
@@ -43,10 +43,11 @@ class BCLoss(ActorLossBase):
             ).item()
             critic = critic_batch_infos[critic_idx].critic
             with torch.no_grad():
-                obs, goal = critic.encoder(torch.stack([
-                    data.observations,
-                    data.future_observations,
-                ], dim=0)).unbind(0)
+                obs = critic.encoder(data.observations)
+                if actor.input_mode == 'split_latent':
+                    goal = critic.encoder.encode_goal_part(data.future_observations)
+                else:
+                    goal = critic.encoder(data.future_observations)
             info['latent_input_critic_idx'] = torch.as_tensor(critic_idx, device=data.observations.device)
         else:
             obs = data.observations

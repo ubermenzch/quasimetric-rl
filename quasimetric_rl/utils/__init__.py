@@ -51,9 +51,6 @@ def rm_if_exists(filename, maybe_dir=False) -> bool:
     return False
 
 
-T = TypeVar('T')
-
-
 class lazy_property(Generic[T]):
     r"""
     Used as a decorator for lazy loading of class attributes. This uses a
@@ -88,12 +85,25 @@ def split_seed(seed: Union[np.random.SeedSequence, int, None], n) -> List[np.ran
 
 
 from . import logging
-from .checkpointing import atomic_torch_save, load_rng_state, prune_checkpoints, rng_state_dict
+from .checkpointing import (
+    RESUME_CHECKPOINT_FILENAME,
+    agent_checkpoint_filename,
+    agent_checkpoint_step,
+    atomic_torch_save,
+    full_checkpoint_key,
+    load_rng_state,
+    prune_checkpoints,
+    rng_state_dict,
+    validate_training_cursor,
+)
 from .timing import TimingConf, TimingProfiler
 
 
 __all__ = [
     'mkdir', 'tqdm', 'rm_if_exists', 'lazy_property', 'logging', 'split_seed',
-    'atomic_torch_save', 'load_rng_state', 'prune_checkpoints', 'rng_state_dict',
+    'RESUME_CHECKPOINT_FILENAME', 'agent_checkpoint_filename',
+    'agent_checkpoint_step', 'atomic_torch_save', 'load_rng_state',
+    'full_checkpoint_key', 'prune_checkpoints', 'rng_state_dict',
+    'validate_training_cursor',
     'TimingConf', 'TimingProfiler',
 ]

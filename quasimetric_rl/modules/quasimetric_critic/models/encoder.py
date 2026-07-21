@@ -12,6 +12,7 @@ from ....data.env_spec.input_encoding import InputEncoding
 
 
 ENCODER_KINDS = ('standard', 'split')
+SPLIT_BRANCH_NORMALIZATIONS = ('none', 'rmsnorm')
 
 
 class Encoder(nn.Module):
@@ -44,6 +45,10 @@ class Encoder(nn.Module):
         non_goal_arch: Tuple[int, ...] = (384, 384)
         goal_latent_size: int = attrs.field(default=64, validator=attrs.validators.gt(0))
         non_goal_latent_size: int = attrs.field(default=64, validator=attrs.validators.gt(0))
+        branch_normalization: str = attrs.field(
+            default='none',
+            validator=attrs.validators.in_(SPLIT_BRANCH_NORMALIZATIONS),
+        )
 
         def make(self, *, env_spec: EnvSpec) -> Union['Encoder', 'SplitEncoder']:
             if self.kind == 'split':
@@ -62,6 +67,11 @@ class Encoder(nn.Module):
                     non_goal_arch=self.non_goal_arch,
                     goal_latent_size=self.goal_latent_size,
                     non_goal_latent_size=self.non_goal_latent_size,
+                    branch_normalization=self.branch_normalization,
+                )
+            if self.branch_normalization != 'none':
+                raise ValueError(
+                    'encoder.branch_normalization is only valid for encoder.kind=split'
                 )
             return Encoder(
                 env_spec=env_spec,
@@ -108,11 +118,14 @@ class SplitEncoder(nn.Module):
     non_goal_latent_size: int
     goal_encoder: MLP
     non_goal_encoder: MLP
+    goal_normalization: nn.Module
+    non_goal_normalization: nn.Module
 
     def __init__(
             self, *, env_spec: EnvSpec, goal_dims: Tuple[int, ...],
             goal_arch: Tuple[int, ...], non_goal_arch: Tuple[int, ...],
-            goal_latent_size: int, non_goal_latent_size: int):
+            goal_latent_size: int, non_goal_latent_size: int,
+            branch_normalization: str = 'none'):
         super().__init__()
         if len(env_spec.observation_shape) != 1:
             raise RuntimeError('SplitEncoder currently supports vector observations only')
@@ -128,6 +141,10 @@ class SplitEncoder(nn.Module):
         non_goal_dims = tuple(dim for dim in range(observation_size) if dim not in goal_dim_set)
         if not non_goal_dims:
             raise ValueError('SplitEncoder requires at least one non-goal dimension')
+        if branch_normalization not in SPLIT_BRANCH_NORMALIZATIONS:
+            raise ValueError(
+                f'Unknown split branch normalization: {branch_normalization!r}'
+            )
 
         self.input_shape = env_spec.observation_shape
         self.goal_dims = goal_dims
@@ -135,18 +152,49 @@ class SplitEncoder(nn.Module):
         self.goal_latent_size = goal_latent_size
         self.non_goal_latent_size = non_goal_latent_size
         self.latent_size = goal_latent_size + non_goal_latent_size
+        self.branch_normalization = branch_normalization
         self.goal_encoder = MLP(
             len(goal_dims), goal_latent_size, hidden_sizes=goal_arch
         )
         self.non_goal_encoder = MLP(
             len(non_goal_dims), non_goal_latent_size, hidden_sizes=non_goal_arch
         )
+        if branch_normalization == 'rmsnorm':
+            self.goal_normalization = nn.RMSNorm(
+                goal_latent_size, elementwise_affine=False
+            )
+            self.non_goal_normalization = nn.RMSNorm(
+                non_goal_latent_size, elementwise_affine=False
+            )
+        else:
+            self.goal_normalization = nn.Identity()
+            self.non_goal_normalization = nn.Identity()
+
+    def normalize_goal_part(self, latent: LatentTensor) -> LatentTensor:
+        if latent.shape[-1] != self.goal_latent_size:
+            raise ValueError(
+                f'Expected goal latent size {self.goal_latent_size}, '
+                f'got {latent.shape[-1]}'
+            )
+        return self.goal_normalization(latent)
+
+    def normalize_non_goal_part(self, latent: LatentTensor) -> LatentTensor:
+        if latent.shape[-1] != self.non_goal_latent_size:
+            raise ValueError(
+                f'Expected non-goal latent size {self.non_goal_latent_size}, '
+                f'got {latent.shape[-1]}'
+            )
+        return self.non_goal_normalization(latent)
 
     def encode_goal_part(self, observation: torch.Tensor) -> LatentTensor:
-        return self.goal_encoder(observation[..., list(self.goal_dims)])
+        return self.normalize_goal_part(
+            self.goal_encoder(observation[..., list(self.goal_dims)])
+        )
 
     def encode_non_goal_part(self, observation: torch.Tensor) -> LatentTensor:
-        return self.non_goal_encoder(observation[..., list(self.non_goal_dims)])
+        return self.normalize_non_goal_part(
+            self.non_goal_encoder(observation[..., list(self.non_goal_dims)])
+        )
 
     def join_parts(
             self, goal_latent: torch.Tensor,
@@ -199,8 +247,12 @@ class SplitEncoder(nn.Module):
             f'input_shape={self.input_shape}, latent_size={self.latent_size}, '
             f'goal_dims={self.goal_dims}, non_goal_dims={self.non_goal_dims}, '
             f'goal_latent_size={self.goal_latent_size}, '
-            f'non_goal_latent_size={self.non_goal_latent_size}'
+            f'non_goal_latent_size={self.non_goal_latent_size}, '
+            f'branch_normalization={self.branch_normalization!r}'
         )
 
 
-__all__ = ['Encoder', 'SplitEncoder', 'ENCODER_KINDS']
+__all__ = [
+    'Encoder', 'SplitEncoder', 'ENCODER_KINDS',
+    'SPLIT_BRANCH_NORMALIZATIONS',
+]

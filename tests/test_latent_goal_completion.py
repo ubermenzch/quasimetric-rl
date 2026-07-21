@@ -6,6 +6,7 @@ import torch
 
 from quasimetric_rl.data.env_spec.act_distn import BoxOutputLinearNormalization
 from quasimetric_rl.modules import QRLConf
+from quasimetric_rl.modules.actor import Actor
 from quasimetric_rl.modules.actor.losses.min_dist import MinDistLoss
 from quasimetric_rl.modules.quasimetric_critic.models.encoder import SplitEncoder
 from tests.test_goal_set_distance import batch_data, vector_env_spec
@@ -16,16 +17,27 @@ class SquaredDistance(torch.nn.Module):
         return (left - right).square().sum(dim=-1)
 
 
+class RecordingSquaredDistance(SquaredDistance):
+    def __init__(self):
+        super().__init__()
+        self.right_inputs = []
+
+    def forward(self, left, right):
+        self.right_inputs.append(right.detach().clone())
+        return super().forward(left, right)
+
+
 def split_agent_conf(mode='none'):
     conf = copy.deepcopy(QRLConf())
     conf.num_critics = 1
-    conf.actor.model.input_mode = 'latent'
+    conf.actor.model.input_mode = 'split_latent'
     conf.actor.model.arch = (8,)
     conf.actor.losses.min_dist.adaptive_entropy_regularizer = False
     conf.actor.losses.min_dist.add_goal_as_future_state = False
     conf.actor.losses.min_dist.latent_goal_mode = mode
     conf.actor.losses.min_dist.latent_goal_steps = 8
     conf.actor.losses.min_dist.latent_goal_lr = 0.01
+    conf.actor.losses.min_dist.latent_goal_keep_best = mode in ('min', 'max')
     encoder = conf.quasimetric_critic.model.encoder
     encoder.kind = 'split'
     encoder.latent_size = 4
@@ -34,6 +46,7 @@ def split_agent_conf(mode='none'):
     encoder.non_goal_arch = (8,)
     encoder.goal_latent_size = 2
     encoder.non_goal_latent_size = 2
+    encoder.branch_normalization = 'rmsnorm'
     conf.quasimetric_critic.model.quasimetric_model.projector_arch = (8,)
     conf.quasimetric_critic.model.quasimetric_model.quasimetric_head_spec = 'l2(dim=4)'
     conf.quasimetric_critic.model.latent_dynamics.arch = (8,)
@@ -53,12 +66,14 @@ def latent_variant_conf(encoder_kind, mode):
     encoder_conf = conf.quasimetric_critic.model.encoder
     encoder_conf.kind = encoder_kind
     if encoder_kind == 'standard':
+        conf.actor.model.input_mode = 'latent'
         encoder_conf.arch = (8,)
+        encoder_conf.branch_normalization = 'none'
     return conf
 
 
 class SplitEncoderTest(unittest.TestCase):
-    def make_encoder(self):
+    def make_encoder(self, branch_normalization='none'):
         return SplitEncoder(
             env_spec=vector_env_spec(),
             goal_dims=(0, 1),
@@ -66,6 +81,7 @@ class SplitEncoderTest(unittest.TestCase):
             non_goal_arch=(8,),
             goal_latent_size=2,
             non_goal_latent_size=2,
+            branch_normalization=branch_normalization,
         )
 
     def test_branches_only_observe_their_own_coordinates(self):
@@ -101,6 +117,28 @@ class SplitEncoderTest(unittest.TestCase):
         torch.testing.assert_close(goal_part, encoder.encode_goal_part(goal))
         torch.testing.assert_close(non_goal_part, torch.zeros_like(non_goal_part))
         self.assertEqual(tuple(encoded.shape), (1, 4))
+
+    def test_rmsnorm_normalizes_each_branch_without_affine_parameters(self):
+        encoder = self.make_encoder('rmsnorm')
+        observations = torch.tensor([
+            [1.0, 2.0, 3.0, 4.0],
+            [-2.0, 0.5, 8.0, -1.0],
+        ])
+        goal_latent, non_goal_latent = encoder.split_latent(
+            encoder(observations)
+        )
+
+        for latent in (goal_latent, non_goal_latent):
+            rms = latent.square().mean(dim=-1).sqrt()
+            torch.testing.assert_close(
+                rms, torch.ones_like(rms), rtol=1e-5, atol=1e-5
+            )
+        self.assertEqual(
+            list(encoder.goal_normalization.named_parameters()), []
+        )
+        self.assertEqual(
+            list(encoder.non_goal_normalization.named_parameters()), []
+        )
 
 
 class LatentGoalAdamTest(unittest.TestCase):
@@ -157,8 +195,351 @@ class LatentGoalAdamTest(unittest.TestCase):
             atol=0,
         )
 
+    def test_inner_adam_starts_from_supplied_non_goal_latent(self):
+        loss, critic = self.make_loss_and_critic('min')
+        loss.latent_goal_steps = 1
+        predicted = torch.tensor([[0.5, -0.25, 2.0, -3.0]])
+        sampled_goal = torch.tensor([[0.5, -0.25, 1.0, -2.0]])
+
+        completed, diagnostics = loss._optimize_latent_goal(
+            critic, predicted, sampled_goal
+        )
+
+        torch.testing.assert_close(
+            completed[..., 2:],
+            torch.tensor([[1.01, -2.01]]),
+            rtol=0,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            diagnostics['latent_goal_initial_norm'],
+            torch.sqrt(torch.tensor(5.0)),
+        )
+
+    def test_rmsnorm_is_applied_to_every_inner_candidate(self):
+        encoder = SplitEncoder(
+            env_spec=vector_env_spec(),
+            goal_dims=(0, 1),
+            goal_arch=(),
+            non_goal_arch=(),
+            goal_latent_size=2,
+            non_goal_latent_size=2,
+            branch_normalization='rmsnorm',
+        )
+        distance = RecordingSquaredDistance()
+        critic = types.SimpleNamespace(
+            encoder=encoder,
+            quasimetric_model=distance,
+        )
+        loss = MinDistLoss(
+            env_spec=vector_env_spec(),
+            adaptive_entropy_regularizer=False,
+            add_goal_as_future_state=False,
+            latent_goal_mode='max',
+            latent_goal_steps=8,
+            latent_goal_lr=0.01,
+            latent_goal_keep_best=True,
+        )
+        sampled_goal = encoder(torch.tensor([[0.5, -0.25, 1.0, -2.0]]))
+        predicted = torch.tensor([[0.5, -0.25, 2.0, -3.0]])
+
+        completed, _diagnostics = loss._optimize_latent_goal(
+            critic, predicted, sampled_goal
+        )
+
+        self.assertEqual(len(distance.right_inputs), 10)
+        for candidate in distance.right_inputs:
+            _goal, non_goal = encoder.split_latent(candidate)
+            torch.testing.assert_close(
+                non_goal.square().mean(dim=-1).sqrt(),
+                torch.ones(1),
+                rtol=1e-5,
+                atol=1e-5,
+            )
+        _goal, final_non_goal = encoder.split_latent(completed)
+        torch.testing.assert_close(
+            final_non_goal.square().mean(dim=-1).sqrt(),
+            torch.ones(1),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_bounded_residual_projects_every_inner_candidate(self):
+        encoder = SplitEncoder(
+            env_spec=vector_env_spec(),
+            goal_dims=(0, 1),
+            goal_arch=(),
+            non_goal_arch=(),
+            goal_latent_size=2,
+            non_goal_latent_size=2,
+        )
+        distance = RecordingSquaredDistance()
+        critic = types.SimpleNamespace(
+            encoder=encoder,
+            quasimetric_model=distance,
+        )
+        radius = 0.25
+        loss = MinDistLoss(
+            env_spec=vector_env_spec(),
+            adaptive_entropy_regularizer=False,
+            add_goal_as_future_state=False,
+            latent_goal_mode='max',
+            latent_goal_steps=8,
+            latent_goal_lr=10.0,
+            latent_goal_keep_best=True,
+            latent_goal_search='bounded_residual',
+            latent_goal_residual_radius=radius,
+        )
+        sampled_goal = torch.tensor([
+            [0.5, -0.25, -3.0, -1.0],
+            [0.5, -0.25, -1.0, 2.0],
+            [0.5, -0.25, 2.0, 4.0],
+            [0.5, -0.25, 6.0, 8.0],
+        ])
+        predicted = torch.zeros_like(sampled_goal)
+        _goal, initial_non_goal = encoder.split_latent(sampled_goal)
+        residual_scale = initial_non_goal.std(dim=0, unbiased=False)
+
+        completed, diagnostics = loss._optimize_latent_goal(
+            critic, predicted, sampled_goal
+        )
+
+        self.assertEqual(len(distance.right_inputs), 10)
+        for candidate in [*distance.right_inputs, completed]:
+            _goal, candidate_non_goal = encoder.split_latent(candidate)
+            standardized_residual = (
+                candidate_non_goal - initial_non_goal
+            ) / residual_scale
+            residual_rms = standardized_residual.square().mean(dim=-1).sqrt()
+            self.assertLessEqual(residual_rms.max().item(), radius + 1e-6)
+        torch.testing.assert_close(
+            diagnostics['latent_goal_residual_scale_mean'],
+            residual_scale.mean(),
+        )
+        self.assertLessEqual(
+            diagnostics['latent_goal_last_residual_rms_max'].item(),
+            radius + 1e-6,
+        )
+        self.assertLessEqual(
+            diagnostics['latent_goal_final_residual_rms_max'].item(),
+            radius + 1e-6,
+        )
+        self.assertGreaterEqual(
+            diagnostics['latent_goal_final_inner_dist'].item() + 1e-6,
+            diagnostics['latent_goal_initial_dist'].item(),
+        )
+
+    def test_bounded_residual_requires_latent_goal_optimization(self):
+        with self.assertRaisesRegex(
+                ValueError, 'requires latent_goal_mode=min or max'):
+            MinDistLoss(
+                env_spec=vector_env_spec(),
+                adaptive_entropy_regularizer=False,
+                add_goal_as_future_state=False,
+                latent_goal_search='bounded_residual',
+            )
+
 
 class LatentGoalIntegrationTest(unittest.TestCase):
+    def test_split_actor_requires_explicit_goal_latent_width(self):
+        with self.assertRaisesRegex(ValueError, 'requires goal_latent_size'):
+            Actor.Conf(input_mode='split_latent').make(
+                env_spec=vector_env_spec(),
+                latent_size=4,
+            )
+
+    def test_split_actor_receives_full_state_and_goal_branch_only(self):
+        agent, _ = split_agent_conf().make(
+            env_spec=vector_env_spec(), total_optim_steps=10
+        )
+        self.assertEqual(agent.actor.backbone.input_size, 6)
+
+        data = batch_data()
+        obs = data.observations
+        goal = data.next_observations
+        captured_inputs = []
+        handle = agent.actor.backbone.register_forward_pre_hook(
+            lambda _module, args: captured_inputs.append(args[0].detach().clone())
+        )
+        try:
+            agent.act(obs, goal)
+        finally:
+            handle.remove()
+
+        critic = agent.critics[0]
+        expected = torch.cat([
+            critic.encoder(obs),
+            critic.encoder.encode_goal_part(goal),
+        ], dim=-1)
+        torch.testing.assert_close(captured_inputs[-1], expected)
+
+    def test_split_actor_ignores_goal_non_goal_coordinates(self):
+        agent, _ = split_agent_conf().make(
+            env_spec=vector_env_spec(), total_optim_steps=10
+        )
+        obs = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+        goal_a = torch.tensor([[0.8, 0.9, 1.0, 2.0]])
+        goal_b = torch.tensor([[0.8, 0.9, -7.0, 11.0]])
+
+        captured_inputs = []
+        handle = agent.actor.backbone.register_forward_pre_hook(
+            lambda _module, args: captured_inputs.append(args[0].detach().clone())
+        )
+        try:
+            agent.act(obs, goal_a)
+            agent.act(obs, goal_b)
+        finally:
+            handle.remove()
+        torch.testing.assert_close(captured_inputs[0], captured_inputs[1], rtol=0, atol=0)
+
+    def test_split_behavior_cloning_uses_goal_branch_only(self):
+        conf = split_agent_conf()
+        conf.actor.losses.behavior_cloning.weight = 1
+        agent, losses = conf.make(
+            env_spec=vector_env_spec(), total_optim_steps=10
+        )
+        data = batch_data()
+        critic_infos = losses._make_critic_batch_infos(agent, data)
+
+        captured_inputs = []
+        handle = agent.actor.backbone.register_forward_pre_hook(
+            lambda _module, args: captured_inputs.append(args[0].detach().clone())
+        )
+        try:
+            result = losses.actor_loss.behavior_cloning(
+                agent.actor, critic_infos, data
+            )
+        finally:
+            handle.remove()
+
+        critic = agent.critics[0]
+        expected = torch.cat([
+            critic.encoder(data.observations),
+            critic.encoder.encode_goal_part(data.future_observations),
+        ], dim=-1)
+        self.assertTrue(torch.isfinite(result.loss))
+        torch.testing.assert_close(captured_inputs[-1], expected)
+
+    def test_split_minmax_starts_from_sampled_goal_non_goal_latent(self):
+        for mode in ('min', 'max'):
+            with self.subTest(mode=mode):
+                agent, losses = split_agent_conf(mode).make(
+                    env_spec=vector_env_spec(), total_optim_steps=10
+                )
+                data = batch_data()
+                captured_inputs = []
+                handle = agent.actor.backbone.register_forward_pre_hook(
+                    lambda _module, args: captured_inputs.append(
+                        args[0].detach().clone()
+                    )
+                )
+                try:
+                    result = losses(
+                        agent, data, optimize=False, phase='actor'
+                    )
+                finally:
+                    handle.remove()
+
+                critic = agent.critics[0]
+                sampled_goal = torch.roll(data.next_observations, 1, dims=0)
+                expected_actor_input = torch.cat([
+                    critic.encoder(data.observations),
+                    critic.encoder.encode_goal_part(sampled_goal),
+                ], dim=-1)
+                initial_non_goal = critic.encoder.encode_non_goal_part(
+                    sampled_goal
+                )
+                expected_norm = torch.linalg.vector_norm(
+                    initial_non_goal, dim=-1
+                ).mean()
+                torch.testing.assert_close(
+                    captured_inputs[-1], expected_actor_input
+                )
+                torch.testing.assert_close(
+                    result.info['actor']['min_dist'][
+                        'latent_goal_initial_norm_00'
+                    ],
+                    expected_norm,
+                )
+                info = result.info['actor']['min_dist']
+                if mode == 'min':
+                    self.assertLessEqual(
+                        info['latent_goal_final_inner_dist_00'].item(),
+                        info['latent_goal_initial_dist_00'].item() + 1e-6,
+                    )
+                    self.assertLessEqual(
+                        info['latent_goal_final_inner_dist_00'].item(),
+                        info['latent_goal_last_inner_dist_00'].item() + 1e-6,
+                    )
+                else:
+                    self.assertGreaterEqual(
+                        info['latent_goal_final_inner_dist_00'].item() + 1e-6,
+                        info['latent_goal_initial_dist_00'].item(),
+                    )
+                    self.assertGreaterEqual(
+                        info['latent_goal_final_inner_dist_00'].item() + 1e-6,
+                        info['latent_goal_last_inner_dist_00'].item(),
+                    )
+                self.assertGreaterEqual(
+                    info['latent_goal_best_step_00'].item(), 0
+                )
+                self.assertLessEqual(
+                    info['latent_goal_best_step_max_00'].item(), 8
+                )
+
+    def test_bounded_residual_runs_end_to_end(self):
+        conf = split_agent_conf('max')
+        min_dist = conf.actor.losses.min_dist
+        min_dist.latent_goal_search = 'bounded_residual'
+        min_dist.latent_goal_residual_radius = 0.5
+        min_dist.latent_goal_lr = 0.1
+        conf.quasimetric_critic.model.encoder.branch_normalization = 'none'
+        agent, losses = conf.make(
+            env_spec=vector_env_spec(), total_optim_steps=10
+        )
+
+        result = losses(
+            agent, batch_data(), optimize=False, phase='actor'
+        )
+        info = result.info['actor']['min_dist']
+
+        self.assertTrue(torch.isfinite(result.loss))
+        self.assertLessEqual(
+            info['latent_goal_last_residual_rms_max_00'].item(), 0.5 + 1e-6
+        )
+        self.assertLessEqual(
+            info['latent_goal_final_residual_rms_max_00'].item(), 0.5 + 1e-6
+        )
+        self.assertGreaterEqual(
+            info['latent_goal_final_inner_dist_00'].item() + 1e-6,
+            info['latent_goal_initial_dist_00'].item(),
+        )
+
+    def test_legacy_latent_minmax_keeps_zero_initialization(self):
+        conf = split_agent_conf('min')
+        conf.actor.model.input_mode = 'latent'
+        conf.actor.losses.min_dist.latent_goal_keep_best = False
+        conf.quasimetric_critic.model.encoder.branch_normalization = 'none'
+        agent, losses = conf.make(
+            env_spec=vector_env_spec(), total_optim_steps=10
+        )
+        result = losses(
+            agent, batch_data(), optimize=False, phase='actor'
+        )
+
+        self.assertEqual(
+            result.info['actor']['min_dist'][
+                'latent_goal_initial_norm_00'
+            ].item(),
+            0,
+        )
+
+    def test_legacy_latent_actor_keeps_full_goal_width(self):
+        conf = split_agent_conf()
+        conf.actor.model.input_mode = 'latent'
+        agent, _ = conf.make(env_spec=vector_env_spec(), total_optim_steps=10)
+        self.assertEqual(agent.actor.backbone.input_size, 8)
+
     def test_all_latent_actor_variants_use_immutable_action_bounds(self):
         data = batch_data()
         goal = torch.roll(data.next_observations, 1, dims=0)

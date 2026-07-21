@@ -7,6 +7,7 @@ import torch
 
 from . import actor, quasimetric_critic
 from . import goal_set_distance as goal_set_distance_module
+from .quasimetric_critic.models.encoder import SplitEncoder
 
 from ..data import EnvSpec, BatchData
 from .utils import LossResult, Module, InfoT
@@ -38,12 +39,17 @@ class QRLAgent(Module):
             goal = padded_goal
         if self.actor.input_mode == 'raw':
             return self.actor(obs, goal)
-        if self.actor.input_mode != 'latent':
+        if self.actor.input_mode not in ('latent', 'split_latent'):
             raise ValueError(f"Unknown actor input_mode: {self.actor.input_mode!r}")
         critic = self.critics[0]
         with torch.no_grad():
             z_obs = critic.encoder(obs)
-            z_goal = critic.encoder.encode_actor_goal(goal)
+            if self.actor.input_mode == 'split_latent':
+                if not isinstance(critic.encoder, SplitEncoder):
+                    raise RuntimeError('split_latent actor input requires SplitEncoder')
+                z_goal = critic.encoder.encode_goal_part(goal)
+            else:
+                z_goal = critic.encoder.encode_actor_goal(goal)
         return self.actor(z_obs, z_goal)
 
 
@@ -251,19 +257,22 @@ class QRLConf:
             if self.actor is None
             else self.actor.losses.min_dist.latent_goal_mode
         )
-        if self.actor is not None and self.actor.model.input_mode == 'latent' and self.num_critics != 1:
+        actor_input_mode = None if self.actor is None else self.actor.model.input_mode
+        if actor_input_mode in ('latent', 'split_latent') and self.num_critics != 1:
             raise ValueError(
-                'agent.actor.model.input_mode=latent requires agent.num_critics=1; '
+                f'agent.actor.model.input_mode={actor_input_mode} requires agent.num_critics=1; '
                 'the latent actor must use a single, stable critic encoder.'
             )
+        if actor_input_mode == 'split_latent' and encoder_conf.kind != 'split':
+            raise ValueError('agent.actor.model.input_mode=split_latent requires encoder.kind=split')
         if encoder_conf.kind == 'split' and self.goal_set_distance.enabled:
             raise ValueError('SplitEncoder cannot be combined with GoalSetDistance')
         if latent_goal_mode != 'none':
             if self.num_critics != 1:
                 raise ValueError('Latent goal optimization requires agent.num_critics=1')
-            if self.actor.model.input_mode != 'latent':
+            if self.actor.model.input_mode not in ('latent', 'split_latent'):
                 raise ValueError(
-                    'Latent goal optimization requires agent.actor.model.input_mode=latent'
+                    'Latent goal optimization requires a latent actor input mode'
                 )
             if encoder_conf.kind != 'split':
                 raise ValueError('Latent goal optimization requires encoder.kind=split')
@@ -286,10 +295,16 @@ class QRLConf:
         if self.actor is None:
             actor = actor_losses = None
         else:
+            actor_goal_latent_size = (
+                encoder_conf.goal_latent_size
+                if self.actor.model.input_mode == 'split_latent'
+                else encoder_conf.latent_size
+            )
             actor, actor_losses = self.actor.make(
                 env_spec=env_spec,
                 total_optim_steps=total_optim_steps,
-                latent_size=self.quasimetric_critic.model.encoder.latent_size,
+                latent_size=encoder_conf.latent_size,
+                goal_latent_size=actor_goal_latent_size,
             )
         critics, critic_losses = zip(*[
             self.quasimetric_critic.make(env_spec=env_spec, total_optim_steps=total_optim_steps)
