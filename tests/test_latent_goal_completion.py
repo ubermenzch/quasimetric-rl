@@ -13,8 +13,19 @@ from tests.test_goal_set_distance import batch_data, vector_env_spec
 
 
 class SquaredDistance(torch.nn.Module):
-    def forward(self, left, right):
+    def __init__(self):
+        super().__init__()
+        self.project_calls = 0
+
+    def project(self, latent):
+        self.project_calls += 1
+        return latent
+
+    def forward_projected(self, left, right):
         return (left - right).square().sum(dim=-1)
+
+    def forward(self, left, right):
+        return self.forward_projected(self.project(left), self.project(right))
 
 
 class RecordingSquaredDistance(SquaredDistance):
@@ -22,9 +33,9 @@ class RecordingSquaredDistance(SquaredDistance):
         super().__init__()
         self.right_inputs = []
 
-    def forward(self, left, right):
+    def forward_projected(self, left, right):
         self.right_inputs.append(right.detach().clone())
-        return super().forward(left, right)
+        return super().forward_projected(left, right)
 
 
 def split_agent_conf(mode='none'):
@@ -193,6 +204,18 @@ class LatentGoalAdamTest(unittest.TestCase):
             single.expand_as(repeated),
             rtol=0,
             atol=0,
+        )
+
+    def test_frozen_prediction_is_projected_once_per_inner_loop(self):
+        loss, critic = self.make_loss_and_critic('min')
+        predicted = torch.tensor([[0.5, -0.25, 2.0, -3.0]])
+        sampled_goal = torch.tensor([[0.5, -0.25, 1.0, -2.0]])
+
+        loss._optimize_latent_goal(critic, predicted, sampled_goal)
+
+        # One prediction, plus initial, each inner step, and final goal.
+        self.assertEqual(
+            critic.quasimetric_model.project_calls, loss.latent_goal_steps + 3
         )
 
     def test_inner_adam_starts_from_supplied_non_goal_latent(self):

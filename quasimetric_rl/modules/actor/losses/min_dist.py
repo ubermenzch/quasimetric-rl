@@ -288,10 +288,15 @@ class MinDistLoss(ActorLossBase):
         frozen_prediction = predicted_latent.detach()
 
         with torch.no_grad():
+            projected_prediction = critic.quasimetric_model.project(
+                frozen_prediction
+            )
             initial_h = candidate_h(search_variable.detach())
-            initial_dist = critic.quasimetric_model(
-                frozen_prediction,
-                critic.encoder.join_parts(goal_latent, initial_h),
+            initial_dist = critic.quasimetric_model.forward_projected(
+                projected_prediction,
+                critic.quasimetric_model.project(
+                    critic.encoder.join_parts(goal_latent, initial_h)
+                ),
             )
             best_h = initial_h
             best_dist = initial_dist
@@ -306,8 +311,9 @@ class MinDistLoss(ActorLossBase):
                 completed_goal = critic.encoder.join_parts(
                     goal_latent, current_h
                 )
-                inner_dist = critic.quasimetric_model(
-                    frozen_prediction, completed_goal
+                inner_dist = critic.quasimetric_model.forward_projected(
+                    projected_prediction,
+                    critic.quasimetric_model.project(completed_goal),
                 )
                 if not torch.isfinite(inner_dist).all():
                     raise FloatingPointError(
@@ -369,9 +375,11 @@ class MinDistLoss(ActorLossBase):
                 if self.latent_goal_search == 'bounded_residual'
                 else torch.zeros_like(initial_dist)
             )
-            last_inner_dist = critic.quasimetric_model(
-                frozen_prediction,
-                critic.encoder.join_parts(goal_latent, last_h),
+            last_inner_dist = critic.quasimetric_model.forward_projected(
+                projected_prediction,
+                critic.quasimetric_model.project(
+                    critic.encoder.join_parts(goal_latent, last_h)
+                ),
             )
         if not torch.isfinite(last_inner_dist).all():
             raise FloatingPointError('Non-finite final latent goal distance')
