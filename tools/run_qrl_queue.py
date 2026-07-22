@@ -2,7 +2,7 @@
 """Queue runner for qrl-official experiments.
 
 Task TSV columns:
-    task_id    mode    env_name    seed    steps    extra_args
+    task_id    mode    env_name    seed    steps    params    extra_args
 
 The runner periodically reconciles status files with actual GPU processes, so
 stale RUNNING rows are requeued instead of being shown forever.
@@ -45,6 +45,7 @@ class Task:
     env_name: str
     seed: str
     steps: str
+    params: str = ""
     extra_args: str = ""
 
 
@@ -72,13 +73,16 @@ def normalized_task_definition(task: Task) -> dict[str, object]:
         "env_name": task.env_name,
         "seed": task.seed,
         "steps": task.steps,
+        "params": task.params,
         "extra_args": task.extra_args.split(),
     }
 
 
 def task_fingerprint(task: Task) -> str:
+    definition = normalized_task_definition(task)
+    definition.pop("params")
     payload = json.dumps(
-        normalized_task_definition(task),
+        definition,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -201,11 +205,13 @@ def read_tasks(path: Path) -> list[Task]:
         for parts in reader:
             if not parts or not "".join(parts).strip() or parts[0].lstrip().startswith("#"):
                 continue
-            parts.extend([""] * (6 - len(parts)))
-            if len(parts) != 6:
+            if len(parts) == 6:
+                tasks.append(Task(*parts[:5], extra_args=parts[5]))
+                continue
+            if len(parts) != 7:
                 print(f"[{timestamp()}] WARNING: skipping malformed row: {parts}", flush=True)
                 continue
-            tasks.append(Task(*parts))
+            tasks.append(Task(*parts[:5], params=parts[5], extra_args=parts[6]))
     return tasks
 
 
@@ -275,6 +281,7 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
         f"env_name={task.env_name}",
         f"seed={task.seed}",
         f"steps={task.steps}",
+        f"params={task.params}",
     ]
     if task.extra_args:
         lines.append(f"extra_args={task.extra_args}")
@@ -290,7 +297,7 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
 
 STATUS_MANAGED_KEYS = {
     "state", "updated_at", "task_id", "task_fingerprint", "mode",
-    "env_name", "seed", "steps", "extra_args",
+    "env_name", "seed", "steps", "params", "extra_args",
 }
 
 

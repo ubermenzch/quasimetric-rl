@@ -26,6 +26,7 @@ class Task:
     env_name: str
     seed: str
     steps: str
+    params: str = ""
     extra_args: str = ""
 
 
@@ -69,9 +70,10 @@ def read_tasks(path: Path) -> list[Task]:
         for parts in reader:
             if not parts or not "".join(parts).strip() or parts[0].lstrip().startswith("#"):
                 continue
-            parts.extend([""] * (6 - len(parts)))
             if len(parts) == 6:
-                tasks.append(Task(*parts))
+                tasks.append(Task(*parts[:5], extra_args=parts[5]))
+            elif len(parts) == 7:
+                tasks.append(Task(*parts[:5], params=parts[5], extra_args=parts[6]))
     return tasks
 
 
@@ -454,6 +456,52 @@ def extra_arg_value(extra_args: str, key: str) -> str:
     return ""
 
 
+def compact_count(value: str) -> str:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return value
+    for scale, suffix in ((1_000_000, "m"), (1_000, "k")):
+        if count >= scale and count % scale == 0:
+            return f"{count // scale}{suffix}"
+    return str(count)
+
+
+def task_critic_count(task: Task) -> str:
+    value = extra_arg_value(task.extra_args, "agent.num_critics")
+    if value:
+        return value
+    match = re.search(r"(?:^|_)(\d+)q(?:_|$)", task.task_id, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return "2"
+
+
+def task_checkpoint_interval(task: Task) -> str:
+    value = extra_arg_value(task.extra_args, "save_steps")
+    if not value:
+        value = "50000" if task.mode == "online" else "10000"
+    return compact_count(value)
+
+
+def compact_parameter_count(count: int) -> str:
+    for scale, suffix in ((1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")):
+        if count >= scale:
+            value = f"{count / scale:.1f}".rstrip("0").rstrip(".")
+            return f"{value}{suffix}"
+    return str(count)
+
+
+def task_parameter_count(task: Task) -> str:
+    value = task.params.strip().lower().replace(",", "")
+    if not value:
+        return ""
+    try:
+        return compact_parameter_count(int(value))
+    except ValueError:
+        return value
+
+
 def task_variant(task: Task) -> str:
     implementation = extra_arg_value(
         task.extra_args, "agent.goal_set_distance.losses.implementation"
@@ -480,6 +528,46 @@ def task_variant(task: Task) -> str:
         }.get(sampler, sampler)
         implementation_label = implementation.capitalize()
         return f"{implementation_label}/{aggregation_label}/{sampler_label}"
+
+    encoder_kind = extra_arg_value(
+        task.extra_args, "agent.quasimetric_critic.model.encoder.kind"
+    )
+    actor_input_mode = extra_arg_value(task.extra_args, "agent.actor.model.input_mode")
+    latent_goal_mode = extra_arg_value(
+        task.extra_args, "agent.actor.losses.min_dist.latent_goal_mode"
+    )
+    named_latent_variant = re.search(
+        r"_(SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|$)",
+        task.task_id,
+    )
+    if encoder_kind == "split":
+        if latent_goal_mode in {"max", "min"}:
+            latent_goal_steps = extra_arg_value(
+                task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
+            )
+            variant = f"SplitLatent{latent_goal_mode.capitalize()}{latent_goal_steps}"
+        elif named_latent_variant and named_latent_variant.group(1).startswith("SplitLatent"):
+            variant = named_latent_variant.group(1)
+        else:
+            variant = "SplitZero"
+        if extra_arg_value(
+            task.extra_args, "agent.actor.losses.min_dist.latent_goal_search"
+        ) == "bounded_residual":
+            radius = extra_arg_value(
+                task.extra_args, "agent.actor.losses.min_dist.latent_goal_residual_radius"
+            )
+            try:
+                radius = f"{float(radius):g}"
+            except ValueError:
+                pass
+            variant += f"/BoundedResR{radius}" if radius else "/BoundedRes"
+        return variant
+    if actor_input_mode == "latent" or (
+        named_latent_variant and named_latent_variant.group(1) == "LatentBase"
+    ):
+        return "LatentBase"
+    if named_latent_variant:
+        return named_latent_variant.group(1)
     if "CDA_Tr" in task.task_id:
         return "CDA-Tr"
     if "_GSD_" in task.task_id:
@@ -501,14 +589,66 @@ def task_variant(task: Task) -> str:
     return "base"
 
 
-def task_history_length(task: Task) -> str:
-    value = extra_arg_value(task.extra_args, "agent.quasimetric_critic.model.latent_dynamics.history_length")
-    if value:
-        return value
-    match = re.search(r"_h(\d+)_", task.task_id)
-    if match:
-        return match.group(1)
-    return "0"
+def task_environment_token_aliases(env_name: str) -> list[list[str]]:
+    aliases: list[list[str]] = []
+    hyphenated = re.split(r"[-_]", env_name.lower())
+    if hyphenated and re.fullmatch(r"v\d+", hyphenated[-1]):
+        hyphenated.pop()
+    if hyphenated:
+        aliases.append(hyphenated)
+
+    camel_words = [
+        word.lower()
+        for word in re.findall(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|\d+", env_name)
+    ]
+    if len(camel_words) >= 2:
+        aliases.append(["".join(camel_words[:2]), *camel_words[2:]])
+        aliases.append(camel_words)
+    return sorted(aliases, key=lambda parts: (len(parts), len("".join(parts))), reverse=True)
+
+
+def task_display_name(task: Task) -> str:
+    parts = task.task_id.split("_")
+    lowered = [part.lower() for part in parts]
+    for alias in task_environment_token_aliases(task.env_name):
+        alias_len = len(alias)
+        for index in range(len(parts) - alias_len + 1):
+            if lowered[index:index + alias_len] == alias:
+                del parts[index:index + alias_len]
+                del lowered[index:index + alias_len]
+                break
+        else:
+            continue
+        break
+
+    step_label = compact_count(task.steps).lower()
+    variant_tokens = {
+        "base", "latentbase", "splitzero", "gsd", "tmse", "a-latent", "alatent",
+        "sonly", "tseptr", "tsep", "tr", "cda",
+    }
+    filtered = []
+    for part in parts:
+        lower = part.lower()
+        if re.fullmatch(r"\d+q", lower):
+            continue
+        if re.fullmatch(r"bc\d+(?:\.\d+)?", lower):
+            continue
+        if lower == step_label or re.fullmatch(r"\d+(?:\.\d+)?[km]?ckpt", lower):
+            continue
+        if lower == f"s{task.seed}".lower() or lower == task.mode.lower():
+            continue
+        if re.fullmatch(r"h\d+", lower):
+            continue
+        if lower in variant_tokens:
+            continue
+        if re.fullmatch(r"splitlatent(?:max|min)\d+", lower):
+            continue
+        if re.fullmatch(r"boundedresr\d+(?:\.\d+)?", lower):
+            continue
+        if lower.startswith("direct-") or lower.startswith("learned-"):
+            continue
+        filtered.append(part)
+    return "_".join(filtered) or task.task_id
 
 
 def display_status_timestamp(value: str) -> str:
@@ -561,12 +701,15 @@ def render(config: dict[str, str]) -> None:
             state,
             status.get("gpu", "") if state == "RUNNING" else "",
             pid if state == "RUNNING" else "",
-            task.task_id,
+            task_display_name(task),
             task_variant(task),
-            task_history_length(task),
+            task_parameter_count(task),
+            task_critic_count(task),
             task.mode,
             task.env_name,
             task.seed,
+            compact_count(task.steps),
+            task_checkpoint_interval(task),
             display_status_timestamp(submitted_at),
             display_status_timestamp(gpu_started_at),
             status.get("gpu_mem_peak_mb", ""),
@@ -588,12 +731,13 @@ def render(config: dict[str, str]) -> None:
         f"queue_eta_h={queue_eta:.2f}",
     )
     headers = [
-        "#", "state", "gpu", "pid", "task", "variant", "hist", "mode", "env", "seed",
-        "submitted", "gpu_start", "peak_mb", "oom_n", "mem_cap", "%", "eta_h",
-        "elapsed_h", "progress", "succ", "err",
+        "#", "state", "gpu", "pid", "task", "variant", "params", "critics", "mode", "env",
+        "seed", "steps", "ckpt", "submitted", "gpu_start", "peak_mb", "oom_n", "mem_cap",
+        "%", "eta_h", "elapsed_h", "progress", "succ", "err",
     ]
     widths = [
-        4, 8, 4, 8, 44, 30, 4, 7, 18, 6, 14, 14, 8, 5, 8, 6, 7, 9, 17, 8, 18,
+        4, 8, 4, 8, 34, 34, 7, 7, 7, 22, 6, 6, 6, 14, 14, 8, 5, 8, 6, 7,
+        9, 17, 8, 18,
     ]
     print(" ".join(fmt(h, w) for h, w in zip(headers, widths)))
     print(" ".join("-" * w for w in widths))

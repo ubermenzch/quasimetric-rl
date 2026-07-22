@@ -430,7 +430,7 @@ initialize_queue_tasks() {
     mkdir -p "$(dirname "${QUEUE_TASKS_FILE}")"
     printf '%s\n' \
         '# Runtime queue task list. Add task rows locally before starting the scheduler.' \
-        '# Format: task_id<TAB>mode<TAB>env_name<TAB>seed<TAB>steps<TAB>extra_args' \
+        '# Format: task_id<TAB>mode<TAB>env_name<TAB>seed<TAB>steps<TAB>params<TAB>extra_args' \
         > "${QUEUE_TASKS_FILE}"
     echo "Created empty queue task list: ${QUEUE_TASKS_FILE}"
 }

@@ -146,6 +146,11 @@ preferences do not leak into the repository. The setup script creates an empty
 runtime task list at `runs/qrl_queue/tasks.tsv`; add local task rows there
 before starting the scheduler.
 
+Queue rows use seven tab-separated columns: `task_id`, `mode`, `env_name`,
+`seed`, `steps`, `params`, and `extra_args`. Record total agent parameters in
+`params` when adding the task, either as an integer or a compact value such as
+`11.6m`. Legacy six-column rows remain valid and show an empty parameter field.
+
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set
 `SCALING_CRL_ROOT` to that checkout when using the diagnostic.
