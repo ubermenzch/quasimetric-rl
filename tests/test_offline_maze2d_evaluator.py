@@ -10,9 +10,19 @@ import numpy as np
 import torch
 
 from tools.evaluate_offline_maze2d import (
+    ALL_CHECKPOINT_NUM_EPISODES,
     ProcessEnvPool,
+    expand_result_dirs_for_training_seeds,
+    find_evaluation_checkpoints,
+    format_cpu_cores,
+    make_evaluation_tasks,
+    parse_gpu_ids,
+    parse_training_seeds,
+    resolve_num_episodes,
     rollout_episodes,
     select_checkpoint,
+    split_cpu_cores,
+    validate_result_dir_training_seeds,
 )
 
 
@@ -43,6 +53,100 @@ class CheckpointSelectionTest(unittest.TestCase):
 
             with self.assertRaisesRegex(FileNotFoundError, "No evaluation checkpoint"):
                 select_checkpoint(result_dir, "latest")
+
+    def test_finds_every_archival_checkpoint_but_not_rolling_or_malformed_files(self):
+        with TemporaryDirectory() as temp_dir:
+            result_dir = Path(temp_dir)
+            expected_names = [
+                "checkpoint_00001_00002.pth",
+                "agent_checkpoint_step00010000.pth",
+                "agent_checkpoint_step00020000.pth",
+                "checkpoint_00003_00004_final.pth",
+            ]
+            ignored_names = ["checkpoint_resume_latest.pth", "checkpoint_broken.pth"]
+            for name in expected_names + ignored_names:
+                (result_dir / name).touch()
+
+            checkpoints = find_evaluation_checkpoints(result_dir)
+
+            self.assertEqual([path.name for path in checkpoints], expected_names)
+            tasks = make_evaluation_tasks([result_dir], all_checkpoints=True)
+            self.assertEqual([task.checkpoint for task in tasks], checkpoints)
+
+    def test_all_checkpoint_mode_requires_1000_episodes(self):
+        self.assertEqual(
+            resolve_num_episodes(None, all_checkpoints=True),
+            ALL_CHECKPOINT_NUM_EPISODES,
+        )
+        self.assertEqual(resolve_num_episodes(None, all_checkpoints=False), 100)
+        with self.assertRaisesRegex(ValueError, "requires --num-episodes=1000"):
+            resolve_num_episodes(999, all_checkpoints=True)
+
+
+class ParallelResourceAllocationTest(unittest.TestCase):
+    def test_parses_comma_or_space_separated_gpu_indices(self):
+        self.assertEqual(parse_gpu_ids("0,2,cuda:5"), [0, 2, 5])
+        self.assertEqual(parse_gpu_ids("1 3"), [1, 3])
+
+    def test_rejects_invalid_or_duplicate_gpu_indices(self):
+        for value in ("", "-1", "0,0", "gpu0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_gpu_ids(value)
+
+    def test_splits_cpu_cores_evenly_without_losing_affinity_ids(self):
+        self.assertEqual(
+            split_cpu_cores([2, 4, 6, 8, 10, 12, 14, 16], 3),
+            [[2, 4, 6], [8, 10, 12], [14, 16]],
+        )
+        self.assertEqual(split_cpu_cores([2, 4], 3), [[2], [4], [2]])
+
+    def test_formats_cpu_core_ranges(self):
+        self.assertEqual(format_cpu_cores([0, 1, 2, 4, 7, 8]), "0-2,4,7-8")
+
+
+class MultipleTrainingSeedsTest(unittest.TestCase):
+    def test_parses_training_seeds_and_rejects_invalid_values(self):
+        self.assertEqual(parse_training_seeds("1000, 1001 1003"), [1000, 1001, 1003])
+        for value in ("", "-1", "1000,1000", "seed1000"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_training_seeds(value)
+
+    def test_expands_placeholder_and_existing_seed_token(self):
+        self.assertEqual(
+            expand_result_dirs_for_training_seeds(
+                ["runs/maze_s1000", "runs/ant_s{seed}_final"],
+                [1001, 1003],
+            ),
+            [
+                "runs/maze_s1001",
+                "runs/maze_s1003",
+                "runs/ant_s1001_final",
+                "runs/ant_s1003_final",
+            ],
+        )
+        self.assertEqual(
+            expand_result_dirs_for_training_seeds(
+                ["runs/model_s1000_20260722"],
+                [1002],
+            ),
+            ["runs/model_s1002_20260722"],
+        )
+
+    def test_requires_a_seed_marker_in_result_directory(self):
+        with self.assertRaisesRegex(ValueError, "no .* placeholder or sNNN"):
+            expand_result_dirs_for_training_seeds(["runs/model"], [1000, 1001])
+
+    def test_validates_training_seeds_from_configs(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result_dirs = [root / "run_s1000", root / "run_s1001"]
+            for training_seed, result_dir in zip((1000, 1001), result_dirs):
+                result_dir.mkdir()
+                (result_dir / "config.yaml").write_text(f"seed: {training_seed}\n")
+
+            validate_result_dir_training_seeds(result_dirs, [1000, 1001])
+            with self.assertRaisesRegex(ValueError, "No result directory.*1002"):
+                validate_result_dir_training_seeds(result_dirs, [1000, 1001, 1002])
 
 
 class FakeMazeEnv:

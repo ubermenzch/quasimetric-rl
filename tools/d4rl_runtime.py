@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes.util
 import os
 import sys
 from pathlib import Path
 
 
 RUNTIME_REEXEC_MARKER = "_QRL_D4RL_RUNTIME_REEXEC"
+EGL_VENDOR_ENV = "__EGL_VENDOR_LIBRARY_FILENAMES"
 
 
 def default_asset_root(repo_root: Path) -> Path:
@@ -26,6 +28,33 @@ def default_user_graphics_prefix(asset_root: Path) -> Path:
             "QRL_USER_GRAPHICS_PREFIX", asset_root / "micromamba/envs/graphics"
         )
     )
+
+
+def find_nvidia_egl_vendor_file(repo_root: Path) -> Path | None:
+    vendor_dirs = (
+        Path("/usr/share/glvnd/egl_vendor.d"),
+        Path("/etc/glvnd/egl_vendor.d"),
+        Path("/usr/local/share/glvnd/egl_vendor.d"),
+    )
+    for vendor_dir in vendor_dirs:
+        vendor_files = sorted(vendor_dir.glob("*nvidia*.json"))
+        if vendor_files:
+            return vendor_files[0]
+
+    if ctypes.util.find_library("EGL_nvidia") is None:
+        return None
+    bundled_vendor_file = repo_root / "configs/nvidia_egl_vendor.json"
+    return bundled_vendor_file if bundled_vendor_file.is_file() else None
+
+
+def configure_nvidia_egl_vendor(repo_root: Path) -> Path | None:
+    existing = os.environ.get(EGL_VENDOR_ENV)
+    if existing:
+        return Path(existing.split(os.pathsep)[0])
+    vendor_file = find_nvidia_egl_vendor_file(repo_root)
+    if vendor_file is not None:
+        os.environ[EGL_VENDOR_ENV] = str(vendor_file)
+    return vendor_file
 
 
 def prepend_env_path(name: str, path: Path | str, *, require_exists: bool = False) -> None:
@@ -48,6 +77,7 @@ def configure_d4rl_runtime(
     *,
     require_library_paths: bool,
     reexec_if_library_path_changed: bool = False,
+    prefer_nvidia_egl_vendor: bool = False,
 ) -> Path:
     """Set the legacy D4RL/MuJoCo defaults and return the asset root.
 
@@ -67,6 +97,8 @@ def configure_d4rl_runtime(
     os.environ.setdefault("D4RL_DATASET_DIR", str(asset_root / "d4rl/datasets"))
     os.environ.setdefault("MUJOCO_PY_MUJOCO_PATH", str(mujoco_path))
     os.environ.setdefault("MUJOCO_PATH", str(mujoco_path))
+    if prefer_nvidia_egl_vendor:
+        configure_nvidia_egl_vendor(repo_root)
 
     prepend_env_path(
         "LD_LIBRARY_PATH",
