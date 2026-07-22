@@ -151,6 +151,36 @@ class SplitEncoderTest(unittest.TestCase):
             list(encoder.non_goal_normalization.named_parameters()), []
         )
 
+    def test_layernorm_normalizes_each_branch_without_affine_parameters(self):
+        encoder = self.make_encoder('layernorm')
+        observations = torch.tensor([
+            [1.0, 2.0, 3.0, 4.0],
+            [-2.0, 0.5, 8.0, -1.0],
+        ])
+        goal_latent, non_goal_latent = encoder.split_latent(
+            encoder(observations)
+        )
+
+        for latent in (goal_latent, non_goal_latent):
+            torch.testing.assert_close(
+                latent.mean(dim=-1),
+                torch.zeros(latent.shape[0]),
+                rtol=0,
+                atol=1e-6,
+            )
+            torch.testing.assert_close(
+                latent.square().mean(dim=-1).sqrt(),
+                torch.ones(latent.shape[0]),
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        self.assertEqual(
+            list(encoder.goal_normalization.named_parameters()), []
+        )
+        self.assertEqual(
+            list(encoder.non_goal_normalization.named_parameters()), []
+        )
+
 
 class LatentGoalAdamTest(unittest.TestCase):
     def make_loss_and_critic(self, mode):

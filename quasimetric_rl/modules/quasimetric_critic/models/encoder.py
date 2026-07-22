@@ -12,7 +12,7 @@ from ....data.env_spec.input_encoding import InputEncoding
 
 
 ENCODER_KINDS = ('standard', 'split')
-SPLIT_BRANCH_NORMALIZATIONS = ('none', 'rmsnorm')
+SPLIT_BRANCH_NORMALIZATIONS = ('none', 'rmsnorm', 'layernorm')
 
 
 class Encoder(nn.Module):
@@ -164,6 +164,13 @@ class SplitEncoder(nn.Module):
                 goal_latent_size, elementwise_affine=False
             )
             self.non_goal_normalization = nn.RMSNorm(
+                non_goal_latent_size, elementwise_affine=False
+            )
+        elif branch_normalization == 'layernorm':
+            self.goal_normalization = nn.LayerNorm(
+                goal_latent_size, elementwise_affine=False
+            )
+            self.non_goal_normalization = nn.LayerNorm(
                 non_goal_latent_size, elementwise_affine=False
             )
         else:

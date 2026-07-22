@@ -20,7 +20,10 @@ from quasimetric_rl.data import BatchData, EnvSpec
 from quasimetric_rl.modules import QRLConf
 
 
-VARIANTS = ('1q_base', '2q_base', 'split_none', 'split_max8')
+VARIANTS = (
+    '1q_base', '2q_base', 'split_none', 'split_max8',
+    'split_layernorm_max8',
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,17 +68,19 @@ def configure_agent(variant: str) -> QRLConf:
     encoder = conf.quasimetric_critic.model.encoder
     encoder.kind = 'split'
     encoder.goal_dims = (0, 1)
-    encoder.latent_size = 256
-    encoder.goal_arch = (896, 896)
-    encoder.non_goal_arch = (896, 896)
-    encoder.goal_latent_size = 128
-    encoder.non_goal_latent_size = 128
-    encoder.branch_normalization = 'rmsnorm'
-    conf.quasimetric_critic.model.quasimetric_model.projector_arch = (1024, 1024)
-    conf.quasimetric_critic.model.latent_dynamics.arch = (1024, 1024, 1024)
-    conf.actor.model.arch = (1120, 1024, 1024, 1024)
+    encoder.latent_size = 128
+    encoder.goal_arch = (369, 378)
+    encoder.non_goal_arch = (369, 379)
+    encoder.goal_latent_size = 64
+    encoder.non_goal_latent_size = 64
+    encoder.branch_normalization = (
+        'layernorm' if variant == 'split_layernorm_max8' else 'rmsnorm'
+    )
+    conf.quasimetric_critic.model.quasimetric_model.projector_arch = (512,)
+    conf.quasimetric_critic.model.latent_dynamics.arch = (512, 512)
+    conf.actor.model.arch = (506, 512)
     conf.actor.model.input_mode = 'split_latent'
-    if variant == 'split_max8':
+    if variant in ('split_max8', 'split_layernorm_max8'):
         min_dist = conf.actor.losses.min_dist
         min_dist.latent_goal_mode = 'max'
         min_dist.latent_goal_steps = 8
@@ -164,6 +169,16 @@ def main() -> None:
         gpu_name = None
 
     repo_root = Path(quasimetric_rl.__file__).resolve().parent.parent
+    agent_parameters = sum(
+        parameter.numel()
+        for parameter in agent.parameters()
+        if parameter.requires_grad
+    )
+    loss_parameters = sum(
+        parameter.numel()
+        for parameter in losses.parameters()
+        if parameter.requires_grad
+    )
     row = {
         'variant': args.variant,
         'batch_size': args.batch_size,
@@ -179,12 +194,9 @@ def main() -> None:
         'samples_per_second': args.measure_steps * args.batch_size / elapsed_s,
         'peak_allocated_mb': peak_allocated_mb,
         'peak_reserved_mb': peak_reserved_mb,
-        'trainable_parameters': sum(
-            parameter.numel()
-            for module in (agent, losses)
-            for parameter in module.parameters()
-            if parameter.requires_grad
-        ),
+        'agent_trainable_parameters': agent_parameters,
+        'loss_trainable_parameters': loss_parameters,
+        'trainable_parameters': agent_parameters + loss_parameters,
         'torch_version': torch.__version__,
         'hostname': platform.node(),
         'pid': os.getpid(),
