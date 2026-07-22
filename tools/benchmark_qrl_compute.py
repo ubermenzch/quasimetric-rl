@@ -22,7 +22,7 @@ from quasimetric_rl.modules import QRLConf
 
 VARIANTS = (
     '1q_base', '2q_base', 'split_none', 'split_max8',
-    'split_layernorm_max8',
+    'split_layernorm_max4', 'split_layernorm_min4',
 )
 
 
@@ -74,16 +74,20 @@ def configure_agent(variant: str) -> QRLConf:
     encoder.goal_latent_size = 64
     encoder.non_goal_latent_size = 64
     encoder.branch_normalization = (
-        'layernorm' if variant == 'split_layernorm_max8' else 'rmsnorm'
+        'layernorm' if variant.startswith('split_layernorm_') else 'rmsnorm'
     )
     conf.quasimetric_critic.model.quasimetric_model.projector_arch = (512,)
     conf.quasimetric_critic.model.latent_dynamics.arch = (512, 512)
     conf.actor.model.arch = (506, 512)
     conf.actor.model.input_mode = 'split_latent'
-    if variant in ('split_max8', 'split_layernorm_max8'):
+    if variant in ('split_max8', 'split_layernorm_max4', 'split_layernorm_min4'):
         min_dist = conf.actor.losses.min_dist
-        min_dist.latent_goal_mode = 'max'
-        min_dist.latent_goal_steps = 8
+        min_dist.latent_goal_mode = (
+            'min' if variant == 'split_layernorm_min4' else 'max'
+        )
+        min_dist.latent_goal_steps = (
+            4 if variant.startswith('split_layernorm_') else 8
+        )
         min_dist.latent_goal_keep_best = True
         min_dist.latent_goal_optim = 'adam'
         min_dist.latent_goal_lr = 0.01

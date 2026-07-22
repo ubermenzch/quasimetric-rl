@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare 1Q Base and SplitLatentMax8 LayerNorm training speed."""
+"""Compare 1Q Base and SplitLatentMax4 LayerNorm training speed."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from typing import Any
 
 
 BASE_VARIANT = '1q_base'
-SPLIT_VARIANT = 'split_layernorm_max8'
+SPLIT_VARIANT = 'split_layernorm_max4'
 VARIANTS = (BASE_VARIANT, SPLIT_VARIANT)
 LABELS = {
     BASE_VARIANT: '1Q Base',
-    SPLIT_VARIANT: 'SplitLatentMax8 LayerNorm',
+    SPLIT_VARIANT: 'SplitLatentMax4 LayerNorm',
 }
 
 
@@ -163,7 +163,7 @@ def print_summary(summary: dict[str, dict[str, Any]]) -> None:
     split = summary[SPLIT_VARIANT]
     comparison = summary['comparison']
     print()
-    print(f"{'metric':<24} {'1Q Base':>16} {'LayerNorm Max8':>20}")
+    print(f"{'metric':<24} {'1Q Base':>16} {'LayerNorm Max4':>20}")
     print('-' * 62)
     print(
         f"{'agent params':<24} "
@@ -183,17 +183,17 @@ def print_summary(summary: dict[str, dict[str, Any]]) -> None:
         )
     print()
     print(
-        'LayerNorm Max8 / Base time: '
+        'LayerNorm Max4 / Base time: '
         f"{comparison['time_ratio']:.3f}x "
         f"({comparison['slower_percent']:+.2f}%)"
     )
     print(
-        'LayerNorm Max8 / Base throughput: '
+        'LayerNorm Max4 / Base throughput: '
         f"{comparison['throughput_ratio']:.3f}x"
     )
     if comparison['peak_allocated_mb_delta'] is not None:
         print(
-            'LayerNorm Max8 peak allocation delta: '
+            'LayerNorm Max4 peak allocation delta: '
             f"{comparison['peak_allocated_mb_delta']:+.1f} MiB"
         )
 
