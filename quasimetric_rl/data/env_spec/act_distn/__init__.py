@@ -37,7 +37,7 @@ class TensorDistributionProtocol(Protocol):
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
         pass
 
-    def entropy(self) -> torch.Tensor:
+    def entropy(self, num_samples: Optional[int] = None) -> torch.Tensor:
         pass
 
 
@@ -157,7 +157,7 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
             *feature.shape[:-1], 2, *self.action_shape
         ).unbind(dim=-len(self.action_shape) - 1)
         mean, half_len = self._action_bounds_like(feature)
-        distn = torch.distributions.Normal(
+        pre_tanh_distn = torch.distributions.Normal(
             loc=gmean,
             scale=F.softplus(grawstd) + 1e-4,
             validate_args=FLAGS.DEBUG,
@@ -166,7 +166,7 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
         # Acme (CRL) Tanh Normal
         from .utils import AcmeTanhTransformedDistribution, SampleDist
         distn = AcmeTanhTransformedDistribution(
-            distn,
+            pre_tanh_distn,
             validate_args=FLAGS.DEBUG,
         )
         distn = torch.distributions.TransformedDistribution(
@@ -180,6 +180,10 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
             validate_args=FLAGS.DEBUG,
         )
 
-        distn = SampleDist(distn)
+        distn = SampleDist(
+            distn,
+            pre_tanh_distn=pre_tanh_distn,
+            affine_scale=half_len,
+        )
 
         return distn

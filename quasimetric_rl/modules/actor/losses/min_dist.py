@@ -39,6 +39,10 @@ class MinDistLoss(ActorLossBase):
         # config / argparse uses this to specify behavior
 
         adaptive_entropy_regularizer: bool = True
+        target_entropy: Optional[float] = None
+        entropy_mc_samples: int = attrs.field(
+            default=100, validator=attrs.validators.gt(0)
+        )
 
         # If set, in addition to use random goals, also use future state in the same trajectory as goals.
         # We enable this for online settings, following Contrastive RL.
@@ -68,6 +72,8 @@ class MinDistLoss(ActorLossBase):
             return MinDistLoss(
                 env_spec=env_spec,
                 adaptive_entropy_regularizer=self.adaptive_entropy_regularizer,
+                target_entropy=self.target_entropy,
+                entropy_mc_samples=self.entropy_mc_samples,
                 add_goal_as_future_state=self.add_goal_as_future_state,
                 latent_goal_mode=self.latent_goal_mode,
                 latent_goal_steps=self.latent_goal_steps,
@@ -83,6 +89,7 @@ class MinDistLoss(ActorLossBase):
     add_goal_as_future_state: bool
     raw_entropy_weight: Optional[nn.Parameter]  # set if using adaptive entropy regularization
     target_entropy: Optional[float] = None  # set if using adaptive entropy regularization
+    entropy_mc_samples: int
     latent_goal_mode: str
     latent_goal_steps: int
     latent_goal_optim: str
@@ -95,6 +102,8 @@ class MinDistLoss(ActorLossBase):
 
     def __init__(self, *, env_spec: EnvSpec,
                  adaptive_entropy_regularizer: bool,
+                 target_entropy: Optional[float] = None,
+                 entropy_mc_samples: int = 100,
                  add_goal_as_future_state: bool,
                  latent_goal_mode: str = 'none',
                  latent_goal_steps: int = 8,
@@ -146,12 +155,28 @@ class MinDistLoss(ActorLossBase):
         self.latent_goal_keep_best = latent_goal_keep_best
         self.latent_goal_search = latent_goal_search
         self.latent_goal_residual_radius = latent_goal_residual_radius
+        if entropy_mc_samples <= 0:
+            raise ValueError(
+                f'Expected a positive entropy sample count, got {entropy_mc_samples}'
+            )
+        self.entropy_mc_samples = entropy_mc_samples
         if adaptive_entropy_regularizer:
             self.raw_entropy_weight = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-            self.target_entropy = env_spec.get_action_entropy_reg_target()
+            self.target_entropy = (
+                env_spec.get_action_entropy_reg_target()
+                if target_entropy is None
+                else float(target_entropy)
+            )
         else:
             self.register_parameter('raw_entropy_weight', None)
             self.target_entropy = None
+
+    def adaptive_entropy_loss(
+            self, entropy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.target_entropy is None or self.raw_entropy_weight is None:
+            raise RuntimeError('Adaptive entropy regularization is disabled')
+        alpha = grad_mul(self.raw_entropy_weight.exp(), -1)
+        return alpha * (self.target_entropy - entropy), alpha
 
     def gather_obs_goal_pairs(
             self, critic_batch_infos: Collection[CriticBatchInfo], data: BatchData,
@@ -599,17 +624,23 @@ class MinDistLoss(ActorLossBase):
         loss = max_dist
         if self.target_entropy is not None:
             info['target_entropy'] = self.target_entropy
-            entropy = info['entropy'] = actor_distn.entropy().mean()
-            alpha = info['entropy_alpha'] = grad_mul(
-                self.raw_entropy_weight.exp(), -1
+            entropy = info['entropy'] = actor_distn.entropy(
+                num_samples=self.entropy_mc_samples
+            ).mean()
+            entropy_loss, alpha = self.adaptive_entropy_loss(entropy)
+            info['entropy_alpha'] = alpha
+            info['entropy_gap'] = self.target_entropy - entropy
+            info['entropy_mc_samples'] = torch.as_tensor(
+                self.entropy_mc_samples, device=entropy.device
             )
-            loss += alpha * (self.target_entropy - entropy)
+            loss += entropy_loss
         return LossResult(loss=loss, info=info)
 
     def extra_repr(self) -> str:
         return (
             f'add_goal_as_future_state={self.add_goal_as_future_state}, '
             f'target_entropy={self.target_entropy}, '
+            f'entropy_mc_samples={self.entropy_mc_samples}, '
             f'latent_goal_mode={self.latent_goal_mode}, '
             f'latent_goal_steps={self.latent_goal_steps}, '
             f'latent_goal_optim={self.latent_goal_optim}, '

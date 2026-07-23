@@ -1,4 +1,5 @@
 import unittest
+import math
 
 import gym
 import numpy as np
@@ -110,6 +111,52 @@ class ImmutableActionBoundsTest(unittest.TestCase):
         self.assertEqual(half_len.shape, torch.Size([2, 2]))
         action = converter(torch.zeros(3, converter.input_size)).rsample()
         self.assertEqual(action.shape, torch.Size([3, 2, 2]))
+
+    def test_stable_entropy_keeps_gradient_for_saturated_mean(self):
+        converter = BoxOutputLinearNormalization(
+            gym.spaces.Box(
+                low=np.array([-1.0], dtype=np.float32),
+                high=np.array([1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        )
+        target_std = torch.tensor(0.5 - 1e-4)
+        raw_std = torch.log(torch.expm1(target_std))
+        feature = torch.tensor([[10.0, raw_std.item()]], requires_grad=True)
+
+        torch.manual_seed(71)
+        entropy = converter(feature).entropy(num_samples=4096).mean()
+        self.assertTrue(torch.isfinite(entropy))
+        self.assertLess(entropy.item(), -15.0)
+
+        entropy.backward()
+        self.assertLess(feature.grad[0, 0].item(), -1.9)
+
+    def test_stable_entropy_includes_affine_action_scale(self):
+        unit_converter = BoxOutputLinearNormalization(
+            gym.spaces.Box(
+                low=np.array([-1.0], dtype=np.float32),
+                high=np.array([1.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        )
+        double_converter = BoxOutputLinearNormalization(
+            gym.spaces.Box(
+                low=np.array([-2.0], dtype=np.float32),
+                high=np.array([2.0], dtype=np.float32),
+                dtype=np.float32,
+            )
+        )
+        feature = torch.tensor([[0.3, -0.2]])
+
+        torch.manual_seed(79)
+        unit_entropy = unit_converter(feature).entropy(num_samples=2048)
+        torch.manual_seed(79)
+        double_entropy = double_converter(feature).entropy(num_samples=2048)
+        torch.testing.assert_close(
+            double_entropy - unit_entropy,
+            torch.full_like(unit_entropy, math.log(2.0)),
+        )
 
 
 if __name__ == '__main__':

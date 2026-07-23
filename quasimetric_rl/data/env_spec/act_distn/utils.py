@@ -1,15 +1,22 @@
 from typing import *
 
+import math
 import numpy as np
 
 import torch
 import torch.distributions
 import torch.distributions.constraints
+import torch.nn.functional as F
 
 
 #-----------------------------------------------------------------------------#
 #------------------------------ distributions --------------------------------#
 #-----------------------------------------------------------------------------#
+
+
+def stable_tanh_log_abs_det_jacobian(x: torch.Tensor) -> torch.Tensor:
+    r"""Compute ``log(1 - tanh(x) ** 2)`` without boundary clipping."""
+    return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
 
 
 # https://github.com/deepmind/acme/blob/5fac34092330fbe7d758adc487c4b97c9f58f777/acme/jax/networks/distributional.py#L179
@@ -49,9 +56,23 @@ class AcmeTanhTransformedDistribution(torch.distributions.TransformedDistributio
 
 # https://github.com/juliusfrost/dreamer-pytorch
 class SampleDist(torch.distributions.Distribution):
-    def __init__(self, dist: torch.distributions.Distribution, samples: int = 100):
+    def __init__(
+            self,
+            dist: torch.distributions.Distribution,
+            samples: int = 100,
+            *,
+            pre_tanh_distn: Optional[torch.distributions.Normal] = None,
+            affine_scale: Optional[torch.Tensor] = None):
+        if samples <= 0:
+            raise ValueError(f'Expected a positive sample count, got {samples}')
+        if (pre_tanh_distn is None) != (affine_scale is None):
+            raise ValueError(
+                'pre_tanh_distn and affine_scale must either both be set or both be omitted'
+            )
         self._dist = dist
         self._samples = samples
+        self._pre_tanh_distn = pre_tanh_distn
+        self._affine_scale = affine_scale
 
     @property
     def name(self):
@@ -77,10 +98,31 @@ class SampleDist(torch.distributions.Distribution):
         indices = torch.argmax(logprob, dim=0).reshape(1, batch_size, 1).expand(1, batch_size, feature_size)
         return torch.gather(sample, 0, indices).squeeze(0)
 
-    def entropy(self):
-        sample: torch.Tensor = self._dist.rsample([self._samples])
-        logprob = self._dist.log_prob(sample)
-        return -torch.mean(logprob, 0)
+    def entropy(self, num_samples: Optional[int] = None):
+        samples = self._samples if num_samples is None else num_samples
+        if samples <= 0:
+            raise ValueError(f'Expected a positive sample count, got {samples}')
+
+        if self._pre_tanh_distn is None:
+            sample: torch.Tensor = self._dist.rsample([samples])
+            logprob = self._dist.log_prob(sample)
+            return -torch.mean(logprob, 0)
+
+        # H(A) = H(X) + E[log|d tanh(X) / dX|] + log|affine_scale|.
+        # The Gaussian term is analytic; only the tanh Jacobian needs Monte
+        # Carlo estimation. Unlike log_prob(), this path deliberately avoids
+        # clipping at +/-0.999 so saturated means keep a useful entropy gradient.
+        pre_tanh_sample = self._pre_tanh_distn.rsample([samples])
+        elementwise_entropy = (
+            self._pre_tanh_distn.entropy()
+            + stable_tanh_log_abs_det_jacobian(pre_tanh_sample).mean(dim=0)
+            + self._affine_scale.abs().log()
+        )
+        event_ndims = len(self._dist.event_shape)
+        if event_ndims > 0:
+            event_dims = tuple(range(-event_ndims, 0))
+            elementwise_entropy = elementwise_entropy.sum(dim=event_dims)
+        return elementwise_entropy
 
     def sample(self):
         return self._dist.sample()
