@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime as dt
 import io
 import json
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -49,15 +51,38 @@ DEFAULT_RESULT_DIRS = (
     "online/results_queue/official_qrl_maze2d_large_s1000",
 )
 ALL_CHECKPOINT_NUM_EPISODES = 1000
+DEFAULT_SELECTION_CRITERIA = (
+    "success_rate:max,first_success_step_success_only_mean:min"
+)
+SELECTABLE_METRICS = frozenset(
+    {
+        "return_mean",
+        "normalized_score_x100_mean",
+        "success_rate",
+        "time_at_goal_mean",
+        "first_success_step_mean",
+        "first_success_step_success_only_mean",
+        "min_distance_mean",
+        "final_distance_mean",
+    }
+)
+EVALUATION_MODEL_STATE_PREFIXES = ("actor.", "critics.0.encoder.")
 TRAINING_SEED_TOKEN_RE = re.compile(
     r"(?P<prefix>(?:^|[_/\-])s)(?P<seed>\d+)(?=$|[_/\-])"
 )
+LOGGER = logging.getLogger("offline_maze2d_evaluator")
 
 
 @dataclass(frozen=True)
 class EvaluationTask:
     result_dir: Path
     checkpoint: Path | None = None
+
+
+@dataclass(frozen=True)
+class SelectionCriterion:
+    metric: str
+    direction: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Evaluate every archival checkpoint in each result directory. "
-            f"This mode always runs {ALL_CHECKPOINT_NUM_EPISODES} episodes per checkpoint."
+            f"The default is {ALL_CHECKPOINT_NUM_EPISODES} episodes per checkpoint."
         ),
     )
     parser.add_argument(
@@ -90,7 +115,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Episodes per evaluation (default: 100). In --all-checkpoints mode "
-            f"this must be {ALL_CHECKPOINT_NUM_EPISODES}."
+            f"the default is {ALL_CHECKPOINT_NUM_EPISODES}."
+        ),
+    )
+    parser.add_argument(
+        "--select-best-per-run",
+        action="store_true",
+        help=(
+            "After evaluating all checkpoints, select one checkpoint per result directory "
+            "(one scheme and training-seed run), then evaluate those checkpoints on the "
+            "next non-overlapping episode-seed range. Requires "
+            "--all-checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--selection-criteria",
+        default=DEFAULT_SELECTION_CRITERIA,
+        help=(
+            "Ordered comma-separated METRIC:DIRECTION criteria used by "
+            "--select-best-per-run, where DIRECTION is max or min. Default: "
+            f"{DEFAULT_SELECTION_CRITERIA}."
         ),
     )
     parser.add_argument(
@@ -154,7 +198,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--success-radius", type=float, default=0.5)
     parser.add_argument("--out-dir", default="analysis/offline_eval")
     parser.add_argument("--prefix", default=None)
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Detailed log path. Defaults to OUT_DIR/PREFIX.log.",
+    )
     return parser.parse_args()
+
+
+def configure_file_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        handler.close()
+    handler = logging.FileHandler(log_path, mode="w")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
 
 
 def parse_gpu_ids(value: str) -> list[int]:
@@ -195,6 +258,33 @@ def parse_training_seeds(value: str) -> list[int]:
     if not training_seeds:
         raise ValueError("--training-seeds must contain at least one seed")
     return training_seeds
+
+
+def parse_selection_criteria(value: str) -> list[SelectionCriterion]:
+    criteria: list[SelectionCriterion] = []
+    seen: set[str] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token or ":" not in token:
+            raise ValueError(
+                "--selection-criteria must contain comma-separated METRIC:max or METRIC:min entries"
+            )
+        metric, direction = (part.strip() for part in token.rsplit(":", 1))
+        if metric not in SELECTABLE_METRICS:
+            raise ValueError(
+                f"Unsupported selection metric {metric!r}; choose from {sorted(SELECTABLE_METRICS)}"
+            )
+        if direction not in ("max", "min"):
+            raise ValueError(
+                f"Invalid direction {direction!r} for {metric!r}; expected 'max' or 'min'"
+            )
+        if metric in seen:
+            raise ValueError(f"Duplicate selection metric: {metric}")
+        seen.add(metric)
+        criteria.append(SelectionCriterion(metric, direction))
+    if not criteria:
+        raise ValueError("--selection-criteria must contain at least one criterion")
+    return criteria
 
 
 def expand_result_dirs_for_training_seeds(
@@ -266,15 +356,57 @@ def format_cpu_cores(cpu_cores: list[int]) -> str:
 
 def resolve_num_episodes(requested: int | None, all_checkpoints: bool) -> int:
     if all_checkpoints:
-        if requested not in (None, ALL_CHECKPOINT_NUM_EPISODES):
-            raise ValueError(
-                f"--all-checkpoints requires --num-episodes={ALL_CHECKPOINT_NUM_EPISODES}"
-            )
-        return ALL_CHECKPOINT_NUM_EPISODES
+        return ALL_CHECKPOINT_NUM_EPISODES if requested is None else requested
     return 100 if requested is None else requested
 
 
-def find_evaluation_checkpoints(result_dir: Path) -> list[Path]:
+def checkpoint_models_are_identical(
+    left: Path,
+    right: Path,
+    state_prefixes: tuple[str, ...] = EVALUATION_MODEL_STATE_PREFIXES,
+) -> bool:
+    left_state = torch.load(left, map_location="cpu", weights_only=False)
+    right_state = torch.load(right, map_location="cpu", weights_only=False)
+    left_step = left_state.get("optim_steps")
+    right_step = right_state.get("optim_steps")
+    if left_step is None:
+        left_step = quasimetric_rl.utils.agent_checkpoint_step(left)
+    if right_step is None:
+        right_step = quasimetric_rl.utils.agent_checkpoint_step(right)
+    if left_step is None or right_step is None or int(left_step) != int(right_step):
+        return False
+
+    left_agent = left_state.get("agent")
+    right_agent = right_state.get("agent")
+    if not isinstance(left_agent, dict) or not isinstance(right_agent, dict):
+        return False
+    left_keys = {
+        key
+        for key in left_agent
+        if key.startswith(state_prefixes)
+    }
+    right_keys = {
+        key
+        for key in right_agent
+        if key.startswith(state_prefixes)
+    }
+    if not left_keys or left_keys != right_keys:
+        return False
+    return all(
+        isinstance(left_agent[key], torch.Tensor)
+        and isinstance(right_agent[key], torch.Tensor)
+        and left_agent[key].shape == right_agent[key].shape
+        and left_agent[key].dtype == right_agent[key].dtype
+        and torch.equal(left_agent[key], right_agent[key])
+        for key in left_keys
+    )
+
+
+def find_evaluation_checkpoints(
+    result_dir: Path,
+    *,
+    deduplicate_final: bool = False,
+) -> list[Path]:
     periodic_full: list[tuple[tuple[int, int, int], Path]] = []
     finals: list[tuple[tuple[int, int, int], Path]] = []
     for path in result_dir.glob("checkpoint_*.pth"):
@@ -291,9 +423,40 @@ def find_evaluation_checkpoints(result_dir: Path) -> list[Path]:
         ),
         key=lambda item: item[0],
     )
-    checkpoints = [path for _key, path in sorted(periodic_full)]
+    periodic_full = sorted(periodic_full)
+    finals = sorted(finals)
+    if deduplicate_final and finals:
+        last_final = finals[-1][1]
+        state_prefixes = evaluation_model_state_prefixes(result_dir)
+        possible_duplicates = []
+        if periodic_full:
+            possible_duplicates.append(periodic_full[-1][1])
+        if agent_checkpoints:
+            possible_duplicates.append(agent_checkpoints[-1][1])
+        duplicate_paths = {
+            checkpoint
+            for checkpoint in possible_duplicates
+            if checkpoint_models_are_identical(
+                checkpoint,
+                last_final,
+                state_prefixes,
+            )
+        }
+        for checkpoint in sorted(duplicate_paths):
+            LOGGER.info(
+                f"skipping duplicate final-step checkpoint {checkpoint}; "
+                f"keeping {last_final}"
+            )
+        periodic_full = [
+            item for item in periodic_full if item[1] not in duplicate_paths
+        ]
+        agent_checkpoints = [
+            item for item in agent_checkpoints if item[1] not in duplicate_paths
+        ]
+
+    checkpoints = [path for _key, path in periodic_full]
     checkpoints.extend(path for _step, path in agent_checkpoints)
-    checkpoints.extend(path for _key, path in sorted(finals))
+    checkpoints.extend(path for _key, path in finals)
     if not checkpoints:
         raise FileNotFoundError(f"No evaluation checkpoint found in {result_dir}")
     return checkpoints
@@ -303,13 +466,17 @@ def make_evaluation_tasks(
     result_dirs: list[Path],
     *,
     all_checkpoints: bool,
+    deduplicate_final: bool = False,
 ) -> list[EvaluationTask]:
     if not all_checkpoints:
         return [EvaluationTask(result_dir) for result_dir in result_dirs]
     return [
         EvaluationTask(result_dir, checkpoint)
         for result_dir in result_dirs
-        for checkpoint in find_evaluation_checkpoints(result_dir)
+        for checkpoint in find_evaluation_checkpoints(
+            result_dir,
+            deduplicate_final=deduplicate_final,
+        )
     ]
 
 
@@ -357,6 +524,25 @@ def load_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Expected mapping in {path}")
     return data
+
+
+def evaluation_model_state_prefixes(result_dir: Path) -> tuple[str, ...]:
+    config_path = result_dir / "config.yaml"
+    if not config_path.exists():
+        return EVALUATION_MODEL_STATE_PREFIXES
+    conf = load_yaml(config_path)
+    actor_conf = conf.get("agent", {}).get("actor")
+    if not isinstance(actor_conf, dict):
+        return ("actor.",)
+    actor_model_conf = actor_conf.get("model", {})
+    input_mode = (
+        actor_model_conf.get("input_mode", "raw")
+        if isinstance(actor_model_conf, dict)
+        else "raw"
+    )
+    if input_mode == "raw":
+        return ("actor.",)
+    return EVALUATION_MODEL_STATE_PREFIXES
 
 
 def validate_result_dir_training_seeds(
@@ -750,6 +936,66 @@ def summarize(result: dict[str, Any], episodes: list[dict[str, Any]], elapsed_s:
     return summary
 
 
+def format_selection_criteria(criteria: list[SelectionCriterion]) -> str:
+    return ",".join(f"{criterion.metric}:{criterion.direction}" for criterion in criteria)
+
+
+def selection_sort_key(
+    summary: dict[str, Any],
+    criteria: list[SelectionCriterion],
+) -> tuple[Any, ...]:
+    key: list[Any] = []
+    for criterion in criteria:
+        raw_value = summary.get(criterion.metric)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value):
+            key.extend((1, 0.0))
+        else:
+            key.extend((0, -value if criterion.direction == "max" else value))
+    key.extend((str(summary.get("run_id", "")), str(summary.get("checkpoint", ""))))
+    return tuple(key)
+
+
+def select_best_summaries_per_run(
+    summaries: list[dict[str, Any]],
+    criteria: list[SelectionCriterion],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for summary in summaries:
+        result_dir = summary.get("result_dir")
+        if not result_dir:
+            raise ValueError(f"Summary {summary.get('task_id')!r} has no result directory")
+        grouped.setdefault(str(result_dir), []).append(summary)
+
+    criteria_text = format_selection_criteria(criteria)
+    selected: list[dict[str, Any]] = []
+    for result_dir, candidates in sorted(
+        grouped.items(),
+        key=lambda item: (str(item[1][0].get("run_id", "")), item[0]),
+    ):
+        best = dict(min(candidates, key=lambda item: selection_sort_key(item, criteria)))
+        best["selection_criteria"] = criteria_text
+        best["selection_candidate_count"] = len(candidates)
+        best["selected_for_test"] = True
+        best["selection_run_id"] = best.get("run_id")
+        best["selection_result_dir"] = result_dir
+        best["selection_training_seed"] = best.get("seed")
+        selected.append(best)
+    return selected
+
+
+def evaluation_seed_range(base_seed: int, num_episodes: int, split_index: int) -> tuple[int, int]:
+    if num_episodes <= 0:
+        raise ValueError("num_episodes must be positive")
+    if split_index < 0:
+        raise ValueError("split_index must be nonnegative")
+    start = base_seed + split_index * num_episodes
+    return start, start + num_episodes - 1
+
+
 def start_episode(
     episode_idx: int,
     episode_seed: int,
@@ -810,6 +1056,7 @@ def rollout_episodes(
     device: torch.device,
     details_f: Any,
     base_result: dict[str, Any],
+    progress_callback: Callable[[int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     num_envs = min(args.num_envs, args.num_episodes)
     num_workers = min(args.num_workers, num_envs)
@@ -867,6 +1114,7 @@ def rollout_episodes(
             desc=f"eval {base_result['task_id']}",
             dynamic_ncols=True,
             position=getattr(args, "progress_position", 0),
+            disable=progress_callback is not None,
         ) as progress:
             while active:
                 slot_ids = sorted(active)
@@ -920,7 +1168,11 @@ def rollout_episodes(
                         )
                         del active[slot_id]
                         freed_slots.append(slot_id)
-                        progress.update(1)
+
+                completed_count = len(freed_slots)
+                progress.update(completed_count)
+                if progress_callback is not None and completed_count:
+                    progress_callback(completed_count)
 
                 while (
                     next_write_idx < len(episode_records)
@@ -956,6 +1208,7 @@ def evaluate_one(
     details_f,
     *,
     checkpoint_override: Path | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     checkpoint = checkpoint_override or select_checkpoint(result_dir, args.checkpoint)
     agent, dataset, conf, checkpoint_metadata = make_agent(
@@ -972,6 +1225,11 @@ def evaluate_one(
             close()
     env_name = conf["env"]["name"]
     run_id = result_dir.name
+    episode_seed_start, episode_seed_end = evaluation_seed_range(
+        args.seed,
+        args.num_episodes,
+        0,
+    )
     task_id = (
         f"{run_id}@{checkpoint.stem}"
         if getattr(args, "all_checkpoints", False)
@@ -983,6 +1241,9 @@ def evaluate_one(
         result_dir=str(result_dir),
         env_name=env_name,
         seed=conf.get("seed"),
+        evaluation_split=getattr(args, "evaluation_split", "evaluation"),
+        episode_seed_start=episode_seed_start,
+        episode_seed_end=episode_seed_end,
         checkpoint=str(checkpoint),
         checkpoint_name=checkpoint.name,
         checkpoint_optim_steps=checkpoint_metadata["optim_steps"],
@@ -1007,17 +1268,25 @@ def evaluate_one(
         device,
         details_f,
         base_result,
+        progress_callback,
     )
     return summarize(base_result, episodes, elapsed_s)
 
 
-def write_outputs(summaries: list[dict[str, Any]], details_path: Path, summary_json: Path, summary_tsv: Path) -> None:
+def write_summaries(
+    summaries: list[dict[str, Any]],
+    summary_json: Path,
+    summary_tsv: Path,
+) -> None:
     summary_json.write_text(json.dumps(summaries, indent=2, sort_keys=True) + "\n")
     fieldnames = [
         "task_id",
         "run_id",
         "env_name",
         "seed",
+        "evaluation_split",
+        "episode_seed_start",
+        "episode_seed_end",
         "checkpoint_name",
         "checkpoint_optim_steps",
         "checkpoint_epoch",
@@ -1040,15 +1309,31 @@ def write_outputs(summaries: list[dict[str, Any]], details_path: Path, summary_j
         "final_distance_mean",
         "elapsed_s",
         "checkpoint",
+        "selection_criteria",
+        "selection_candidate_count",
+        "selected_for_test",
+        "selection_run_id",
+        "selection_result_dir",
+        "selection_training_seed",
+        "selection_metrics",
     ]
     with summary_tsv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t", extrasaction="ignore")
         writer.writeheader()
         for summary in summaries:
             writer.writerow(summary)
-    print(f"wrote details: {details_path}")
-    print(f"wrote summary: {summary_json}")
-    print(f"wrote summary tsv: {summary_tsv}")
+    LOGGER.info("wrote summary: %s", summary_json)
+    LOGGER.info("wrote summary tsv: %s", summary_tsv)
+
+
+def write_outputs(
+    summaries: list[dict[str, Any]],
+    details_path: Path,
+    summary_json: Path,
+    summary_tsv: Path,
+) -> None:
+    write_summaries(summaries, summary_json, summary_tsv)
+    LOGGER.info("wrote details: %s", details_path)
 
 
 def configure_evaluation_worker(cpu_cores: list[int]) -> None:
@@ -1102,6 +1387,9 @@ def evaluation_worker_main(
                 device,
                 details,
                 checkpoint_override=evaluation_task.checkpoint,
+                progress_callback=lambda count: result_queue.put(
+                    ("progress", count)
+                ),
             )
             result_queue.put(
                 ("result", task_index, summary, details.getvalue(), worker_index)
@@ -1124,6 +1412,7 @@ def evaluate_in_parallel(
     evaluation_tasks: list[EvaluationTask],
     args: argparse.Namespace,
     gpu_ids: list[int],
+    progress_callback: Callable[[int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     worker_count = min(len(evaluation_tasks), len(gpu_ids))
     cpu_groups = split_cpu_cores(available_cpu_cores(), worker_count)
@@ -1137,12 +1426,12 @@ def evaluate_in_parallel(
     for _ in range(worker_count):
         task_queue.put(None)
 
-    print(
+    LOGGER.info(
         f"running {len(evaluation_tasks)} evaluation task(s) on "
         f"{worker_count} GPU worker(s): {gpu_ids[:worker_count]}"
     )
     for worker_index in range(worker_count):
-        print(
+        LOGGER.info(
             f"worker {worker_index}: cuda:{gpu_ids[worker_index]}, "
             f"CPUs {format_cpu_cores(cpu_groups[worker_index])}"
         )
@@ -1179,10 +1468,14 @@ def evaluate_in_parallel(
                 _, task_index, summary, details, worker_index = message
                 results[task_index] = (summary, details)
                 completed_tasks += 1
-                print(
+                LOGGER.info(
                     f"completed [{completed_tasks}/{len(evaluation_tasks)}] "
                     f"{summary['task_id']} on cuda:{gpu_ids[worker_index]}"
                 )
+            elif message_type == "progress":
+                _, completed_count = message
+                if progress_callback is not None:
+                    progress_callback(completed_count)
             elif message_type == "task_error":
                 _, task_index, result_dir, checkpoint, error = message
                 completed_tasks += 1
@@ -1220,104 +1513,52 @@ def evaluate_in_parallel(
         result_queue.close()
 
 
-def main() -> None:
-    args = parse_args()
-    args.num_episodes = resolve_num_episodes(
-        args.num_episodes,
-        args.all_checkpoints,
-    )
-    if args.num_episodes <= 0:
-        raise ValueError("--num-episodes must be positive")
-    if args.num_envs <= 0:
-        raise ValueError("--num-envs must be positive")
-    if args.num_workers < 0:
-        raise ValueError("--num-workers must be nonnegative")
-    if args.num_workers > args.num_envs:
-        raise ValueError("--num-workers cannot exceed --num-envs")
-
-    training_seeds: list[int] | None = None
-    result_dir_args = args.result_dirs
-    if args.training_seeds is not None:
-        training_seeds = parse_training_seeds(args.training_seeds)
-        result_dir_args = expand_result_dirs_for_training_seeds(
-            result_dir_args,
-            training_seeds,
-        )
-
-    result_dirs: list[Path] = []
-    for result_dir_arg in result_dir_args:
-        result_dir = Path(result_dir_arg)
-        if not result_dir.is_absolute():
-            result_dir = ROOT / result_dir
-        result_dirs.append(result_dir)
-    if training_seeds is not None:
-        validate_result_dir_training_seeds(result_dirs, training_seeds)
-        print(
-            f"resolved {len(result_dirs)} result directory/directories for "
-            f"training seeds {training_seeds}"
-        )
-    evaluation_tasks = make_evaluation_tasks(
-        result_dirs,
-        all_checkpoints=args.all_checkpoints,
-    )
-    if args.all_checkpoints:
-        print(
-            f"discovered {len(evaluation_tasks)} checkpoint(s) across "
-            f"{len(result_dirs)} result directory/directories; "
-            f"running {args.num_episodes} episodes per checkpoint"
-        )
-
-    gpu_ids: list[int] | None = None
-    if args.gpus is not None:
-        gpu_ids = parse_gpu_ids(args.gpus)
-        if not torch.cuda.is_available():
-            raise RuntimeError("--gpus requires CUDA, but torch.cuda.is_available() is false")
-        device_count = torch.cuda.device_count()
-        invalid_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id >= device_count]
-        if invalid_gpu_ids:
-            raise ValueError(
-                f"GPU indices {invalid_gpu_ids} are unavailable; visible CUDA device count is {device_count}"
-            )
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    prefix = args.prefix or f"offline_maze2d_eval_{stamp}"
-    details_path = out_dir / f"{prefix}_episodes.jsonl"
-    summary_json = out_dir / f"{prefix}_summary.json"
-    summary_tsv = out_dir / f"{prefix}_summary.tsv"
-
-    summaries: list[dict[str, Any]] = []
+def run_evaluation_tasks(
+    evaluation_tasks: list[EvaluationTask],
+    args: argparse.Namespace,
+    gpu_ids: list[int] | None,
+    details_path: Path,
+    progress_callback: Callable[[int], None] | None = None,
+) -> list[dict[str, Any]]:
     if gpu_ids is not None:
         summaries, task_details = evaluate_in_parallel(
             evaluation_tasks,
             args,
             gpu_ids,
+            progress_callback,
         )
         with details_path.open("w") as details_f:
             for details in task_details:
                 details_f.write(details)
-    else:
-        device = torch.device(args.device)
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-        with details_path.open("w") as details_f:
-            for evaluation_task in evaluation_tasks:
-                summaries.append(
-                    evaluate_one(
-                        evaluation_task.result_dir,
-                        args,
-                        device,
-                        details_f,
-                        checkpoint_override=evaluation_task.checkpoint,
-                    )
-                )
+        return summaries
 
-    write_outputs(summaries, details_path, summary_json, summary_tsv)
-    print("")
-    print("task_id\tenv\treturn_mean\tnorm_x100\tsuccess_rate\ttime_at_goal\tfirst_success")
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    summaries: list[dict[str, Any]] = []
+    with details_path.open("w") as details_f:
+        for evaluation_task in evaluation_tasks:
+            summaries.append(
+                evaluate_one(
+                    evaluation_task.result_dir,
+                    args,
+                    device,
+                    details_f,
+                    checkpoint_override=evaluation_task.checkpoint,
+                    progress_callback=progress_callback,
+                )
+            )
+    return summaries
+
+
+def print_summary_table(summaries: list[dict[str, Any]], title: str) -> None:
+    LOGGER.info("")
+    LOGGER.info(title)
+    LOGGER.info(
+        "task_id\tenv\treturn_mean\tnorm_x100\tsuccess_rate\ttime_at_goal\tfirst_success"
+    )
     for summary in summaries:
-        print(
+        LOGGER.info(
             "\t".join(
                 str(x)
                 for x in [
@@ -1337,5 +1578,255 @@ def main() -> None:
         )
 
 
+def main() -> None:
+    args = parse_args()
+    args.num_episodes = resolve_num_episodes(
+        args.num_episodes,
+        args.all_checkpoints,
+    )
+    if args.num_episodes <= 0:
+        raise ValueError("--num-episodes must be positive")
+    if args.seed < 0:
+        raise ValueError("--seed must be nonnegative")
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be nonnegative")
+    if args.num_workers > args.num_envs:
+        raise ValueError("--num-workers cannot exceed --num-envs")
+    if args.select_best_per_run and not args.all_checkpoints:
+        raise ValueError("--select-best-per-run requires --all-checkpoints")
+    selection_criteria = (
+        parse_selection_criteria(args.selection_criteria)
+        if args.select_best_per_run
+        else []
+    )
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix = args.prefix or f"offline_maze2d_eval_{stamp}"
+    log_path = (
+        Path(args.log_file)
+        if getattr(args, "log_file", None)
+        else out_dir / f"{prefix}.log"
+    )
+    configure_file_logging(log_path)
+    LOGGER.info("evaluation command: %s", " ".join(sys.argv))
+    LOGGER.info("detailed log: %s", log_path)
+
+    training_seeds: list[int] | None = None
+    result_dir_args = args.result_dirs
+    if args.training_seeds is not None:
+        training_seeds = parse_training_seeds(args.training_seeds)
+        result_dir_args = expand_result_dirs_for_training_seeds(
+            result_dir_args,
+            training_seeds,
+        )
+
+    result_dirs: list[Path] = []
+    for result_dir_arg in result_dir_args:
+        result_dir = Path(result_dir_arg)
+        if not result_dir.is_absolute():
+            result_dir = ROOT / result_dir
+        result_dirs.append(result_dir)
+    if training_seeds is not None:
+        validate_result_dir_training_seeds(result_dirs, training_seeds)
+        LOGGER.info(
+            f"resolved {len(result_dirs)} result directory/directories for "
+            f"training seeds {training_seeds}"
+        )
+    evaluation_tasks = make_evaluation_tasks(
+        result_dirs,
+        all_checkpoints=args.all_checkpoints,
+        deduplicate_final=args.select_best_per_run,
+    )
+    if args.all_checkpoints:
+        LOGGER.info(
+            f"discovered {len(evaluation_tasks)} checkpoint(s) across "
+            f"{len(result_dirs)} result directory/directories; "
+            f"running {args.num_episodes} episodes per checkpoint"
+        )
+
+    gpu_ids: list[int] | None = None
+    if args.gpus is not None:
+        gpu_ids = parse_gpu_ids(args.gpus)
+        if not torch.cuda.is_available():
+            raise RuntimeError("--gpus requires CUDA, but torch.cuda.is_available() is false")
+        device_count = torch.cuda.device_count()
+        invalid_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id >= device_count]
+        if invalid_gpu_ids:
+            raise ValueError(
+                f"GPU indices {invalid_gpu_ids} are unavailable; visible CUDA device count is {device_count}"
+            )
+
+    expected_test_tasks = (
+        len({str(task.result_dir) for task in evaluation_tasks})
+        if args.select_best_per_run
+        else 0
+    )
+    total_evaluations = len(evaluation_tasks) + expected_test_tasks
+    total_episodes = total_evaluations * args.num_episodes
+    LOGGER.info(
+        "total workload: %d evaluation(s), %d episode(s)",
+        total_evaluations,
+        total_episodes,
+    )
+    total_progress = tqdm(
+        total=total_episodes,
+        desc=(
+            "total evaluation [selection]"
+            if args.select_best_per_run
+            else "total evaluation"
+        ),
+        unit="episode",
+        dynamic_ncols=True,
+        mininterval=1.0,
+        smoothing=0.1,
+        bar_format=(
+            "{desc}: {percentage:6.2f}%|{bar}| "
+            "{n_fmt}/{total_fmt} episodes [{elapsed}<{remaining}, {rate_fmt}]"
+        ),
+    )
+    if not args.select_best_per_run:
+        details_path = out_dir / f"{prefix}_episodes.jsonl"
+        summary_json = out_dir / f"{prefix}_summary.json"
+        summary_tsv = out_dir / f"{prefix}_summary.tsv"
+        summaries = run_evaluation_tasks(
+            evaluation_tasks,
+            args,
+            gpu_ids,
+            details_path,
+            total_progress.update,
+        )
+        write_outputs(summaries, details_path, summary_json, summary_tsv)
+        print_summary_table(summaries, "evaluation results")
+        total_progress.close()
+        return
+
+    selection_seed_start, selection_seed_end = evaluation_seed_range(
+        args.seed,
+        args.num_episodes,
+        0,
+    )
+    test_seed_start, test_seed_end = evaluation_seed_range(
+        args.seed,
+        args.num_episodes,
+        1,
+    )
+    criteria_text = format_selection_criteria(selection_criteria)
+    LOGGER.info(
+        f"selection phase: episode seeds {selection_seed_start}-{selection_seed_end}; "
+        f"criteria {criteria_text}"
+    )
+
+    args.evaluation_split = "selection"
+    selection_details = out_dir / f"{prefix}_selection_episodes.jsonl"
+    selection_json = out_dir / f"{prefix}_selection_summary.json"
+    selection_tsv = out_dir / f"{prefix}_selection_summary.tsv"
+    selection_summaries = run_evaluation_tasks(
+        evaluation_tasks,
+        args,
+        gpu_ids,
+        selection_details,
+        total_progress.update,
+    )
+    write_outputs(
+        selection_summaries,
+        selection_details,
+        selection_json,
+        selection_tsv,
+    )
+
+    selected_best = select_best_summaries_per_run(
+        selection_summaries,
+        selection_criteria,
+    )
+    selected_json = out_dir / f"{prefix}_selected_best.json"
+    selected_tsv = out_dir / f"{prefix}_selected_best.tsv"
+    write_summaries(selected_best, selected_json, selected_tsv)
+    print_summary_table(selected_best, "selected checkpoint per scheme and training-seed run")
+
+    test_tasks = [
+        EvaluationTask(
+            result_dir=Path(summary["result_dir"]),
+            checkpoint=Path(summary["checkpoint"]),
+        )
+        for summary in selected_best
+    ]
+    test_args = copy.copy(args)
+    test_args.seed = test_seed_start
+    test_args.evaluation_split = "test"
+    total_progress.set_description_str("total evaluation [test]")
+    LOGGER.info("test phase: episode seeds %d-%d", test_seed_start, test_seed_end)
+    test_details = out_dir / f"{prefix}_test_episodes.jsonl"
+    test_json = out_dir / f"{prefix}_test_summary.json"
+    test_tsv = out_dir / f"{prefix}_test_summary.tsv"
+    test_summaries = run_evaluation_tasks(
+        test_tasks,
+        test_args,
+        gpu_ids,
+        test_details,
+        total_progress.update,
+    )
+    for test_summary, selected_summary in zip(test_summaries, selected_best):
+        test_summary["selection_criteria"] = criteria_text
+        test_summary["selection_candidate_count"] = selected_summary[
+            "selection_candidate_count"
+        ]
+        test_summary["selected_for_test"] = True
+        test_summary["selection_run_id"] = selected_summary["run_id"]
+        test_summary["selection_result_dir"] = selected_summary["result_dir"]
+        test_summary["selection_training_seed"] = selected_summary["seed"]
+        test_summary["selection_metrics"] = {
+            criterion.metric: selected_summary.get(criterion.metric)
+            for criterion in selection_criteria
+        }
+    write_outputs(test_summaries, test_details, test_json, test_tsv)
+    print_summary_table(test_summaries, "held-out test results")
+
+    all_summary_json = out_dir / f"{prefix}_all_summary.json"
+    all_summary_tsv = out_dir / f"{prefix}_all_summary.tsv"
+    write_summaries(
+        selection_summaries + test_summaries,
+        all_summary_json,
+        all_summary_tsv,
+    )
+    all_results_path = out_dir / f"{prefix}_all_results.json"
+    all_results = {
+        "selection_criteria": criteria_text,
+        "num_episodes_per_evaluation": args.num_episodes,
+        "selection_episode_seed_range": [selection_seed_start, selection_seed_end],
+        "test_episode_seed_range": [test_seed_start, test_seed_end],
+        "num_selection_candidates": len(selection_summaries),
+        "num_selected_models": len(selected_best),
+        "selection_summaries": selection_summaries,
+        "selected_best": selected_best,
+        "test_summaries": test_summaries,
+        "output_files": {
+            "selection_episodes": str(selection_details),
+            "selection_summary_json": str(selection_json),
+            "selection_summary_tsv": str(selection_tsv),
+            "selected_best_json": str(selected_json),
+            "selected_best_tsv": str(selected_tsv),
+            "test_episodes": str(test_details),
+            "test_summary_json": str(test_json),
+            "test_summary_tsv": str(test_tsv),
+            "all_summary_json": str(all_summary_json),
+            "all_summary_tsv": str(all_summary_tsv),
+            "log": str(log_path),
+        },
+    }
+    all_results_path.write_text(
+        json.dumps(all_results, indent=2, sort_keys=True) + "\n"
+    )
+    LOGGER.info("wrote complete two-stage results: %s", all_results_path)
+    total_progress.close()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        if LOGGER.handlers:
+            LOGGER.exception("evaluation failed")
+        raise
