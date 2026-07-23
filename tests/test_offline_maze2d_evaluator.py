@@ -1,6 +1,8 @@
 import argparse
 import io
 import json
+import multiprocessing as mp
+import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -13,6 +15,7 @@ import torch
 
 from tools.evaluate_offline_maze2d import (
     ALL_CHECKPOINT_NUM_EPISODES,
+    CHILD_OUTPUT_LOG_ENV,
     EvaluationTask,
     ProcessEnvPool,
     SelectionCriterion,
@@ -33,6 +36,11 @@ from tools.evaluate_offline_maze2d import (
     split_cpu_cores,
     validate_result_dir_training_seeds,
 )
+
+
+def emit_native_child_output():
+    os.write(1, b"native child stdout\n")
+    os.write(2, b"native child stderr\n")
 
 
 class CheckpointSelectionTest(unittest.TestCase):
@@ -424,6 +432,28 @@ class ParallelResourceAllocationTest(unittest.TestCase):
 
     def test_formats_cpu_core_ranges(self):
         self.assertEqual(format_cpu_cores([0, 1, 2, 4, 7, 8]), "0-2,4,7-8")
+
+    def test_spawned_native_stdout_and_stderr_are_redirected_to_log(self):
+        with TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "child.log"
+            previous = os.environ.get(CHILD_OUTPUT_LOG_ENV)
+            os.environ[CHILD_OUTPUT_LOG_ENV] = str(log_path)
+            try:
+                process = mp.get_context("spawn").Process(
+                    target=emit_native_child_output
+                )
+                process.start()
+            finally:
+                if previous is None:
+                    os.environ.pop(CHILD_OUTPUT_LOG_ENV, None)
+                else:
+                    os.environ[CHILD_OUTPUT_LOG_ENV] = previous
+            process.join(timeout=10)
+
+            self.assertEqual(process.exitcode, 0)
+            log_text = log_path.read_text()
+            self.assertIn("native child stdout", log_text)
+            self.assertIn("native child stderr", log_text)
 
 
 class MultipleTrainingSeedsTest(unittest.TestCase):

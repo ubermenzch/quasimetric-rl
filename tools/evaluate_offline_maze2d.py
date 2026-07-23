@@ -21,6 +21,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+CHILD_OUTPUT_LOG_ENV = "QRL_EVALUATOR_CHILD_OUTPUT_LOG"
+
+
+def redirect_spawned_child_output() -> None:
+    log_path = os.environ.get(CHILD_OUTPUT_LOG_ENV)
+    if not log_path:
+        return
+    log_fd = os.open(
+        log_path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o644,
+    )
+    try:
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+    finally:
+        os.close(log_fd)
+
+
+redirect_spawned_child_output()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -208,16 +229,24 @@ def parse_args() -> argparse.Namespace:
 
 def configure_file_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("")
     for handler in list(LOGGER.handlers):
         LOGGER.removeHandler(handler)
         handler.close()
-    handler = logging.FileHandler(log_path, mode="w")
+    handler = logging.FileHandler(log_path, mode="a")
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     )
     LOGGER.addHandler(handler)
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
+
+
+def restore_child_output_log(previous_value: str | None) -> None:
+    if previous_value is None:
+        os.environ.pop(CHILD_OUTPUT_LOG_ENV, None)
+    else:
+        os.environ[CHILD_OUTPUT_LOG_ENV] = previous_value
 
 
 def parse_gpu_ids(value: str) -> list[int]:
@@ -1611,6 +1640,8 @@ def main() -> None:
         else out_dir / f"{prefix}.log"
     )
     configure_file_logging(log_path)
+    previous_child_output_log = os.environ.get(CHILD_OUTPUT_LOG_ENV)
+    os.environ[CHILD_OUTPUT_LOG_ENV] = str(log_path.resolve())
     LOGGER.info("evaluation command: %s", " ".join(sys.argv))
     LOGGER.info("detailed log: %s", log_path)
 
@@ -1701,6 +1732,7 @@ def main() -> None:
         write_outputs(summaries, details_path, summary_json, summary_tsv)
         print_summary_table(summaries, "evaluation results")
         total_progress.close()
+        restore_child_output_log(previous_child_output_log)
         return
 
     selection_seed_start, selection_seed_end = evaluation_seed_range(
@@ -1821,6 +1853,7 @@ def main() -> None:
     )
     LOGGER.info("wrote complete two-stage results: %s", all_results_path)
     total_progress.close()
+    restore_child_output_log(previous_child_output_log)
 
 
 if __name__ == "__main__":
