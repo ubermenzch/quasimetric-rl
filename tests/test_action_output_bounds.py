@@ -112,6 +112,32 @@ class ImmutableActionBoundsTest(unittest.TestCase):
         action = converter(torch.zeros(3, converter.input_size)).rsample()
         self.assertEqual(action.shape, torch.Size([3, 2, 2]))
 
+    def test_mean_and_mode_are_deterministic_transformed_gaussian_means(self):
+        converter = self.make_converter()
+        gaussian_loc = torch.tensor([
+            [-2.0, 0.0, 2.0],
+            [0.5, -0.5, 1.0],
+        ])
+        raw_std = torch.tensor([
+            [-4.0, 0.0, 4.0],
+            [3.0, -3.0, 1.0],
+        ])
+        feature = torch.stack((gaussian_loc, raw_std), dim=1).flatten(1)
+        action_center, action_half_range = converter._action_bounds_like(feature)
+        expected = action_center + action_half_range * torch.tanh(gaussian_loc)
+
+        dist = converter(feature)
+        torch.manual_seed(101)
+        mean_first = dist.mean
+        torch.manual_seed(202)
+        mean_second = dist.mean
+        torch.manual_seed(303)
+        mode = dist.mode
+
+        self.assertTrue(torch.equal(mean_first, expected))
+        self.assertTrue(torch.equal(mean_second, expected))
+        self.assertTrue(torch.equal(mode, expected))
+
     def test_stable_entropy_keeps_gradient_for_saturated_mean(self):
         converter = BoxOutputLinearNormalization(
             gym.spaces.Box(

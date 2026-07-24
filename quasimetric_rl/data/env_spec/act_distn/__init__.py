@@ -183,6 +183,7 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
         distn = SampleDist(
             distn,
             pre_tanh_distn=pre_tanh_distn,
+            affine_loc=mean,
             affine_scale=half_len,
         )
 

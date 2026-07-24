@@ -183,7 +183,7 @@ class Trainer(object):
                 adistn = self.agent.act(obs, goal)
             if eval:
                 with self._record('env/action_to_cpu'):
-                    a = adistn.mode.cpu().numpy()[0]
+                    a = adistn.mean.cpu().numpy()[0]
             else:
                 with self._record('env/action_sample'):
                     a_t = adistn.sample()

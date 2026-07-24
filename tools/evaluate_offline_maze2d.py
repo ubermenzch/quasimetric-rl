@@ -205,7 +205,15 @@ def parse_args() -> argparse.Namespace:
             "Runs one evaluator per GPU and dynamically distributes evaluation tasks."
         ),
     )
-    parser.add_argument("--action-mode", choices=("mode", "mean", "sample"), default="mode")
+    parser.add_argument(
+        "--action-mode",
+        choices=("mean", "mode", "sample"),
+        default="mean",
+        help=(
+            "Policy action selection. The default uses the deterministic "
+            "tanh-transformed Gaussian mean; sample is stochastic."
+        ),
+    )
     parser.add_argument(
         "--goal-mode",
         choices=("target_zero", "target_current", "target_reset"),

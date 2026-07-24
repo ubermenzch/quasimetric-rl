@@ -26,6 +26,7 @@ from tools.evaluate_offline_maze2d import (
     find_evaluation_checkpoints,
     format_cpu_cores,
     make_evaluation_tasks,
+    parse_args as parse_evaluator_args,
     parse_gpu_ids,
     parse_selection_criteria,
     parse_training_seeds,
@@ -41,6 +42,14 @@ from tools.evaluate_offline_maze2d import (
 def emit_native_child_output():
     os.write(1, b"native child stdout\n")
     os.write(2, b"native child stderr\n")
+
+
+class EvaluationArgumentTest(unittest.TestCase):
+    def test_default_action_mode_is_deterministic_mean(self):
+        with patch("sys.argv", ["evaluate_offline_maze2d.py"]):
+            args = parse_evaluator_args()
+
+        self.assertEqual(args.action_mode, "mean")
 
 
 class CheckpointSelectionTest(unittest.TestCase):

@@ -62,16 +62,23 @@ class SampleDist(torch.distributions.Distribution):
             samples: int = 100,
             *,
             pre_tanh_distn: Optional[torch.distributions.Normal] = None,
+            affine_loc: Optional[torch.Tensor] = None,
             affine_scale: Optional[torch.Tensor] = None):
         if samples <= 0:
             raise ValueError(f'Expected a positive sample count, got {samples}')
-        if (pre_tanh_distn is None) != (affine_scale is None):
+        transform_metadata = (
+            pre_tanh_distn, affine_loc, affine_scale
+        )
+        if any(value is None for value in transform_metadata) != all(
+                value is None for value in transform_metadata):
             raise ValueError(
-                'pre_tanh_distn and affine_scale must either both be set or both be omitted'
+                'pre_tanh_distn, affine_loc, and affine_scale must either all be '
+                'set or all be omitted'
             )
         self._dist = dist
         self._samples = samples
         self._pre_tanh_distn = pre_tanh_distn
+        self._affine_loc = affine_loc
         self._affine_scale = affine_scale
 
     @property
@@ -83,11 +90,18 @@ class SampleDist(torch.distributions.Distribution):
 
     @property
     def mean(self):
+        if self._pre_tanh_distn is not None:
+            return (
+                self._affine_loc
+                + self._affine_scale * torch.tanh(self._pre_tanh_distn.mean)
+            )
         sample = self._dist.rsample([self._samples])
         return torch.mean(sample, 0)
 
     @property
     def mode(self):
+        if self._pre_tanh_distn is not None:
+            return self.mean
         sample: torch.Tensor = self._dist.rsample([self._samples])
         logprob: torch.Tensor = self._dist.log_prob(sample)
         assert len(self._dist.batch_shape) == 1, self._dist.batch_shape
