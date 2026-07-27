@@ -100,6 +100,10 @@ To reproduce the online `gcrl`  experiments in paper, you can use commands simil
 ./online/run_gcrl.sh env.name='FetchSlide' seed=44411223 interaction.total_env_steps=10 agent.num_critics=3
 ```
 
+Additional goal-conditioned Gym MuJoCo and DeepMind Control environments are
+listed in [`docs/ONLINE_GOAL_ENVS.md`](docs/ONLINE_GOAL_ENVS.md), including the
+goal dimensions required by GO-QRL agents.
+
 <details>
 <summary><strong>
 Example code for how to load a trained checkpoint (click me)

@@ -136,6 +136,8 @@ class BaseConf(abc.ABC):
                     ')'
                 )
             encoder_conf = self.agent.quasimetric_critic.model.encoder
+            if self.agent.model_size is not None:
+                specs.append(f'size={self.agent.model_size}')
             if encoder_conf.kind == 'split':
                 specs.append(
                     'split('
@@ -168,7 +170,11 @@ class BaseConf(abc.ABC):
                         + (
                             f':residual-r{latent_goal_loss.latent_goal_residual_radius:g}'
                             if latent_goal_loss.latent_goal_search == 'bounded_residual'
-                            else ''
+                            else (
+                                ':residual'
+                                if latent_goal_loss.latent_goal_search == 'residual'
+                                else ''
+                            )
                         )
                     )
                 if self.agent.actor.losses.behavior_cloning.weight > 0:

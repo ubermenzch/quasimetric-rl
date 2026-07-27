@@ -1,0 +1,23 @@
+# QRL-S: eligible when state_dim < latent_size / 2 = 64.
+model_size: QRL-S
+num_critics: 1
+training_schedule: joint
+quasimetric_critic:
+  model:
+    encoder:
+      kind: standard
+      arch: [512, 512]
+      latent_size: 128
+    quasimetric_model:
+      projector_arch: [512]
+      quasimetric_head_spec: iqe(dim=2048,components=64)
+    latent_dynamics:
+      kind: mlp
+      arch: [512, 512]
+      residual: true
+actor:
+  model:
+    input_mode: raw
+    arch: [512, 512]
+goal_set_distance:
+  enabled: false

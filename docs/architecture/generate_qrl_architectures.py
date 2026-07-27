@@ -426,10 +426,10 @@ def generate_base() -> str:
 
 
 def generate_split_max8() -> str:
-    svg = SVG(2400, 1680, "Detailed 1Q SplitLatentMax8 architecture on Maze2D")
+    svg = SVG(2400, 1680, "Detailed 1Q GO-QRL-Max8 architecture on Maze2D")
     header(
         svg,
-        "1Q SplitLatentMax8",
+        "1Q GO-QRL-Max8",
         "Maze2D-umaze-v1  |  one critic  |  full critic and actor training routes",
         "LATEX SOURCE + PREVIEW",
     )

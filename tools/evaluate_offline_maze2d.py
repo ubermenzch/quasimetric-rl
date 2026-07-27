@@ -651,7 +651,22 @@ def make_agent(
     return agent, dataset, conf, checkpoint_metadata
 
 
-def reset_env(env: gym.Env, seed: int) -> np.ndarray:
+def observation_and_desired_goal(
+    value: Any,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    if isinstance(value, dict):
+        if "observation" not in value or "desired_goal" not in value:
+            raise ValueError(
+                "Goal-conditioned observations must contain observation and desired_goal"
+            )
+        return (
+            np.asarray(value["observation"], dtype=np.float32),
+            np.asarray(value["desired_goal"], dtype=np.float32),
+        )
+    return np.asarray(value, dtype=np.float32), None
+
+
+def reset_env(env: gym.Env, seed: int) -> tuple[np.ndarray, np.ndarray | None]:
     if hasattr(env, "seed"):
         env.seed(seed)
     if hasattr(env.action_space, "seed"):
@@ -659,7 +674,7 @@ def reset_env(env: gym.Env, seed: int) -> np.ndarray:
     out = env.reset()
     if isinstance(out, tuple):
         out = out[0]
-    return np.asarray(out, dtype=np.float32)
+    return observation_and_desired_goal(out)
 
 
 def step_env(env: gym.Env, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
@@ -669,7 +684,8 @@ def step_env(env: gym.Env, action: np.ndarray) -> tuple[np.ndarray, float, bool,
     else:
         obs, reward, done, info = out
         terminated, truncated = bool(done), bool(info.get("TimeLimit.truncated", False))
-    return np.asarray(obs, dtype=np.float32), float(reward), bool(terminated), bool(truncated), dict(info)
+    observation, _desired_goal = observation_and_desired_goal(obs)
+    return observation, float(reward), bool(terminated), bool(truncated), dict(info)
 
 
 def get_target(env: gym.Env) -> np.ndarray:
@@ -682,6 +698,8 @@ def get_target(env: gym.Env) -> np.ndarray:
 
 
 def make_goal(obs: np.ndarray, reset_obs: np.ndarray, target_xy: np.ndarray, goal_mode: str) -> np.ndarray:
+    if target_xy.shape == obs.shape:
+        return target_xy.astype(np.float32, copy=False)
     if goal_mode == "target_current":
         goal = obs.copy()
     elif goal_mode == "target_reset":
@@ -692,6 +710,18 @@ def make_goal(obs: np.ndarray, reset_obs: np.ndarray, target_xy: np.ndarray, goa
     return goal.astype(np.float32, copy=False)
 
 
+def goal_distance(
+    obs: np.ndarray,
+    target: np.ndarray,
+    goal_dims: tuple[int, ...] | None,
+) -> float:
+    if goal_dims is None:
+        return float(np.linalg.norm(obs[: target.shape[0]] - target))
+    dims = np.asarray(goal_dims, dtype=np.int64)
+    target_values = target[dims] if target.shape == obs.shape else target
+    return float(np.linalg.norm(obs[dims] - target_values))
+
+
 @dataclass
 class EpisodeAccumulator:
     episode_idx: int
@@ -699,6 +729,7 @@ class EpisodeAccumulator:
     obs: np.ndarray
     reset_obs: np.ndarray
     target_xy: np.ndarray
+    goal_dims: tuple[int, ...] | None = None
     rewards: list[float] = field(default_factory=list)
     distances: list[float] = field(default_factory=list)
     episode_return: float = 0.0
@@ -741,8 +772,9 @@ class LocalEnvPool:
             np.random.seed(episode_seed)
             torch.manual_seed(episode_seed)
             env = self.envs[slot_id]
-            obs = reset_env(env, episode_seed)
-            results[slot_id] = (obs, get_target(env))
+            obs, desired_goal = reset_env(env, episode_seed)
+            target = desired_goal if desired_goal is not None else get_target(env)
+            results[slot_id] = (obs, target)
         return results
 
     def step(
@@ -1039,14 +1071,16 @@ def start_episode(
     obs: np.ndarray,
     target_xy: np.ndarray,
     max_steps: int,
+    goal_dims: tuple[int, ...] | None = None,
 ) -> EpisodeAccumulator:
-    initial_distance = float(np.linalg.norm(obs[: target_xy.shape[0]] - target_xy))
+    initial_distance = goal_distance(obs, target_xy, goal_dims)
     return EpisodeAccumulator(
         episode_idx=episode_idx,
         episode_seed=episode_seed,
         obs=obs,
         reset_obs=obs.copy(),
         target_xy=target_xy,
+        goal_dims=goal_dims,
         distances=[initial_distance],
         first_success_step=max_steps + 1,
     )
@@ -1097,6 +1131,10 @@ def rollout_episodes(
 ) -> tuple[list[dict[str, Any]], float]:
     num_envs = min(args.num_envs, args.num_episodes)
     num_workers = min(args.num_workers, num_envs)
+    try:
+        goal_dims = tuple(dataset.goal_set_dims)
+    except (AttributeError, ValueError):
+        goal_dims = None
     probe_env = dataset.create_env()
     max_steps = base_result["max_episode_steps"]
     pool: LocalEnvPool | ProcessEnvPool | None = None
@@ -1142,6 +1180,7 @@ def rollout_episodes(
                     obs,
                     target_xy,
                     max_steps,
+                    goal_dims,
                 )
 
         start = time.time()
@@ -1185,8 +1224,10 @@ def rollout_episodes(
                     state.rewards.append(reward)
                     state.terminated = terminated
                     state.truncated = truncated
-                    distance = float(
-                        np.linalg.norm(obs[: state.target_xy.shape[0]] - state.target_xy)
+                    distance = goal_distance(
+                        obs,
+                        state.target_xy,
+                        state.goal_dims,
                     )
                     state.distances.append(distance)
                     if (

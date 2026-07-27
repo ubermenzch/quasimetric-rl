@@ -16,8 +16,8 @@ from . import ActorLossBase
 
 
 LATENT_GOAL_MODES = ('none', 'min', 'max')
-LATENT_GOAL_OPTIMIZERS = ('adam',)
-LATENT_GOAL_SEARCHES = ('direct', 'bounded_residual')
+LATENT_GOAL_OPTIMIZERS = ('adam', 'sgd', 'rmsg')
+LATENT_GOAL_SEARCHES = ('direct', 'residual', 'bounded_residual')
 
 
 @attrs.define(kw_only=True)
@@ -131,7 +131,7 @@ class MinDistLoss(ActorLossBase):
         if (latent_goal_steps <= 0 or latent_goal_lr <= 0
                 or latent_goal_eps <= 0 or latent_goal_residual_radius <= 0):
             raise ValueError(
-                'Latent goal Adam steps, lr, eps, and residual radius must be positive'
+                'Latent goal steps, lr, eps, and residual radius must be positive'
             )
         if (len(latent_goal_betas) != 2
                 or not all(0 <= beta < 1 for beta in latent_goal_betas)):
@@ -284,9 +284,11 @@ class MinDistLoss(ActorLossBase):
         goal_latent, initial_non_goal_latent = critic.encoder.split_latent(
             initial_goal_latent.detach()
         )
-        if self.latent_goal_search == 'bounded_residual':
-            # Optimize in batch-standardized coordinates and constrain each
-            # sample by its residual RMS rather than a dimension-dependent L2 radius.
+        residual_search = self.latent_goal_search in (
+            'residual', 'bounded_residual'
+        )
+        if residual_search:
+            # Optimize relative movement in batch-standardized coordinates.
             flat_initial_h = initial_non_goal_latent.reshape(
                 -1, initial_non_goal_latent.shape[-1]
             )
@@ -304,6 +306,9 @@ class MinDistLoss(ActorLossBase):
             search_variable = initial_non_goal_latent.clone().requires_grad_(True)
 
             def candidate_h(variable: torch.Tensor) -> torch.Tensor:
+                # LayerNorm defines the encoder output, not the inner search space.
+                if critic.encoder.branch_normalization == 'layernorm':
+                    return variable
                 return critic.encoder.normalize_non_goal_part(variable)
 
         first_moment = torch.zeros_like(search_variable)
@@ -357,7 +362,7 @@ class MinDistLoss(ActorLossBase):
                     candidate_dist = inner_dist.detach()
                     candidate_residual_rms = (
                         self._standardized_residual_rms(search_variable.detach())
-                        if self.latent_goal_search == 'bounded_residual'
+                        if residual_search
                         else torch.zeros_like(candidate_dist)
                     )
                     improved = (
@@ -379,13 +384,23 @@ class MinDistLoss(ActorLossBase):
                     )
 
             gradient = gradient.detach()
-            first_moment = beta1 * first_moment + (1 - beta1) * gradient
-            second_moment = beta2 * second_moment + (1 - beta2) * gradient.square()
-            corrected_first = first_moment / (1 - beta1 ** step)
-            corrected_second = second_moment / (1 - beta2 ** step)
-            update = self.latent_goal_lr * corrected_first / (
-                corrected_second.sqrt() + self.latent_goal_eps
-            )
+            if self.latent_goal_optim == 'adam':
+                first_moment = beta1 * first_moment + (1 - beta1) * gradient
+                second_moment = beta2 * second_moment + (1 - beta2) * gradient.square()
+                corrected_first = first_moment / (1 - beta1 ** step)
+                corrected_second = second_moment / (1 - beta2 ** step)
+                update = self.latent_goal_lr * corrected_first / (
+                    corrected_second.sqrt() + self.latent_goal_eps
+                )
+            elif self.latent_goal_optim == 'sgd':
+                update = self.latent_goal_lr * gradient
+            elif self.latent_goal_optim == 'rmsg':
+                gradient_rms = gradient.square().mean(
+                    dim=-1, keepdim=True
+                ).sqrt().clamp_min(self.latent_goal_eps)
+                update = self.latent_goal_lr * gradient / gradient_rms
+            else:
+                raise AssertionError(self.latent_goal_optim)
             gradient_norms.append(torch.linalg.vector_norm(gradient, dim=-1).mean())
             update_norms.append(torch.linalg.vector_norm(update, dim=-1).mean())
             search_variable = (search_variable + direction * update).detach()
@@ -397,7 +412,7 @@ class MinDistLoss(ActorLossBase):
             last_h = candidate_h(search_variable.detach())
             last_residual_rms = (
                 self._standardized_residual_rms(search_variable.detach())
-                if self.latent_goal_search == 'bounded_residual'
+                if residual_search
                 else torch.zeros_like(initial_dist)
             )
             last_inner_dist = critic.quasimetric_model.forward_projected(
@@ -565,7 +580,7 @@ class MinDistLoss(ActorLossBase):
         for idx, actor_obs_goal_critic_info in enumerate(actor_obs_goal_critic_infos):
             critic = actor_obs_goal_critic_info.critic
             with critic.requiring_grad(False):
-                zp = critic.latent_dynamics(
+                zp = critic.predict_next_latent(
                     actor_obs_goal_critic_info.zo.detach(), action
                 )
                 if self.latent_goal_mode in ('min', 'max'):

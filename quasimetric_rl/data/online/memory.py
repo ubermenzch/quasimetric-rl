@@ -394,4 +394,4 @@ class ReplayBuffer(Dataset):
         return '\n'.join(lines)
 
 
-from . import gcrl  # register
+from . import dmc, gcrl, gym_mujoco  # register

@@ -56,8 +56,24 @@ class QuasimetricCritic(Module):
         zx = self.encoder(x)
         zy = self.encoder(y)
         if action is not None:
-            zx = self.latent_dynamics(zx, action)
+            zx = self.predict_next_latent(zx, action)
         return self.quasimetric_model(zx, zy)
+
+    def predict_next_latent(
+            self, zx: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.encoder.normalize_latent(self.latent_dynamics(zx, action))
+
+    def predict_next_latent_sequence(
+            self, z_history: torch.Tensor, action_history: torch.Tensor,
+            history_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not hasattr(self.latent_dynamics, 'forward_sequence'):
+            raise RuntimeError('Configured latent dynamics does not support sequences')
+        predicted = self.latent_dynamics.forward_sequence(
+            z_history,
+            action_history,
+            history_mask,
+        )
+        return self.encoder.normalize_latent(predicted)
 
     # for type hints
     def __call__(self, x: torch.Tensor, y: torch.Tensor, *, action: Optional[torch.Tensor] = None) -> torch.Tensor:

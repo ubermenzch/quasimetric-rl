@@ -72,6 +72,7 @@ valid_names = (
     'FetchPush',
     'FetchPushImage',
     'FetchSlide',
+    'FetchPickAndPlace',
 )
 
 

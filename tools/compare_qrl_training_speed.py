@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare 1Q Base and SplitLatentMax4 LayerNorm training speed."""
+"""Compare QRL and GO-QRL-Max4 LayerNorm training speed."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ BASE_VARIANT = '1q_base'
 SPLIT_VARIANT = 'split_layernorm_max4'
 VARIANTS = (BASE_VARIANT, SPLIT_VARIANT)
 LABELS = {
-    BASE_VARIANT: '1Q Base',
-    SPLIT_VARIANT: 'SplitLatentMax4 LayerNorm',
+    BASE_VARIANT: 'QRL',
+    SPLIT_VARIANT: 'GO-QRL-Max4 LayerNorm',
 }
 
 

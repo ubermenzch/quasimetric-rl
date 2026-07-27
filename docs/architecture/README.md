@@ -2,9 +2,9 @@
 
 This directory contains two editable QRL architecture diagrams:
 
-- `qrl_1q_base_maze2d.svg`: a one-critic Maze2D Base architecture.
+- `qrl_1q_base_maze2d.svg`: a one-critic Maze2D QRL architecture.
 - `qrl_1q_split_latent_max8_maze2d.tex`: authoritative LaTeX/TikZ source for
-  the existing one-critic split-latent Max8 architecture, including all critic,
+  the existing one-critic GO-QRL-Max8 architecture, including all critic,
   actor, and latent-completion routes.
 - `qrl_1q_split_latent_max8_maze2d.svg`: directly viewable vector preview of
   the TikZ figure.
@@ -17,11 +17,11 @@ Both diagrams use `maze2d-umaze-v1`, whose state is
 `(x, y, vx, vy) in R^4` and whose action is in `R^2`.
 
 The repository does not contain a completed run named `1q_Base` on Maze2D.
-The Base diagram therefore uses the existing Maze2D Base network settings and
+The QRL diagram therefore uses the existing Maze2D QRL network settings and
 changes only `agent.num_critics` from 2 to 1. In particular, it keeps the raw
 actor and the larger 1024-wide encoder, dynamics, actor, and projector MLPs.
 
-The SplitLatentMax8 diagram uses the split-encoder dimensions from
+The GO-QRL-Max8 diagram uses the split-encoder dimensions from
 `configs/qrl_tasks_latent_completion_offline.tsv` and the implemented paths in:
 
 - `quasimetric_rl/modules/quasimetric_critic/models/encoder.py`

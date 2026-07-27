@@ -67,7 +67,7 @@ class LatentDynamicsLoss(CriticLossBase):
             zx = zx.detach()
             py = py.detach()
 
-        pred_zy = critic_batch_info.critic.latent_dynamics(zx, data.actions)
+        pred_zy = critic_batch_info.critic.predict_next_latent(zx, data.actions)
         grad_context = (
             self._quasimetric_model_requiring_grad(critic_batch_info, False)
             if detach_critic_outputs else contextlib.nullcontext()
@@ -109,7 +109,7 @@ class LatentDynamicsLoss(CriticLossBase):
             z_context = z_context.detach()
             z_target = z_target.detach()
 
-        pred_z = critic.latent_dynamics.forward_sequence(
+        pred_z = critic.predict_next_latent_sequence(
             z_context,
             data.history_actions,
             data.history_mask,

@@ -197,9 +197,6 @@ def current_run_start_progress(task: Task, status: dict[str, str]) -> float | No
         matches = re.findall(r"Fast forward to env_steps=(\d+)", text)
         if matches:
             return float(matches[-1])
-        matches = re.findall(r"checkpoint_env(\d+)_opt\d+", text)
-        if matches:
-            return float(matches[-1])
         return 0.0
     matches = re.findall(r"Fast forward to epoch=(\d+)", text)
     if matches:
@@ -255,25 +252,44 @@ def latest_eval(output_dir: Path) -> dict[str, str]:
     eval_log = output_dir / "eval.log"
     if not eval_log.exists():
         return {}
-    best = None
+    latest = None
+    best_success = None
     for line in eval_log.read_text(errors="replace").splitlines():
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if best is None or float(row.get("env_steps", -1)) >= float(best.get("env_steps", -1)):
-            best = row
-    if best is None:
+        if latest is None or (
+                float(row.get("env_steps", -1)),
+                float(row.get("optim_steps", -1)),
+        ) >= (
+                float(latest.get("env_steps", -1)),
+                float(latest.get("optim_steps", -1)),
+        ):
+            latest = row
+        if "succ_rate" in row and (
+                best_success is None
+                or float(row["succ_rate"]) > float(best_success)
+        ):
+            best_success = row["succ_rate"]
+    if latest is None:
         return {}
     out: dict[str, str] = {}
     for key in ["env_steps", "optim_steps", "succ_rate", "epi_return"]:
-        if key in best:
-            value = best[key]
+        if key in latest:
+            value = latest[key]
             out[key] = f"{float(value):.4g}" if isinstance(value, (float, int)) else str(value)
+    if best_success is not None:
+        out["best_succ_rate"] = f"{float(best_success):.4g}"
     return out
 
 
-def online_progress(output_dir: Path, task: Task, status: dict[str, str]) -> Progress:
+def online_progress(
+    output_dir: Path,
+    task: Task,
+    status: dict[str, str],
+    latest: dict[str, str] | None = None,
+) -> Progress:
     best = 0.0
     for path in output_dir.glob("checkpoint_env*_opt*.pth"):
         match = re.search(r"checkpoint_env(\d+)_opt(\d+)", path.name)
@@ -281,10 +297,11 @@ def online_progress(output_dir: Path, task: Task, status: dict[str, str]) -> Pro
             best = max(best, float(match.group(1)))
     log_file = Path(status.get("log_file", ""))
     if log_file.exists():
-        matches = re.findall(r"(\d+(?:\.\d+)?)\s+env steps", read_tail(log_file))
-        if matches:
-            best = max(best, float(matches[-1]))
-    latest = latest_eval(output_dir)
+        log_progress = latest_number_before_marker(log_file, b"env steps")
+        if log_progress is not None:
+            best = max(best, log_progress)
+    if latest is None:
+        latest = latest_eval(output_dir)
     if latest.get("env_steps"):
         try:
             best = max(best, float(latest["env_steps"]))
@@ -297,17 +314,76 @@ def online_progress(output_dir: Path, task: Task, status: dict[str, str]) -> Pro
     return Progress(pct, f"{best:.3g}/{total:.3g}" if best else "", best, total)
 
 
-def read_tail(path: Path, max_bytes: int = 5_000_000) -> str:
+def read_tail_bytes(path: Path, max_bytes: int = 5_000_000) -> bytes:
     if not path.exists():
-        return ""
+        return b""
     try:
         size = path.stat().st_size
         with path.open("rb") as f:
             if size > max_bytes:
                 f.seek(size - max_bytes)
-            return f.read().decode("utf-8", "ignore")
+            return f.read()
     except OSError:
-        return ""
+        return b""
+
+
+def read_tail(path: Path, max_bytes: int = 5_000_000) -> str:
+    return read_tail_bytes(path, max_bytes).decode("utf-8", "ignore")
+
+
+def latest_number_before_marker(
+    path: Path,
+    marker: bytes,
+    max_bytes: int = 5_000_000,
+) -> float | None:
+    """Return the last ASCII number separated by whitespace from a marker."""
+    if not marker or max_bytes <= 0:
+        return None
+    initial_bytes = min(max_bytes, 256_000)
+    data = read_tail_bytes(path, initial_bytes)
+    result = latest_number_in_bytes(data, marker)
+    if result is not None:
+        return result
+    try:
+        needs_fallback = path.stat().st_size > initial_bytes and max_bytes > initial_bytes
+    except OSError:
+        needs_fallback = False
+    if not needs_fallback:
+        return None
+    return latest_number_in_bytes(read_tail_bytes(path, max_bytes), marker)
+
+
+def latest_number_in_bytes(data: bytes, marker: bytes) -> float | None:
+    search_end = len(data)
+    whitespace = b" \t\n\r\v\f"
+    while search_end > 0:
+        marker_start = data.rfind(marker, 0, search_end)
+        if marker_start < 0:
+            return None
+        number_end = marker_start
+        while number_end > 0 and data[number_end - 1] in whitespace:
+            number_end -= 1
+        if number_end == marker_start:
+            search_end = marker_start
+            continue
+        number_start = number_end
+        while number_start > 0 and (
+            48 <= data[number_start - 1] <= 57 or data[number_start - 1] == 46
+        ):
+            number_start -= 1
+        token = data[number_start:number_end]
+        if (
+            token
+            and token[:1] != b"."
+            and token[-1:] != b"."
+            and token.count(b".") <= 1
+        ):
+            try:
+                return float(token)
+            except ValueError:
+                pass
+        search_end = marker_start
+    return None
 
 
 def read_head(path: Path, max_bytes: int = 1_000_000) -> str:
@@ -536,23 +612,49 @@ def task_variant(task: Task) -> str:
     latent_goal_mode = extra_arg_value(
         task.extra_args, "agent.actor.losses.min_dist.latent_goal_mode"
     )
+    latent_goal_search = extra_arg_value(
+        task.extra_args, "agent.actor.losses.min_dist.latent_goal_search"
+    )
+    latent_goal_optim = extra_arg_value(
+        task.extra_args, "agent.actor.losses.min_dist.latent_goal_optim"
+    )
+    branch_normalization = extra_arg_value(
+        task.extra_args, "agent.quasimetric_critic.model.encoder.branch_normalization"
+    )
     named_latent_variant = re.search(
-        r"_(SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|$)",
+        r"_(GO-QRL(?:\+|-)(?:Max|Min)\d+|SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|-|\+|$)",
         task.task_id,
     )
+    if not encoder_kind and (
+        extra_arg_value(task.extra_args, "+go_qrl_model_size")
+        or (
+            named_latent_variant
+            and named_latent_variant.group(1).startswith("GO-QRL")
+        )
+    ):
+        encoder_kind = "split"
     if encoder_kind == "split":
         if latent_goal_mode in {"max", "min"}:
             latent_goal_steps = extra_arg_value(
                 task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
             )
-            variant = f"SplitLatent{latent_goal_mode.capitalize()}{latent_goal_steps}"
-        elif named_latent_variant and named_latent_variant.group(1).startswith("SplitLatent"):
+            mode_label = f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
+            variant = f"GO-QRL+{mode_label}"
+            if latent_goal_search == "residual":
+                variant += "+Res"
+            if branch_normalization == "layernorm":
+                variant += "+LN"
+            if latent_goal_optim == "rmsg":
+                variant += "+RMSG"
+        elif named_latent_variant and (
+                named_latent_variant.group(1).startswith("SplitLatent")
+                or named_latent_variant.group(1).startswith("GO-QRL")):
             variant = named_latent_variant.group(1)
+            variant = re.sub(r'^SplitLatent(Max|Min)', r'GO-QRL+\1', variant)
+            variant = re.sub(r'^GO-QRL-', 'GO-QRL+', variant)
         else:
             variant = "SplitZero"
-        if extra_arg_value(
-            task.extra_args, "agent.actor.losses.min_dist.latent_goal_search"
-        ) == "bounded_residual":
+        if latent_goal_search == "bounded_residual":
             radius = extra_arg_value(
                 task.extra_args, "agent.actor.losses.min_dist.latent_goal_residual_radius"
             )
@@ -560,7 +662,7 @@ def task_variant(task: Task) -> str:
                 radius = f"{float(radius):g}"
             except ValueError:
                 pass
-            variant += f"/BoundedResR{radius}" if radius else "/BoundedRes"
+            variant += f"+BR{radius}" if radius else "+BR"
         return variant
     if actor_input_mode == "latent" or (
         named_latent_variant and named_latent_variant.group(1) == "LatentBase"
@@ -585,6 +687,8 @@ def task_variant(task: Task) -> str:
     if "Tsep" in task.task_id:
         return "Tsep"
     if "_Base_" in task.task_id:
+        return "Base"
+    if extra_arg_value(task.extra_args, "+qrl_model_size"):
         return "Base"
     return "base"
 
@@ -643,6 +747,10 @@ def task_display_name(task: Task) -> str:
             continue
         if re.fullmatch(r"splitlatent(?:max|min)\d+", lower):
             continue
+        if re.fullmatch(
+            r"go-qrl\+(?:max|min)\d+(?:\+(?:res|ln|rmsg))*-[sml]", lower
+        ):
+            continue
         if re.fullmatch(r"boundedresr\d+(?:\.\d+)?", lower):
             continue
         if lower.startswith("direct-") or lower.startswith("learned-"):
@@ -678,9 +786,11 @@ def render(config: dict[str, str]) -> None:
         alive = pid_alive(pid)
         if state == "RUNNING" and not alive:
             state = "STALE"
+            status = {**status, "state": state}
         output_dir = Path(status.get("output_dir") or str(output_root / task.task_id))
+        latest = latest_eval(output_dir)
         if task.mode == "online":
-            progress = online_progress(output_dir, task, status)
+            progress = online_progress(output_dir, task, status, latest)
         else:
             progress = offline_progress(output_dir, task, status)
         run_elapsed = elapsed_hours(status)
@@ -691,8 +801,8 @@ def render(config: dict[str, str]) -> None:
         eta = estimated_eta_hours(task, status, progress, run_elapsed, history_elapsed)
         if state in {"RUNNING", "PENDING"} and eta is not None:
             queue_eta = max(queue_eta, eta)
-        latest = latest_eval(output_dir)
-        succ = latest.get("succ_rate", "")
+        last_succ = latest.get("succ_rate", "")
+        best_succ = latest.get("best_succ_rate", "")
         err = status.get("error", "")
         submitted_at = status.get("submitted_at") or status.get("started_at", "")
         gpu_started_at = status.get("gpu_started_at") or status.get("started_at", "")
@@ -701,7 +811,6 @@ def render(config: dict[str, str]) -> None:
             state,
             status.get("gpu", "") if state == "RUNNING" else "",
             pid if state == "RUNNING" else "",
-            task_display_name(task),
             task_variant(task),
             task_parameter_count(task),
             task_critic_count(task),
@@ -719,7 +828,8 @@ def render(config: dict[str, str]) -> None:
             f"{eta:.2f}" if eta is not None else "",
             f"{display_elapsed:.2f}" if display_elapsed is not None else "",
             progress.text,
-            succ,
+            last_succ,
+            best_succ,
             err,
         ])
         counts[state] = counts.get(state, 0) + 1
@@ -731,13 +841,13 @@ def render(config: dict[str, str]) -> None:
         f"queue_eta_h={queue_eta:.2f}",
     )
     headers = [
-        "#", "state", "gpu", "pid", "task", "variant", "params", "critics", "mode", "env",
+        "#", "state", "gpu", "pid", "variant", "params", "critics", "mode", "env",
         "seed", "steps", "ckpt", "submitted", "gpu_start", "peak_mb", "oom_n", "mem_cap",
-        "%", "eta_h", "elapsed_h", "progress", "succ", "err",
+        "%", "eta_h", "elapsed_h", "progress", "last_succ", "best_succ", "err",
     ]
     widths = [
-        4, 8, 4, 8, 34, 34, 7, 7, 7, 22, 6, 6, 6, 14, 14, 8, 5, 8, 6, 7,
-        9, 17, 8, 18,
+        4, 8, 4, 8, 34, 7, 7, 7, 22, 6, 6, 6, 14, 14, 8, 5, 8, 6, 7,
+        9, 17, 9, 9, 18,
     ]
     print(" ".join(fmt(h, w) for h, w in zip(headers, widths)))
     print(" ".join("-" * w for w in widths))

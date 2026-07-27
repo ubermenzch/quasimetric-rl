@@ -1552,6 +1552,22 @@ def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> Non
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
     finished = output_finished(job.output_dir)
     previous = read_status(status_dir, job.task.task_id)
+    interrupted_exit_codes = {130, -signal.SIGINT, -signal.SIGTERM}
+    if not finished and exit_code in interrupted_exit_codes:
+        write_status(status_dir, job.task, "PENDING", {
+            "exit_code": str(exit_code),
+            "previous_gpu": job.gpu,
+            "previous_pid": str(job.proc.pid),
+            "log_file": str(job.log_file),
+            "output_dir": str(job.output_dir),
+            "error": "training_interrupted_requeued",
+        })
+        print(
+            f"[{timestamp()}] REQUEUE_INTERRUPTED {job.task.task_id} "
+            f"exit_code={exit_code}",
+            flush=True,
+        )
+        return
     oom_status = dict(previous)
     oom_status["exit_code"] = str(exit_code)
     if not finished and exit_code != 0 and requeue_cuda_oom_status(

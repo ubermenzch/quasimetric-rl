@@ -13,6 +13,7 @@ from ....data.env_spec.input_encoding import InputEncoding
 
 ENCODER_KINDS = ('standard', 'split')
 SPLIT_BRANCH_NORMALIZATIONS = ('none', 'rmsnorm', 'layernorm')
+SPLIT_PARAMETERIZATIONS = ('manual', 'match_qrl')
 
 
 class Encoder(nn.Module):
@@ -45,13 +46,57 @@ class Encoder(nn.Module):
         non_goal_arch: Tuple[int, ...] = (384, 384)
         goal_latent_size: int = attrs.field(default=64, validator=attrs.validators.gt(0))
         non_goal_latent_size: int = attrs.field(default=64, validator=attrs.validators.gt(0))
+        split_parameterization: str = attrs.field(
+            default='manual',
+            validator=attrs.validators.in_(SPLIT_PARAMETERIZATIONS),
+        )
+        min_goal_parameter_ratio: float = attrs.field(
+            default=0.125, validator=attrs.validators.gt(0),
+        )
         branch_normalization: str = attrs.field(
             default='none',
             validator=attrs.validators.in_(SPLIT_BRANCH_NORMALIZATIONS),
         )
 
+        def resolve_go_qrl_branches(self, *, state_dim: int, goal_dim: int):
+            """Resolve this preset's concrete branch widths for one task."""
+            if self.kind != 'split' or self.split_parameterization == 'manual':
+                return None
+            if state_dim <= 1 or not 0 < goal_dim < state_dim:
+                raise ValueError(
+                    f'Expected 0 < goal_dim < state_dim, got {goal_dim}, {state_dim}'
+                )
+            from ....model_size import match_go_qrl_split_encoder
+            plan = match_go_qrl_split_encoder(
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+                latent_size=self.latent_size,
+                reference_arch=self.arch,
+                min_goal_ratio=self.min_goal_parameter_ratio,
+            )
+            self.goal_arch = plan.goal_arch
+            self.non_goal_arch = plan.non_goal_arch
+            self.goal_latent_size = plan.goal_latent_size
+            self.non_goal_latent_size = plan.non_goal_latent_size
+            return plan
+
+        def resolve_split_parameterization(self, *, env_spec: EnvSpec):
+            if self.kind != 'split' or self.split_parameterization == 'manual':
+                return None
+            if self.goal_dims is None:
+                raise ValueError('SplitEncoder requires encoder.goal_dims')
+            if len(env_spec.observation_shape) != 1:
+                raise ValueError(
+                    'Automatic GO-QRL branch matching requires vector observations'
+                )
+            return self.resolve_go_qrl_branches(
+                state_dim=int(env_spec.observation_shape[0]),
+                goal_dim=len(self.goal_dims),
+            )
+
         def make(self, *, env_spec: EnvSpec) -> Union['Encoder', 'SplitEncoder']:
             if self.kind == 'split':
+                self.resolve_split_parameterization(env_spec=env_spec)
                 if self.goal_dims is None:
                     raise ValueError('SplitEncoder requires encoder.goal_dims')
                 if self.goal_latent_size + self.non_goal_latent_size != self.latent_size:
@@ -95,6 +140,13 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> LatentTensor:
         return self.encoder(self.input_encoding(x))
+
+    def normalize_latent(self, latent: LatentTensor) -> LatentTensor:
+        if latent.shape[-1] != self.latent_size:
+            raise ValueError(
+                f'Expected latent size {self.latent_size}, got {latent.shape[-1]}'
+            )
+        return latent
 
     def encode_actor_goal(self, goal: torch.Tensor) -> LatentTensor:
         return self(goal)
@@ -232,6 +284,13 @@ class SplitEncoder(nn.Module):
             latent, [self.goal_latent_size, self.non_goal_latent_size], dim=-1
         )
 
+    def normalize_latent(self, latent: LatentTensor) -> LatentTensor:
+        goal_latent, non_goal_latent = self.split_latent(latent)
+        return self.join_parts(
+            self.normalize_goal_part(goal_latent),
+            self.normalize_non_goal_part(non_goal_latent),
+        )
+
     def encode_actor_goal(self, goal: torch.Tensor) -> LatentTensor:
         goal_latent = self.encode_goal_part(goal)
         non_goal_latent = goal_latent.new_zeros(
@@ -261,5 +320,5 @@ class SplitEncoder(nn.Module):
 
 __all__ = [
     'Encoder', 'SplitEncoder', 'ENCODER_KINDS',
-    'SPLIT_BRANCH_NORMALIZATIONS',
+    'SPLIT_BRANCH_NORMALIZATIONS', 'SPLIT_PARAMETERIZATIONS',
 ]

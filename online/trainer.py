@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
+from quasimetric_rl import utils
 from quasimetric_rl.modules import QRLConf, QRLAgent, QRLLosses, InfoT
 from quasimetric_rl.data import BatchData, EpisodeData, MultiEpisodeData
 from quasimetric_rl.data.online import ReplayBuffer, FixedLengthEnvWrapper
@@ -46,12 +47,88 @@ class EvalEpisodeResult:
 class InteractionConf:
     total_env_steps: int = attrs.field(default=int(1e6), validator=attrs.validators.gt(0))
 
-    num_prefill_episodes: int = attrs.field(default=200, validator=attrs.validators.ge(0))
-    num_samples_per_cycle: int = attrs.field(default=500, validator=attrs.validators.ge(0))
-    num_rollouts_per_cycle: int = attrs.field(default=10, validator=attrs.validators.ge(0))
-    num_eval_episodes: int = attrs.field(default=50, validator=attrs.validators.ge(0))
+    # Explicit episode/sample counts override the transition-based defaults.
+    num_prefill_episodes: Optional[int] = attrs.field(
+        default=None, validator=attrs.validators.optional(attrs.validators.ge(0)),
+    )
+    num_samples_per_cycle: Optional[int] = attrs.field(
+        default=None, validator=attrs.validators.optional(attrs.validators.ge(0)),
+    )
+    num_rollouts_per_cycle: Optional[int] = attrs.field(
+        default=None, validator=attrs.validators.optional(attrs.validators.ge(0)),
+    )
+    num_eval_episodes: Optional[int] = attrs.field(
+        default=1000, validator=attrs.validators.optional(attrs.validators.gt(0)),
+    )
+    num_test_episodes: int = attrs.field(default=1000, validator=attrs.validators.gt(0))
+    validation_seed: int = 1_000_000
+    test_seed: int = 2_000_000
+
+    prefill_env_steps: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    env_steps_per_cycle: int = attrs.field(default=500, validator=attrs.validators.gt(0))
+    eval_env_steps: int = attrs.field(default=2_500, validator=attrs.validators.gt(0))
+    optim_steps_per_env_step: float = attrs.field(
+        default=1.0, validator=attrs.validators.gt(0),
+    )
 
     exploration_eps: float = attrs.field(default=0.3, validator=attrs.validators.ge(0))
+
+
+@attrs.frozen
+class ResolvedInteractionSchedule:
+    num_prefill_episodes: int
+    num_samples_per_cycle: int
+    num_rollouts_per_cycle: int
+    num_eval_episodes: int
+
+
+def resolve_interaction_schedule(
+        conf: InteractionConf, episode_length: int) -> ResolvedInteractionSchedule:
+    if episode_length <= 0:
+        raise ValueError(f'episode_length must be positive, got {episode_length}')
+
+    num_prefill_episodes = conf.num_prefill_episodes
+    if num_prefill_episodes is None:
+        num_prefill_episodes = int(np.ceil(conf.prefill_env_steps / episode_length))
+
+    num_rollouts_per_cycle = conf.num_rollouts_per_cycle
+    if num_rollouts_per_cycle is None:
+        num_rollouts_per_cycle = max(1, round(conf.env_steps_per_cycle / episode_length))
+
+    num_samples_per_cycle = conf.num_samples_per_cycle
+    if num_samples_per_cycle is None:
+        cycle_env_steps = num_rollouts_per_cycle * episode_length
+        num_samples_per_cycle = max(
+            1, round(cycle_env_steps * conf.optim_steps_per_env_step),
+        )
+
+    num_eval_episodes = conf.num_eval_episodes
+    if num_eval_episodes is None:
+        num_eval_episodes = max(1, round(conf.eval_env_steps / episode_length))
+
+    return ResolvedInteractionSchedule(
+        num_prefill_episodes=num_prefill_episodes,
+        num_samples_per_cycle=num_samples_per_cycle,
+        num_rollouts_per_cycle=num_rollouts_per_cycle,
+        num_eval_episodes=num_eval_episodes,
+    )
+
+
+def add_gaussian_exploration(
+        action: torch.Tensor, action_space: gym.spaces.Space,
+        std_fraction: float) -> torch.Tensor:
+    """Add Gaussian noise scaled to the environment's finite action bounds."""
+    if std_fraction == 0:
+        return action
+    if not isinstance(action_space, gym.spaces.Box):
+        raise TypeError('Online Gaussian exploration requires a Box action space')
+    low = torch.as_tensor(action_space.low, dtype=action.dtype, device=action.device)
+    high = torch.as_tensor(action_space.high, dtype=action.dtype, device=action.device)
+    if not torch.isfinite(low).all() or not torch.isfinite(high).all():
+        raise ValueError('Online Gaussian exploration requires finite action bounds')
+    scale = (high - low) / 2
+    noisy_action = action + torch.randn_like(action) * std_fraction * scale
+    return torch.maximum(torch.minimum(noisy_action, high), low)
 
 
 class Trainer(object):
@@ -67,8 +144,32 @@ class Trainer(object):
     num_samples_per_cycle: int
     num_rollouts_per_cycle: int
     num_eval_episodes: int
+    num_test_episodes: int
+    validation_seed: int
+    test_seed: int
     exploration_eps: float
     profiler: Optional[TimingProfiler]
+
+    def set_scheduler_horizon(self, total_optim_steps: int) -> None:
+        """Keep restored scheduler progress but use the newly requested horizon."""
+        schedulers = []
+        if self.losses.actor_loss is not None:
+            schedulers.extend((
+                self.losses.actor_loss.actor_sched,
+                self.losses.actor_loss.entropy_weight_sched,
+            ))
+        if (self.losses.goal_set_distance_loss is not None
+                and self.losses.goal_set_distance_loss.sched is not None):
+            schedulers.append(self.losses.goal_set_distance_loss.sched)
+        for critic_loss in self.losses.critic_losses:
+            schedulers.extend((
+                critic_loss.critic_sched,
+                critic_loss.lagrange_mult_sched,
+            ))
+            if critic_loss.latent_dynamics_sched is not None:
+                schedulers.append(critic_loss.latent_dynamics_sched)
+        for scheduler in schedulers:
+            scheduler.T_max = total_optim_steps
 
     def get_total_optim_steps(self, total_env_steps: int):
         current_env_steps = self.replay.num_episodes_realized * self.replay.episode_length
@@ -105,19 +206,44 @@ class Trainer(object):
 
         self.exploration_eps = interaction_conf.exploration_eps
         self.total_env_steps = interaction_conf.total_env_steps
-        self.num_samples_per_cycle = interaction_conf.num_samples_per_cycle
-        self.num_rollouts_per_cycle = interaction_conf.num_rollouts_per_cycle
-        self.num_eval_episodes = interaction_conf.num_eval_episodes
-        self.num_prefill_episodes = interaction_conf.num_prefill_episodes
+        schedule = resolve_interaction_schedule(
+            interaction_conf, replay.episode_length,
+        )
+        self.num_samples_per_cycle = schedule.num_samples_per_cycle
+        self.num_rollouts_per_cycle = schedule.num_rollouts_per_cycle
+        self.num_eval_episodes = schedule.num_eval_episodes
+        self.num_test_episodes = interaction_conf.num_test_episodes
+        self.validation_seed = interaction_conf.validation_seed
+        self.test_seed = interaction_conf.test_seed
+        validation_end = self.validation_seed + self.num_eval_episodes - 1
+        test_end = self.test_seed + self.num_test_episodes - 1
+        if max(self.validation_seed, self.test_seed) <= min(validation_end, test_end):
+            raise ValueError(
+                'validation and test episode seed ranges must be disjoint, got '
+                f'{self.validation_seed}..{validation_end} and '
+                f'{self.test_seed}..{test_end}'
+            )
+        self.num_prefill_episodes = schedule.num_prefill_episodes
+        logging.info(
+            'Resolved interaction schedule for episode_length=%d: '
+            'prefill_episodes=%d, rollouts_per_cycle=%d, '
+            'samples_per_cycle=%d, eval_episodes=%d',
+            replay.episode_length,
+            self.num_prefill_episodes,
+            self.num_rollouts_per_cycle,
+            self.num_samples_per_cycle,
+            self.num_eval_episodes,
+        )
         self.profiler = profiler
         self.replay.transition_history_length = max(
             self.replay.transition_history_length,
             agent_conf.required_transition_history_length,
         )
 
+        total_optim_steps = self.get_total_optim_steps(interaction_conf.total_env_steps)
         self.agent, self.losses = agent_conf.make(
             env_spec=replay.env_spec,
-            total_optim_steps=self.get_total_optim_steps(interaction_conf.total_env_steps),
+            total_optim_steps=total_optim_steps,
             profiler=profiler,
             goal_set_dims=(
                 replay.goal_set_dims
@@ -128,6 +254,7 @@ class Trainer(object):
         )
         self.agent.to(device)
         self.losses.to(device)
+        self.scheduler_horizon = total_optim_steps
         if self.losses.goal_set_distance_loss is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
             self.losses.goal_set_distance_loss.set_candidate_state_provider(
@@ -141,12 +268,12 @@ class Trainer(object):
     def make_collect_env(self) -> FixedLengthEnvWrapper:
         return self.replay.create_env()
 
-    def make_evaluate_env(self) -> FixedLengthEnvWrapper:
+    def make_evaluate_env(self, seed: Optional[int] = None) -> FixedLengthEnvWrapper:
         env = self.replay.create_env()
         # a hack to expose more signal from some envs :)
         if hasattr(env, 'reward_mode') and len(self.replay.env_spec.observation_shape) == 1:
             env.unwrapped.reward_mode = 'dense'
-        env.seed(self.eval_seed)
+        env.seed(self.eval_seed if seed is None else seed)
         return env
 
     def sample(self) -> BatchData:
@@ -187,10 +314,9 @@ class Trainer(object):
             else:
                 with self._record('env/action_sample'):
                     a_t = adistn.sample()
-                    if self.exploration_eps != 0:
-                        # FIXME: this only works with [-1, 1] range!  # a hack :)
-                        a_t += torch.randn_like(a_t).mul_(self.exploration_eps)
-                        a_t.clamp_(-1, 1)
+                    a_t = add_gaussian_exploration(
+                        a_t, space, self.exploration_eps,
+                    )
                 with self._record('env/action_to_cpu'):
                     a = a_t.cpu().numpy()[0]
             return a
@@ -203,23 +329,38 @@ class Trainer(object):
                 self.replay.add_rollout(rollout)
         return rollout
 
-    def evaluate(self) -> EvalEpisodeResult:
-        with self._record('eval/make_env'):
-            env = self.make_evaluate_env()
-        rollouts = []
-        with self._record('eval/rollouts'):
-            for _ in tqdm(range(self.num_eval_episodes), desc='evaluate'):
-                rollouts.append(self.collect_rollout(eval=True, store=False, env=env))
-        with self._record('eval/aggregate'):
-            mrollouts = MultiEpisodeData.cat(rollouts)
-            return EvalEpisodeResult.from_timestep_reward_is_success(
-                mrollouts.rewards.reshape(
-                    self.num_eval_episodes, env.episode_length,
-                ),
-                mrollouts.transition_infos['is_success'].reshape(
-                    self.num_eval_episodes, env.episode_length,
-                ),
-            )
+    def evaluate(
+            self, *, num_episodes: Optional[int] = None,
+            seed: Optional[int] = None) -> EvalEpisodeResult:
+        num_episodes = self.num_eval_episodes if num_episodes is None else num_episodes
+        if num_episodes <= 0:
+            raise ValueError(f'num_episodes must be positive, got {num_episodes}')
+
+        rng_state = utils.rng_state_dict()
+        env = None
+        try:
+            episode_seed_start = self.eval_seed if seed is None else int(seed)
+            with self._record('eval/make_env'):
+                env = self.make_evaluate_env(episode_seed_start)
+            rollouts = []
+            with self._record('eval/rollouts'):
+                for episode_idx in tqdm(range(num_episodes), desc='evaluate'):
+                    env.seed(episode_seed_start + episode_idx)
+                    rollouts.append(self.collect_rollout(eval=True, store=False, env=env))
+            with self._record('eval/aggregate'):
+                mrollouts = MultiEpisodeData.cat(rollouts)
+                return EvalEpisodeResult.from_timestep_reward_is_success(
+                    mrollouts.rewards.reshape(
+                        num_episodes, env.episode_length,
+                    ),
+                    mrollouts.transition_infos['is_success'].reshape(
+                        num_episodes, env.episode_length,
+                    ),
+                )
+        finally:
+            if env is not None:
+                env.close()
+            utils.load_rng_state(rng_state)
 
     def iter_training_data(self, *, start_cycle_sample: int = 0) -> Iterator[Tuple[int, bool, BatchData, InfoT]]:
         r"""

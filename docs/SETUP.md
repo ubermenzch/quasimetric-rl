@@ -146,6 +146,18 @@ preferences do not leak into the repository. The setup script creates an empty
 runtime task list at `runs/qrl_queue/tasks.tsv`; add local task rows there
 before starting the scheduler.
 
+Stop only the scheduler while allowing its current training jobs to finish:
+
+```bash
+tools/stop_qrl_queue.sh
+```
+
+Stop the scheduler and all jobs in its process group:
+
+```bash
+tools/stop_qrl_queue.sh --with-jobs
+```
+
 Queue rows use seven tab-separated columns: `task_id`, `mode`, `env_name`,
 `seed`, `steps`, `params`, and `extra_args`. Record total agent parameters in
 `params` when adding the task, either as an integer or a compact value such as

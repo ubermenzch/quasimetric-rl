@@ -171,6 +171,14 @@ GOAL_SET_DIMS_REGISTRY: Mapping[Tuple[str, str], Tuple[int, ...]] = {
     ('gcrl', 'FetchReach'): (0, 1, 2),
     ('gcrl', 'FetchPush'): (3, 4, 5),
     ('gcrl', 'FetchSlide'): (3, 4, 5),
+    ('gcrl', 'FetchPickAndPlace'): (3, 4, 5),
+    ('gym_mujoco', 'Reacher-v4'): (0, 1),
+    ('gym_mujoco', 'Pusher-v4'): (0, 1, 2),
+    ('gym_mujoco', 'AntNavigate-v4'): (0, 1),
+    ('dmc', 'reacher_easy'): (0, 1),
+    ('dmc', 'reacher_hard'): (0, 1),
+    ('dmc', 'manipulator_bring_ball'): (0, 1),
+    ('dmc', 'manipulator_bring_peg'): (0, 1, 2, 3),
 }
 
 

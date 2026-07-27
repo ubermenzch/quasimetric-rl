@@ -226,6 +226,16 @@ class QRLLosses(Module):
 
 @attrs.define(kw_only=True)
 class QRLConf:
+    # Informational label populated by reusable model-size presets.
+    model_size: Optional[str] = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(
+            attrs.validators.in_((
+                'QRL-S', 'QRL-M', 'QRL-L',
+                'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L',
+            ))
+        ),
+    )
     actor: Optional['actor.ActorConf'] = actor.ActorConf()
     quasimetric_critic: 'quasimetric_critic.QuasimetricCriticConf' = quasimetric_critic.QuasimetricCriticConf()
     goal_set_distance: 'goal_set_distance_module.GoalSetDistanceConf' = (
@@ -252,6 +262,7 @@ class QRLConf:
              profiler: Optional[TimingProfiler] = None,
              goal_set_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
         encoder_conf = self.quasimetric_critic.model.encoder
+        encoder_conf.resolve_split_parameterization(env_spec=env_spec)
         latent_goal_mode = (
             'none'
             if self.actor is None
@@ -276,10 +287,6 @@ class QRLConf:
                 )
             if encoder_conf.kind != 'split':
                 raise ValueError('Latent goal optimization requires encoder.kind=split')
-            if self.actor.losses.min_dist.add_goal_as_future_state:
-                raise ValueError(
-                    'Latent goal optimization requires add_goal_as_future_state=false'
-                )
         if self.goal_set_distance.enabled:
             implementation = self.goal_set_distance.losses.implementation
             gsd_schedule = 'critic_then_dynamics_then_goal_set_distance_then_actor'

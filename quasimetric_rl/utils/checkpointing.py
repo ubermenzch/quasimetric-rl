@@ -14,7 +14,7 @@ import torch
 RESUME_CHECKPOINT_FILENAME = "checkpoint_resume_latest.pth"
 _AGENT_CHECKPOINT_RE = re.compile(r"agent_checkpoint_step(\d+)\.pth$")
 _FULL_CHECKPOINT_RE = re.compile(
-    r"checkpoint_(\d+)_(\d+)(?:_final)?\.pth$"
+    r"checkpoint_(?:(\d+)_(\d+)|env(\d+)_opt(\d+))(?:_final)?\.pth$"
 )
 
 
@@ -33,9 +33,11 @@ def full_checkpoint_key(path: str | os.PathLike[str]) -> tuple[int, int, int] | 
     match = _FULL_CHECKPOINT_RE.fullmatch(Path(path).name)
     if match is None:
         return None
+    first = match.group(1) or match.group(3)
+    second = match.group(2) or match.group(4)
     return (
-        int(match.group(1)),
-        int(match.group(2)),
+        int(first),
+        int(second),
         int(Path(path).name.endswith("_final.pth")),
     )
 

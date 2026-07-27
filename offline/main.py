@@ -24,6 +24,7 @@ from quasimetric_rl import utils, pdb_if_DEBUG, FLAGS
 from quasimetric_rl.utils.steps_counter import StepsCounter
 from quasimetric_rl.modules import InfoT
 from quasimetric_rl.base_conf import BaseConf
+from quasimetric_rl.model_size import register_model_size_presets
 
 from .trainer import Trainer
 
@@ -65,6 +66,7 @@ class Conf(BaseConf):
 
 cs = hydra.core.config_store.ConfigStore.instance()
 cs.store(name='config', node=Conf())
+register_model_size_presets(cs)
 
 
 @pdb_if_DEBUG

@@ -31,10 +31,15 @@ try:
     if not hasattr(slide, 'FetchSlideEnv'):
         slide.FetchSlideEnv = slide.MujocoPyFetchSlideEnv
 
+    from gym_robotics.envs.fetch import pick_and_place
+    if not hasattr(pick_and_place, 'FetchPickAndPlaceEnv'):
+        pick_and_place.FetchPickAndPlaceEnv = pick_and_place.MujocoPyFetchPickAndPlaceEnv
+
 except ImportError:
     from gym.envs.robotics.fetch import push
     from gym.envs.robotics.fetch import reach
     from gym.envs.robotics.fetch import slide
+    from gym.envs.robotics.fetch import pick_and_place
 import numpy as np
 
 
@@ -183,6 +188,47 @@ class FetchSlideEnv(slide.FetchSlideEnv):
         g[:start_index] = observation['desired_goal']
         g[start_index:end_index] = observation['desired_goal']
         return np.concatenate([s, g]).astype(np.float32)
+
+
+class FetchPickAndPlaceEnv(pick_and_place.FetchPickAndPlaceEnv):
+    """Wrapper for the Fetch pick-and-place environment."""
+
+    def __init__(self, reward_mode='positive'):
+        self.reward_mode = reward_mode
+        super().__init__()
+        self._old_observation_space = self.observation_space
+        self._new_observation_space = gym.spaces.Box(
+            low=np.full((50,), -np.inf),
+            high=np.full((50,), np.inf),
+            dtype=np.float32,
+        )
+        self.observation_space = self._new_observation_space
+
+    def reset(self):
+        self.observation_space = self._old_observation_space
+        state = super().reset()
+        self.observation_space = self._new_observation_space
+        return self.observation(state)
+
+    def step(self, action):
+        state = super().step(action)[0]
+        distance = np.linalg.norm(state['achieved_goal'] - state['desired_goal'])
+        is_success = float(distance < 0.05)
+        info = dict(is_success=is_success)
+        reward = get_reward(distance / 0.05, self.reward_mode)
+        return self.observation(state), reward, False, info
+
+    def observation(self, observation):
+        start_index, end_index = 3, 6
+        assert np.all(
+            observation['achieved_goal']
+            == observation['observation'][start_index:end_index]
+        )
+        state = observation['observation']
+        goal = np.zeros_like(state)
+        goal[:start_index] = observation['desired_goal']
+        goal[start_index:end_index] = observation['desired_goal']
+        return np.concatenate([state, goal]).astype(np.float32)
 
 
 class FetchReachImageEnv(reach.FetchReachEnv):
