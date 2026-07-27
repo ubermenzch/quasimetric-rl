@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Provision the reproducible D4RL/MuJoCo environment used by this repository.
+# Provision the reproducible D4RL and online simulator environment used here.
 # The default downloads roughly 1.6 GB of D4RL data in addition to Python
 # packages. All assets remain outside the Git checkout.
 
@@ -16,11 +16,14 @@ ANTMAZE_V2_DATASET_URL="${ANTMAZE_V2_DATASET_URL:-http://rail.eecs.berkeley.edu/
 DOWNLOAD_RETRIES="${DOWNLOAD_RETRIES:-3}"
 MICROMAMBA_URL="${MICROMAMBA_URL:-https://micro.mamba.pm/api/micromamba/linux-64/latest}"
 BOOTSTRAP_PYTHON="${BOOTSTRAP_PYTHON:-}"
+PIP_RETRIES="${PIP_RETRIES:-3}"
 
 INSTALL_SUBMODULES=1
 INSTALL_PYTHON=1
 INSTALL_MUJOCO=1
 INSTALL_DATASETS=1
+INSTALL_SIMULATORS=1
+SIMULATORS_ONLY=0
 VERIFY=1
 
 
@@ -28,19 +31,23 @@ usage() {
     cat <<'EOF'
 Usage: tools/setup_environment.sh [options]
 
-Initialize Git submodules, create the Python environment, install MuJoCo 2.1.0,
-and download the D4RL datasets required by the Maze2D and AntMaze experiments.
+Initialize Git submodules, create the Python environment, install online
+simulators and MuJoCo 2.1.0, and download the D4RL Maze2D/AntMaze datasets.
 
 Options:
   --skip-submodules Do not initialize Git submodules.
   --skip-python     Do not create or install the Python virtual environment.
   --skip-mujoco     Do not download MuJoCo 2.1.0.
   --skip-datasets   Do not download D4RL datasets.
+  --skip-simulators Do not install or verify online simulator packages.
+  --simulators-only Only update and verify online simulators in an existing venv.
+                    This skips submodules and D4RL datasets.
   --skip-verify     Do not run the final CUDA/MuJoCo/D4RL preflight.
   -h, --help        Show this help message.
 
 Environment overrides:
   QRL_ASSET_ROOT, QRL_QUEUE_TASKS_FILE, VENV_DIR, PYTHON_BIN, TORCH_INDEX_URL, BOOTSTRAP_PYTHON,
+  PIP_RETRIES,
   MICROMAMBA_URL, MICROMAMBA_ROOT, QRL_USER_GRAPHICS_PREFIX,
   MUJOCO_URL, MUJOCO_ARCHIVE_SHA256, MAZE2D_DATASET_URL,
   ANTMAZE_V2_DATASET_URL, D4RL_DATASET_MANIFEST, DOWNLOAD_RETRIES.
@@ -54,6 +61,13 @@ while [[ $# -gt 0 ]]; do
         --skip-python) INSTALL_PYTHON=0 ;;
         --skip-mujoco) INSTALL_MUJOCO=0 ;;
         --skip-datasets) INSTALL_DATASETS=0 ;;
+        --skip-simulators) INSTALL_SIMULATORS=0 ;;
+        --simulators-only)
+            SIMULATORS_ONLY=1
+            INSTALL_SUBMODULES=0
+            INSTALL_PYTHON=0
+            INSTALL_DATASETS=0
+            ;;
         --skip-verify) VERIFY=0 ;;
         -h|--help)
             usage
@@ -67,6 +81,11 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+if [[ "${SIMULATORS_ONLY}" -eq 1 && "${INSTALL_SIMULATORS}" -eq 0 ]]; then
+    echo "--simulators-only and --skip-simulators cannot be used together." >&2
+    exit 2
+fi
 
 if [[ "${ASSET_ROOT}" != /* ]]; then
     ASSET_ROOT="${ROOT_DIR}/${ASSET_ROOT}"
@@ -422,6 +441,31 @@ install_datasets() {
 }
 
 
+install_online_simulators() {
+    local requirements_file="${ROOT_DIR}/requirements/online-simulators-py39.txt"
+    if [[ ! -f "${requirements_file}" ]]; then
+        echo "Simulator requirements do not exist: ${requirements_file}" >&2
+        exit 1
+    fi
+    echo "Installing or repairing the pinned local online simulator stack."
+    # The source server uses Gym 0.18 legacy MuJoCo backends. Their dynamics
+    # differ from Gymnasium v4, so remove packages that would make the adapter
+    # silently select another backend.
+    if "${VENV_PYTHON}" -m pip show gymnasium >/dev/null 2>&1 || \
+            "${VENV_PYTHON}" -m pip show gymnasium-robotics >/dev/null 2>&1; then
+        echo "Removing Gymnasium packages to match the source server backends."
+        "${VENV_PYTHON}" -m pip uninstall --yes gymnasium gymnasium-robotics
+    fi
+    "${VENV_PYTHON}" -m pip install \
+        --retries "${PIP_RETRIES}" --prefer-binary \
+        -r "${requirements_file}"
+    # Gym 0.18.0's Pillow<=7.2.0 metadata cannot be satisfied by a Python 3.9
+    # binary wheel. Its runtime dependencies are pinned in the file above.
+    "${VENV_PYTHON}" -m pip install \
+        --retries "${PIP_RETRIES}" --no-deps "gym==0.18.0"
+}
+
+
 initialize_queue_tasks() {
     if [[ -e "${QUEUE_TASKS_FILE}" ]]; then
         echo "Queue task list already exists: ${QUEUE_TASKS_FILE}"
@@ -452,6 +496,14 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
     echo "Run without --skip-python or set VENV_DIR to an existing environment." >&2
     exit 1
 fi
+if ! "${VENV_PYTHON}" - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info[:2] == (3, 9) else 1)
+PY
+then
+    echo "Existing virtual environment must use Python 3.9: ${VENV_DIR}" >&2
+    exit 1
+fi
 install_user_graphics_dependencies
 if [[ "${INSTALL_MUJOCO}" -eq 1 ]]; then
     install_mujoco
@@ -459,10 +511,18 @@ fi
 if [[ "${INSTALL_DATASETS}" -eq 1 ]]; then
     install_datasets
 fi
+if [[ "${INSTALL_SIMULATORS}" -eq 1 ]]; then
+    install_online_simulators
+fi
 if [[ "${VERIFY}" -eq 1 ]]; then
     source "${ROOT_DIR}/tools/qrl_env.sh"
-    "${VENV_PYTHON}" "${ROOT_DIR}/tools/verify_environment.py" \
-        --checksums --smoke --require-cuda
+    if [[ "${SIMULATORS_ONLY}" -eq 0 ]]; then
+        "${VENV_PYTHON}" "${ROOT_DIR}/tools/verify_environment.py" \
+            --checksums --smoke --require-cuda
+    fi
+    if [[ "${INSTALL_SIMULATORS}" -eq 1 ]]; then
+        "${VENV_PYTHON}" "${ROOT_DIR}/tools/verify_online_simulators.py"
+    fi
 fi
 
 echo "Setup complete. Asset root: ${ASSET_ROOT}"

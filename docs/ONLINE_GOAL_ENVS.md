@@ -11,9 +11,9 @@ be used by both QRL and vector-observation GO-QRL agents.
 | `gcrl` | `FetchPush` | 50 | `[3,4,5]` | Gym Fetch robotics |
 | `gcrl` | `FetchSlide` | 50 | `[3,4,5]` | Gym Fetch robotics |
 | `gcrl` | `FetchPickAndPlace` | 50 | `[3,4,5]` | Gym Fetch robotics |
-| `gym_mujoco` | `Reacher-v4` | 50 | `[0,1]` | Gymnasium v4, or local Gym v2 fallback |
-| `gym_mujoco` | `Pusher-v4` | 100 | `[0,1,2]` | Gymnasium v4, or local Gym v2 fallback |
-| `gym_mujoco` | `AntNavigate-v4` | 1000 | `[0,1]` | Gymnasium Ant-v4, or local Gym Ant-v3 fallback |
+| `gym_mujoco` | `Reacher-v4` | 50 | `[0,1]` | Pinned local Gym `Reacher-v2` backend |
+| `gym_mujoco` | `Pusher-v4` | 100 | `[0,1,2]` | Pinned local Gym `Pusher-v2` backend |
+| `gym_mujoco` | `AntNavigate-v4` | 1000 | `[0,1]` | Pinned local Gym `Ant-v3` backend |
 | `dmc` | `reacher_easy` | 1000 | `[0,1]` | dm_control |
 | `dmc` | `reacher_hard` | 1000 | `[0,1]` | dm_control |
 | `dmc` | `manipulator_bring_ball` | 1000 | `[0,1]` | dm_control |
@@ -128,9 +128,14 @@ removes the old `COMPLETE` marker only after validating the resume checkpoint,
 and writes it again after the extended validation and test phases finish. The
 same command can later target 400k or any larger absolute step count.
 
-The current project environment already contains `dm-control`. Install
-Gymnasium with its MuJoCo dependencies to use the exact v4 Gym backends. When
-Gymnasium is absent, the adapters use the compatible Gym versions available in
-the pinned legacy environment so that the existing D4RL installation remains
-unchanged. Source `tools/qrl_env.sh` before using that legacy fallback so
-`mujoco-py` can find the repository's MuJoCo 2.1 runtime.
+Install or repair the DMC and Gym MuJoCo dependencies in an existing project
+environment with:
+
+```bash
+tools/setup_environment.sh --simulators-only
+```
+
+This also smoke-tests every DMC and Gym MuJoCo environment listed above. The
+requirements intentionally match the source server: `dm-control==1.0.3` and
+the Gym 0.18 legacy backends (`Reacher-v2`, `Pusher-v2`, and `Ant-v3`) behind
+the task-facing names in this table.

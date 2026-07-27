@@ -52,12 +52,32 @@ the host Python installation. It also installs the X11 protocol, X11, and GLEW
 development headers plus `patchelf` required by `mujoco-py` into
 `../qrl-assets/micromamba/envs/graphics/`; this avoids requiring root access
 when a server lacks `X11/Xlib.h`. `--skip-submodules`, `--skip-python`,
-`--skip-mujoco`, `--skip-datasets`, and `--skip-verify` allow partial setup.
+`--skip-mujoco`, `--skip-datasets`, `--skip-simulators`, and `--skip-verify`
+allow partial setup.
 It accepts `QRL_ASSET_ROOT` for a different asset location and URL overrides
 for an internal mirror. Pip uses its default 15-second socket timeout and the
 bootstrap script uses 3 retries for package downloads. MuJoCo and every dataset
 are validated before use. Asset paths are normalized before launching
 `mujoco-py`, whose legacy loader requires canonical library paths.
+
+To add only the online DMC and Gym MuJoCo simulators to a server that already
+has this repository's `.venv`, run:
+
+```bash
+git pull
+tools/setup_environment.sh --simulators-only
+```
+
+This is an incremental installation: matching packages and an existing MuJoCo
+2.1 runtime are retained, while missing or mismatched components are repaired.
+It does not initialize submodules, download D4RL datasets, or rebuild the
+virtual environment. The pinned versions and legacy Gym backends match the
+environment used on the source server. To prevent a silent backend change, it
+removes Gymnasium packages if they are present in that project virtual
+environment. Finally, the command creates, resets, and steps all four DMC tasks
+and all three Gym MuJoCo tasks. Set
+`VENV_DIR=/path/to/venv` if the existing environment is not `.venv` in the
+repository root.
 
 NVIDIA drivers and the driver-provided EGL/OpenGL runtime cannot be installed
 in a Python virtual environment. They are normally already present on an AI

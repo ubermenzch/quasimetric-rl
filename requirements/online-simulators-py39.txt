@@ -1,0 +1,5 @@
+# Keep online simulators identical to the repository's local Python 3.9 stack.
+# Gym 0.18.0 is installed separately with --no-deps because its stale Pillow
+# metadata conflicts with the pinned binary Pillow wheel.
+
+-r offline-py39.txt
