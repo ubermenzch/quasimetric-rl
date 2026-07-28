@@ -376,6 +376,37 @@ class ReplayBuffer(Dataset):
         )
         return self[indices]
 
+    def sample_uniform_future_pairs(self, batch_size: int) -> BatchData:
+        """Sample the ordered within-trajectory state pairs used by GCSL."""
+        if self.num_episodes_realized <= 0:
+            raise RuntimeError('Cannot sample from an empty replay buffer')
+        if self.episode_length <= 1:
+            raise RuntimeError('Uniform future-pair sampling requires horizon > 1')
+
+        episode_indices = np.random.choice(
+            self.num_episodes_realized, size=[batch_size],
+        )
+        first = np.floor(
+            np.random.rand(batch_size) * (self.episode_length - 1)
+        ).astype(np.int64)
+        second = np.floor(
+            np.random.rand(batch_size) * self.episode_length
+        ).astype(np.int64)
+        second[first == second] += 1
+        state_timesteps = np.minimum(first, second)
+        goal_timesteps = np.maximum(first, second)
+
+        transition_indices = torch.from_numpy(
+            episode_indices * self.episode_length + state_timesteps
+        ).to(torch.int64)
+        future_observation_indices = torch.from_numpy(
+            episode_indices * (self.episode_length + 1) + goal_timesteps
+        ).to(torch.int64)
+        return attrs.evolve(
+            self[transition_indices],
+            future_observations=self.get_observations(future_observation_indices),
+        )
+
     def get_dataloader(self, *args, **kwargs):
         raise RuntimeError('Online data cannot be loaded as a dataloader')
 

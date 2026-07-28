@@ -5,7 +5,7 @@ import attrs
 
 import torch
 
-from . import actor, quasimetric_critic
+from . import actor, quasimetric_critic, gcrl_baselines
 from . import goal_set_distance as goal_set_distance_module
 from .quasimetric_critic.models.encoder import SplitEncoder
 
@@ -226,6 +226,11 @@ class QRLLosses(Module):
 
 @attrs.define(kw_only=True)
 class QRLConf:
+    algorithm: str = attrs.field(
+        default='qrl',
+        validator=attrs.validators.in_(('qrl', *gcrl_baselines.BASELINE_ALGORITHMS)),
+    )
+    baselines: 'gcrl_baselines.GCRLBaselinesConf' = gcrl_baselines.GCRLBaselinesConf()
     # Informational label populated by reusable model-size presets.
     model_size: Optional[str] = attrs.field(
         default=None,
@@ -253,6 +258,8 @@ class QRLConf:
 
     @property
     def required_transition_history_length(self) -> int:
+        if self.algorithm != 'qrl':
+            return 0
         latent_dynamics_conf = self.quasimetric_critic.model.latent_dynamics
         if latent_dynamics_conf.kind == 'transformer':
             return latent_dynamics_conf.history_length
@@ -261,6 +268,16 @@ class QRLConf:
     def make(self, *, env_spec: EnvSpec, total_optim_steps: int,
              profiler: Optional[TimingProfiler] = None,
              goal_set_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
+        if self.algorithm != 'qrl':
+            if goal_set_dims is None:
+                raise ValueError(
+                    f'agent.algorithm={self.algorithm} requires registered goal dimensions'
+                )
+            return self.baselines.make(
+                self.algorithm,
+                env_spec=env_spec,
+                goal_dims=goal_set_dims,
+            )
         encoder_conf = self.quasimetric_critic.model.encoder
         encoder_conf.resolve_split_parameterization(env_spec=env_spec)
         latent_goal_mode = (
@@ -342,4 +359,7 @@ class QRLConf:
             goal_set_distance_loss=goal_set_distance_loss,
             profiler=profiler)
 
-__all__ = ['QRLAgent', 'QRLLosses', 'QRLConf', 'InfoT']
+__all__ = [
+    'QRLAgent', 'QRLLosses', 'QRLConf', 'InfoT',
+    'gcrl_baselines',
+]

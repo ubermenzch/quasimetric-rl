@@ -109,6 +109,23 @@ class BaseConf(abc.ABC):
         if self.output_dir is not None:
             raise RuntimeError('setup_for_experiment() can only be called once')
 
+        if self.output_folder is None and self.agent.algorithm != 'qrl':
+            algorithm = self.agent.algorithm
+            conf_name = 'gcbc' if algorithm == 'gcsl' else algorithm
+            baseline_conf = getattr(self.agent.baselines, conf_name)
+            hidden_sizes = 'x'.join(map(str, baseline_conf.hidden_sizes))
+            specs = [
+                algorithm,
+                f'h={hidden_sizes}',
+                f'seed={self.seed}',
+            ]
+            if self.output_folder_suffix is not None:
+                specs.append(self.output_folder_suffix)
+            self.output_folder = os.path.join(
+                f'{self.env.kind}_{self.env.name}',
+                '_'.join(specs),
+            )
+
         if self.output_folder is None:
             specs = [
                 self.agent.quasimetric_critic.model.quasimetric_model.quasimetric_head_spec,

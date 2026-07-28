@@ -149,9 +149,13 @@ class Trainer(object):
     test_seed: int
     exploration_eps: float
     profiler: Optional[TimingProfiler]
+    replay_sampling: str
 
     def set_scheduler_horizon(self, total_optim_steps: int) -> None:
         """Keep restored scheduler progress but use the newly requested horizon."""
+        if hasattr(self.losses, 'set_scheduler_horizon'):
+            self.losses.set_scheduler_horizon(total_optim_steps)
+            return
         schedulers = []
         if self.losses.actor_loss is not None:
             schedulers.extend((
@@ -235,6 +239,15 @@ class Trainer(object):
             self.num_eval_episodes,
         )
         self.profiler = profiler
+        self.replay_sampling = (
+            'uniform_future_pair'
+            if agent_conf.algorithm in ('gcbc', 'gcsl')
+            else 'geometric_future'
+        )
+        if agent_conf.algorithm == 'crl':
+            self.replay.future_observation_discount = (
+                agent_conf.baselines.crl.discount
+            )
         self.replay.transition_history_length = max(
             self.replay.transition_history_length,
             agent_conf.required_transition_history_length,
@@ -247,15 +260,19 @@ class Trainer(object):
             profiler=profiler,
             goal_set_dims=(
                 replay.goal_set_dims
-                if agent_conf.goal_set_distance.enabled
-                and agent_conf.goal_set_distance.losses.goal_dims is None
-                else None
+                if agent_conf.algorithm != 'qrl'
+                else (
+                    replay.goal_set_dims
+                    if agent_conf.goal_set_distance.enabled
+                    and agent_conf.goal_set_distance.losses.goal_dims is None
+                    else None
+                )
             ),
         )
         self.agent.to(device)
         self.losses.to(device)
         self.scheduler_horizon = total_optim_steps
-        if self.losses.goal_set_distance_loss is not None:
+        if getattr(self.losses, 'goal_set_distance_loss', None) is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
             self.losses.goal_set_distance_loss.set_candidate_state_provider(
                 replay.sample_goal_conditioned_observations
@@ -278,7 +295,10 @@ class Trainer(object):
 
     def sample(self) -> BatchData:
         with self._record('data/sample_replay'):
-            batch = self.replay.sample(self.batch_size)
+            if self.replay_sampling == 'uniform_future_pair':
+                batch = self.replay.sample_uniform_future_pairs(self.batch_size)
+            else:
+                batch = self.replay.sample(self.batch_size)
         with self._record('data/to_device'):
             return batch.to(self.device)
 

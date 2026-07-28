@@ -110,6 +110,11 @@ the active queue by `tools/generate_online_goal_env_tasks.py`. The schemes are
 Base, GO-QRL+Max4, GO-QRL+Min4, GO-QRL+Max4+LN+RMSG, and
 GO-QRL+Min4+LN+RMSG.
 
+TD-InfoNCE, CRL, GCSL/GCBC, and C-Learning use the same online collection,
+checkpoint validation, and best-checkpoint test protocol. Their implementation
+and seven-environment task matrix are documented in
+[`GCRL_BASELINES.md`](GCRL_BASELINES.md).
+
 ## Continue a completed run
 
 Stop the queue scheduler, then continue any completed online task in place by
