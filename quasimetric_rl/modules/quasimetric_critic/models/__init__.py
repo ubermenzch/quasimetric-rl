@@ -22,6 +22,10 @@ class QuasimetricCritic(Module):
         encoder: Encoder.Conf = Encoder.Conf()
         quasimetric_model: QuasimetricModel.Conf = QuasimetricModel.Conf()
         latent_dynamics: LatentDynamics.Conf = LatentDynamics.Conf()
+        dynamics_output_normalization: str = attrs.field(
+            default='encoder',
+            validator=attrs.validators.in_(('encoder', 'none')),
+        )
 
         def make(self, *, env_spec: EnvSpec) -> 'QuasimetricCritic':
             encoder = self.encoder.make(
@@ -34,22 +38,40 @@ class QuasimetricCritic(Module):
                 latent_size=encoder.latent_size,
                 env_spec=env_spec,
             )
-            return QuasimetricCritic(encoder, quasimetric_model, latent_dynamics)
+            return QuasimetricCritic(
+                encoder,
+                quasimetric_model,
+                latent_dynamics,
+                dynamics_output_normalization=self.dynamics_output_normalization,
+            )
 
     encoder: Union[Encoder, SplitEncoder]
     quasimetric_model: QuasimetricModel
     latent_dynamics: LatentDynamics
+    dynamics_output_normalization: str
 
     raw_lagrange_multiplier: nn.Parameter  # for the QRL constrained optimization
 
 
     def __init__(self, encoder: Union[Encoder, SplitEncoder],
                  quasimetric_model: QuasimetricModel,
-                 latent_dynamics: LatentDynamics):
+                 latent_dynamics: LatentDynamics, *,
+                 dynamics_output_normalization: str = 'encoder'):
         super().__init__()
         self.encoder = encoder
         self.quasimetric_model = quasimetric_model
         self.latent_dynamics = latent_dynamics
+        self.dynamics_output_normalization = dynamics_output_normalization
+
+    def _normalize_dynamics_output(self, predicted: torch.Tensor) -> torch.Tensor:
+        if self.dynamics_output_normalization == 'encoder':
+            return self.encoder.normalize_latent(predicted)
+        if self.dynamics_output_normalization == 'none':
+            return predicted
+        raise ValueError(
+            'Unknown dynamics output normalization: '
+            f'{self.dynamics_output_normalization!r}'
+        )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, *, action: Optional[torch.Tensor] = None) -> torch.Tensor:
         # The basic interface is a V- or Q-function.
@@ -61,7 +83,9 @@ class QuasimetricCritic(Module):
 
     def predict_next_latent(
             self, zx: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.encoder.normalize_latent(self.latent_dynamics(zx, action))
+        return self._normalize_dynamics_output(
+            self.latent_dynamics(zx, action)
+        )
 
     def predict_next_latent_sequence(
             self, z_history: torch.Tensor, action_history: torch.Tensor,
@@ -73,7 +97,7 @@ class QuasimetricCritic(Module):
             action_history,
             history_mask,
         )
-        return self.encoder.normalize_latent(predicted)
+        return self._normalize_dynamics_output(predicted)
 
     # for type hints
     def __call__(self, x: torch.Tensor, y: torch.Tensor, *, action: Optional[torch.Tensor] = None) -> torch.Tensor:

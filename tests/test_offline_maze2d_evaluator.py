@@ -12,6 +12,7 @@ from unittest.mock import patch
 import gym
 import numpy as np
 import torch
+from quasimetric_rl.utils import full_checkpoint_key
 
 from tools.evaluate_offline_maze2d import (
     ALL_CHECKPOINT_NUM_EPISODES,
@@ -26,6 +27,8 @@ from tools.evaluate_offline_maze2d import (
     find_evaluation_checkpoints,
     format_cpu_cores,
     make_evaluation_tasks,
+    make_goal,
+    observation_and_desired_goal,
     parse_args as parse_evaluator_args,
     parse_gpu_ids,
     parse_selection_criteria,
@@ -51,8 +54,35 @@ class EvaluationArgumentTest(unittest.TestCase):
 
         self.assertEqual(args.action_mode, "mean")
 
+    def test_goal_conditioned_observation_uses_full_desired_goal(self):
+        observation = np.arange(6, dtype=np.float32)
+        desired_goal = np.arange(6, dtype=np.float32) + 10
+
+        actual_observation, actual_goal = observation_and_desired_goal({
+            "observation": observation,
+            "achieved_goal": observation,
+            "desired_goal": desired_goal,
+        })
+
+        np.testing.assert_array_equal(actual_observation, observation)
+        np.testing.assert_array_equal(actual_goal, desired_goal)
+        np.testing.assert_array_equal(
+            make_goal(observation, observation, actual_goal, "target_zero"),
+            desired_goal,
+        )
+
 
 class CheckpointSelectionTest(unittest.TestCase):
+    def test_parses_online_full_checkpoint_names(self):
+        self.assertEqual(
+            full_checkpoint_key("checkpoint_env00100000_opt00090500.pth"),
+            (100000, 90500, 0),
+        )
+        self.assertEqual(
+            full_checkpoint_key("checkpoint_env00100000_opt00090500_final.pth"),
+            (100000, 90500, 1),
+        )
+
     def test_selects_agent_steps_but_never_rolling_resume(self):
         with TemporaryDirectory() as temp_dir:
             result_dir = Path(temp_dir)

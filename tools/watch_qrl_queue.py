@@ -621,6 +621,10 @@ def task_variant(task: Task) -> str:
     branch_normalization = extra_arg_value(
         task.extra_args, "agent.quasimetric_critic.model.encoder.branch_normalization"
     )
+    dynamics_output_normalization = extra_arg_value(
+        task.extra_args,
+        "agent.quasimetric_critic.model.dynamics_output_normalization",
+    )
     named_latent_variant = re.search(
         r"_(GO-QRL(?:\+|-)(?:Max|Min)\d+|SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|-|\+|$)",
         task.task_id,
@@ -639,13 +643,16 @@ def task_variant(task: Task) -> str:
                 task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
             )
             mode_label = f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
-            variant = f"GO-QRL+{mode_label}"
+            modules = ["GO-QRL", mode_label]
             if latent_goal_search == "residual":
-                variant += "+Res"
+                modules.append("Res")
             if branch_normalization == "layernorm":
-                variant += "+LN"
+                modules.append(
+                    "LNv1" if dynamics_output_normalization == "none" else "LN"
+                )
             if latent_goal_optim == "rmsg":
-                variant += "+RMSG"
+                modules.append("RMSG")
+            variant = "+".join(modules)
         elif named_latent_variant and (
                 named_latent_variant.group(1).startswith("SplitLatent")
                 or named_latent_variant.group(1).startswith("GO-QRL")):
