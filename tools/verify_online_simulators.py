@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--suite',
-        choices=('all', 'dmc', 'gym-mujoco'),
+        choices=('all', 'dmc', 'gym-mujoco', 'online-maze'),
         default='all',
         help='Limit verification to one simulator family.',
     )
@@ -123,6 +123,21 @@ def main() -> None:
             smoke_environment(
                 'gym_mujoco', name, create_gym_env,
                 expected_backend=expected_backends[name],
+            )
+
+    if args.suite in ('all', 'online-maze'):
+        print(
+            f'gym={package_version("gym", "0.18.0")}, '
+            f'mujoco-py={package_version("mujoco-py", "2.1.2.14")}'
+        )
+        from quasimetric_rl.data.online.maze2d import (
+            TASK_SPECS as maze_tasks,
+            create_env_from_spec as create_maze_env,
+        )
+        for name, spec in maze_tasks.items():
+            smoke_environment(
+                'online_maze', name, create_maze_env,
+                expected_backend=spec['backend_id'],
             )
 
     print('Online simulator verification passed.')

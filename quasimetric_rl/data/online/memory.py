@@ -475,4 +475,4 @@ class ReplayBuffer(Dataset):
         return '\n'.join(lines)
 
 
-from . import dmc, gcrl, gym_mujoco  # register
+from . import dmc, gcrl, gym_mujoco, maze2d  # register

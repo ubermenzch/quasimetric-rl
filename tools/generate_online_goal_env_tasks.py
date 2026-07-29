@@ -45,7 +45,7 @@ ENVIRONMENT_DIMS = {
     ('gcrl', 'FetchPickAndPlace'): (25, 4, 3),
     ('gym_mujoco', 'Reacher-v4'): (8, 2, 2),
     ('gym_mujoco', 'Pusher-v4'): (20, 7, 3),
-    ('gym_mujoco', 'AntNavigate-v4'): (113, 8, 2),
+    ('gym_mujoco', 'AntNavigate-v4'): (29, 8, 2),
     ('dmc', 'reacher_easy'): (6, 2, 2),
     ('dmc', 'reacher_hard'): (6, 2, 2),
     ('dmc', 'manipulator_bring_ball'): (40, 5, 2),

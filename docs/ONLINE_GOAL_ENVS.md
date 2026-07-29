@@ -16,12 +16,18 @@ be used by both QRL and vector-observation GO-QRL agents.
 | `gym_mujoco` | `AntNavigate-v4` | 1000 | `[0,1]` | Pinned local Gym `Ant-v3` backend |
 | `dmc` | `reacher_easy` | 1000 | `[0,1]` | dm_control |
 | `dmc` | `reacher_hard` | 1000 | `[0,1]` | dm_control |
+| `dmc` | `swimmer6` | 1000 | `[0,1]` | dm_control |
+| `dmc` | `swimmer15` | 1000 | `[0,1]` | dm_control |
+| `dmc` | `quadruped_fetch` | 1000 | `[0,1]` | dm_control |
 | `dmc` | `manipulator_bring_ball` | 1000 | `[0,1]` | dm_control |
 | `dmc` | `manipulator_bring_peg` | 1000 | `[0,1,2,3]` | dm_control |
+| `online_maze` | `maze2d-medium` | 600 | `[0,1]` | D4RL Maze2D v1 |
+| `online_maze` | `maze2d-large` | 800 | `[0,1]` | D4RL Maze2D v1 |
 
 `AntNavigate-v4` is deliberately a separate name. It samples a reachable XY
 navigation goal and does not optimize the standard Ant forward-velocity
-reward.
+reward. Its 29-dimensional state is `qpos + qvel`; backend contact-force cache
+entries are excluded.
 
 ## QRL
 

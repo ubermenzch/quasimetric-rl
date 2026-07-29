@@ -177,8 +177,13 @@ GOAL_SET_DIMS_REGISTRY: Mapping[Tuple[str, str], Tuple[int, ...]] = {
     ('gym_mujoco', 'AntNavigate-v4'): (0, 1),
     ('dmc', 'reacher_easy'): (0, 1),
     ('dmc', 'reacher_hard'): (0, 1),
+    ('dmc', 'swimmer6'): (0, 1),
+    ('dmc', 'swimmer15'): (0, 1),
+    ('dmc', 'quadruped_fetch'): (0, 1),
     ('dmc', 'manipulator_bring_ball'): (0, 1),
     ('dmc', 'manipulator_bring_peg'): (0, 1, 2, 3),
+    ('online_maze', 'maze2d-medium'): (0, 1),
+    ('online_maze', 'maze2d-large'): (0, 1),
 }
 
 

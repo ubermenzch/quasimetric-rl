@@ -54,11 +54,16 @@ ONLINE_GOAL_ENV_SPECS = {
     ('gcrl', 'FetchPickAndPlace'): ((25,), (4,), (3, 4, 5)),
     ('gym_mujoco', 'Reacher-v4'): ((8,), (2,), (0, 1)),
     ('gym_mujoco', 'Pusher-v4'): ((20,), (7,), (0, 1, 2)),
-    ('gym_mujoco', 'AntNavigate-v4'): ((113,), (8,), (0, 1)),
+    ('gym_mujoco', 'AntNavigate-v4'): ((29,), (8,), (0, 1)),
     ('dmc', 'reacher_easy'): ((6,), (2,), (0, 1)),
     ('dmc', 'reacher_hard'): ((6,), (2,), (0, 1)),
+    ('dmc', 'swimmer6'): ((17,), (5,), (0, 1)),
+    ('dmc', 'swimmer15'): ((35,), (14,), (0, 1)),
+    ('dmc', 'quadruped_fetch'): ((60,), (12,), (0, 1)),
     ('dmc', 'manipulator_bring_ball'): ((40,), (5,), (0, 1)),
     ('dmc', 'manipulator_bring_peg'): ((40,), (5,), (0, 1, 2, 3)),
+    ('online_maze', 'maze2d-medium'): ((4,), (2,), (0, 1)),
+    ('online_maze', 'maze2d-large'): ((4,), (2,), (0, 1)),
 }
 
 

@@ -131,9 +131,10 @@ class GymMujocoGoalEnv(gym.Env):
                 self._body_com('tips_arm'),
             ]).astype(np.float32)
         if self.name == 'AntNavigate-v4':
+            # Gym Ant may append 84 cfrc_ext values that this backend never computes.
             return np.concatenate([
-                np.asarray(data.qpos[:2]),
-                np.asarray(raw_observation).reshape(-1),
+                np.asarray(data.qpos),
+                np.asarray(data.qvel),
             ]).astype(np.float32)
         raise AssertionError(self.name)
 

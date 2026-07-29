@@ -12,6 +12,11 @@ from ..memory import register_online_env
 TASK_SPECS = {
     'reacher_easy': dict(domain='reacher', task='easy', goal_dims=(0, 1)),
     'reacher_hard': dict(domain='reacher', task='hard', goal_dims=(0, 1)),
+    'swimmer6': dict(domain='swimmer', task='swimmer6', goal_dims=(0, 1)),
+    'swimmer15': dict(domain='swimmer', task='swimmer15', goal_dims=(0, 1)),
+    'quadruped_fetch': dict(
+        domain='quadruped', task='fetch', goal_dims=(0, 1),
+    ),
     'manipulator_bring_ball': dict(
         domain='manipulator', task='bring_ball', goal_dims=(0, 1),
     ),
@@ -66,7 +71,8 @@ class DMCGoalEnv(gym.Env):
         return timestep
 
     def _state_and_goal(self, observation):
-        if self.task_spec['domain'] == 'reacher':
+        domain = self.task_spec['domain']
+        if domain == 'reacher':
             target = np.asarray(
                 self._env.physics.named.data.geom_xpos['target', :2],
                 dtype=np.float32,
@@ -79,6 +85,39 @@ class DMCGoalEnv(gym.Env):
                 finger,
                 np.asarray(observation['position']).reshape(-1),
                 np.asarray(observation['velocity']).reshape(-1),
+            ])
+            return state.astype(np.float32), target
+
+        if domain == 'swimmer':
+            physics = self._env.physics
+            data = physics.data
+            target = np.asarray(
+                physics.named.data.geom_xpos['target', :2], dtype=np.float32,
+            )
+            nose = np.asarray(
+                physics.named.data.geom_xpos['nose', :2], dtype=np.float32,
+            )
+            root_angle = float(data.qpos[2])
+            state = np.concatenate([
+                nose,
+                np.array([np.cos(root_angle), np.sin(root_angle)]),
+                np.asarray(data.qpos[3:]),
+                np.asarray(data.qvel),
+            ])
+            return state.astype(np.float32), target
+
+        if domain == 'quadruped':
+            physics = self._env.physics
+            target = np.asarray(
+                physics.named.data.site_xpos['target', :2], dtype=np.float32,
+            )
+            ball = np.asarray(
+                physics.named.data.xpos['ball', :2], dtype=np.float32,
+            )
+            state = np.concatenate([
+                ball,
+                np.asarray(physics.data.qpos),
+                np.asarray(physics.data.qvel),
             ])
             return state.astype(np.float32), target
 
@@ -123,7 +162,22 @@ class DMCGoalEnv(gym.Env):
         if not np.allclose(goal_values, self._goal_values, rtol=0, atol=1e-6):
             raise RuntimeError('dm_control changed the desired goal within an episode')
         reward = 0.0 if timestep.reward is None else float(timestep.reward)
-        is_success = reward >= 1.0 - 1e-7
+        distance = float(np.linalg.norm(
+            state[list(self.goal_dims)] - self._goal_values
+        ))
+        domain = self.task_spec['domain']
+        if domain == 'swimmer':
+            success_radius = float(
+                self._env.physics.named.model.geom_size['target', 0]
+            )
+            is_success = distance <= success_radius
+        elif domain == 'quadruped':
+            success_radius = float(
+                self._env.physics.named.model.site_size['target', 0]
+            )
+            is_success = distance <= success_radius
+        else:
+            is_success = reward >= 1.0 - 1e-7
         timeout = bool(timestep.last()) or self._elapsed_steps == self.episode_length
         if timeout and self._elapsed_steps != self.episode_length:
             raise RuntimeError(
@@ -132,9 +186,7 @@ class DMCGoalEnv(gym.Env):
             )
         info = {
             'is_success': bool(is_success),
-            'goal_distance': float(np.linalg.norm(
-                state[list(self.goal_dims)] - self._goal_values
-            )),
+            'goal_distance': distance,
         }
         if timeout:
             info['TimeLimit.truncated'] = True
