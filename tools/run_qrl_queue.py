@@ -595,12 +595,14 @@ def kill_illegal_user_gpu_jobs(
     config: dict[str, str],
     apps: list[dict[str, str]] | None,
     legal_pids: set[str],
+    allowed_gpus: list[str],
     dry_run: bool,
 ) -> bool:
     if apps is None:
         return False
     if not as_bool(cfg(config, "KILL_ILLEGAL_USER_GPU_JOBS", "1")):
         return False
+    managed_gpus = set(allowed_gpus)
     grace_seconds = termination_grace_seconds(config)
     killed_any = False
     for app in apps:
@@ -615,6 +617,8 @@ def kill_illegal_user_gpu_jobs(
                 f"gpu_uuid={app.get('gpu_uuid', '')}",
                 flush=True,
             )
+            continue
+        if gpu not in managed_gpus:
             continue
         if not is_queue_user_process(pid):
             continue
@@ -1396,6 +1400,17 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
     mujoco_path = resolve_path(
         cfg(config, "MUJOCO_PY_MUJOCO_PATH", str(asset_root / "mujoco/mujoco210"))
     )
+    cpu_threads = as_int(
+        cfg(
+            config,
+            "CPU_THREADS_PER_TASK",
+            cfg(config, "OMP_NUM_THREADS", "4"),
+        ),
+        4,
+    )
+    if cpu_threads <= 0:
+        raise ValueError("CPU_THREADS_PER_TASK must be positive")
+    cpu_threads_value = str(cpu_threads)
     env = os.environ.copy()
     env.update({
         "CUDA_VISIBLE_DEVICES": gpu,
@@ -1408,7 +1423,11 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
         "D4RL_SUPPRESS_IMPORT_ERROR": cfg(config, "D4RL_SUPPRESS_IMPORT_ERROR", "1"),
         "QRL_ASSET_ROOT": str(asset_root),
         "D4RL_DATASET_DIR": str(dataset_dir),
-        "OMP_NUM_THREADS": cfg(config, "OMP_NUM_THREADS", "12"),
+        "QRL_CPU_THREADS_PER_TASK": cpu_threads_value,
+        "OMP_NUM_THREADS": cpu_threads_value,
+        "MKL_NUM_THREADS": cpu_threads_value,
+        "OPENBLAS_NUM_THREADS": cpu_threads_value,
+        "NUMEXPR_NUM_THREADS": cpu_threads_value,
         "HYDRA_FULL_ERROR": "1",
         "PYTHONPATH": str(qrl_dir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
     })
@@ -1672,7 +1691,9 @@ def main() -> int:
             apps = gpu_compute_apps()
             update_running_gpu_memory_peaks(tasks, status_dir, apps, dry_run=dry_run)
             legal_pids = legal_running_gpu_pids(tasks, status_dir, allowed_gpus, apps)
-            if kill_illegal_user_gpu_jobs(config, apps, legal_pids, dry_run):
+            if kill_illegal_user_gpu_jobs(
+                config, apps, legal_pids, allowed_gpus, dry_run
+            ):
                 apps = gpu_compute_apps()
             gpu_states = query_gpu_states(allowed_gpus, apps)
             for gpu in allowed_gpus:

@@ -6,8 +6,10 @@ from unittest import mock
 from tools.run_qrl_queue import ActiveJob
 from tools.run_qrl_queue import GpuState
 from tools.run_qrl_queue import Task as RunnerTask
+from tools.run_qrl_queue import command_env
 from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
+from tools.run_qrl_queue import kill_illegal_user_gpu_jobs
 from tools.run_qrl_queue import mark_finished
 from tools.run_qrl_queue import read_status
 from tools.run_qrl_queue import reconcile_running_statuses
@@ -29,6 +31,86 @@ from tools.watch_qrl_queue import task_variant
 
 
 class QueueTaskClassificationTest(unittest.TestCase):
+    def test_command_env_limits_all_cpu_thread_pools(self):
+        env = command_env({"CPU_THREADS_PER_TASK": "4"}, "2")
+
+        self.assertEqual(env["QRL_CPU_THREADS_PER_TASK"], "4")
+        for variable in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        ):
+            with self.subTest(variable=variable):
+                self.assertEqual(env[variable], "4")
+
+    def test_command_env_rejects_nonpositive_cpu_thread_limit(self):
+        with self.assertRaisesRegex(
+            ValueError, "CPU_THREADS_PER_TASK must be positive"
+        ):
+            command_env({"CPU_THREADS_PER_TASK": "0"}, "2")
+
+    def test_illegal_gpu_cleanup_only_manages_allowed_gpus(self):
+        apps = [
+            {
+                "gpu": "5",
+                "pid": "5005",
+                "process_name": ".venv/bin/python",
+                "used_memory": "710",
+            },
+            {
+                "gpu": "6",
+                "pid": "6006",
+                "process_name": ".venv/bin/python",
+                "used_memory": "710",
+            },
+        ]
+        config = {
+            "KILL_ILLEGAL_USER_GPU_JOBS": "1",
+            "DISALLOWED_GPU_TERMINATE_GRACE_SECONDS": "0",
+        }
+
+        with mock.patch(
+            "tools.run_qrl_queue.is_queue_user_process", return_value=True
+        ), mock.patch(
+            "tools.run_qrl_queue.terminate_pid", return_value="terminated"
+        ) as terminate_pid:
+            killed_any = kill_illegal_user_gpu_jobs(
+                config,
+                apps,
+                legal_pids=set(),
+                allowed_gpus=[str(gpu) for gpu in range(6)],
+                dry_run=False,
+            )
+
+        self.assertTrue(killed_any)
+        terminate_pid.assert_called_once_with("5005", config, 0.0)
+
+    def test_illegal_gpu_cleanup_does_nothing_outside_allowed_gpus(self):
+        apps = [{
+            "gpu": "7",
+            "pid": "7007",
+            "process_name": ".venv/bin/python",
+            "used_memory": "710",
+        }]
+
+        with mock.patch(
+            "tools.run_qrl_queue.is_queue_user_process"
+        ) as is_queue_user_process, mock.patch(
+            "tools.run_qrl_queue.terminate_pid"
+        ) as terminate_pid:
+            killed_any = kill_illegal_user_gpu_jobs(
+                {"KILL_ILLEGAL_USER_GPU_JOBS": "1"},
+                apps,
+                legal_pids=set(),
+                allowed_gpus=[str(gpu) for gpu in range(6)],
+                dry_run=False,
+            )
+
+        self.assertFalse(killed_any)
+        is_queue_user_process.assert_not_called()
+        terminate_pid.assert_not_called()
+
     def test_dead_allowed_gpu_status_is_automatically_requeued(self):
         task = RunnerTask(
             task_id="stale_task",

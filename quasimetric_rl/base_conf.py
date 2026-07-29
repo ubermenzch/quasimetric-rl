@@ -261,6 +261,25 @@ class BaseConf(abc.ABC):
 
         # PyTorch setup
         torch.backends.cudnn.benchmark = True
-        torch.set_num_threads(12)
+        cpu_threads_raw = os.environ.get(
+            'QRL_CPU_THREADS_PER_TASK',
+            os.environ.get('OMP_NUM_THREADS', '4'),
+        )
+        try:
+            cpu_threads = int(cpu_threads_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f'Invalid QRL_CPU_THREADS_PER_TASK={cpu_threads_raw!r}'
+            ) from exc
+        if cpu_threads <= 0:
+            raise ValueError('QRL_CPU_THREADS_PER_TASK must be positive')
+        torch.set_num_threads(cpu_threads)
+        if torch.get_num_interop_threads() != 1:
+            torch.set_num_interop_threads(1)
+        logging.info(
+            'CPU thread limits: intra_op=%d inter_op=%d',
+            torch.get_num_threads(),
+            torch.get_num_interop_threads(),
+        )
 
         return writer

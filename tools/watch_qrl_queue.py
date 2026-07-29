@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import ceil
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,90 @@ class Progress:
     text: str
     current: float | None
     total: float | None
+
+
+class RecentProgressHistory:
+    """Persistent progress samples used for recent-window ETA estimates."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.tasks: dict[str, dict[str, Any]] = {}
+        try:
+            payload = json.loads(path.read_text())
+            if payload.get("version") == 1 and isinstance(payload.get("tasks"), dict):
+                self.tasks = payload["tasks"]
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+
+    def observe(
+        self,
+        task_id: str,
+        attempt: str,
+        progress: float,
+        now: float,
+        window_progress: float,
+    ) -> list[tuple[float, float]]:
+        record = self.tasks.get(task_id)
+        if (
+            not isinstance(record, dict)
+            or record.get("attempt") != attempt
+            or not isinstance(record.get("samples"), list)
+        ):
+            record = {"attempt": attempt, "samples": []}
+            self.tasks[task_id] = record
+
+        samples = []
+        for sample in record["samples"]:
+            if not isinstance(sample, list) or len(sample) != 2:
+                continue
+            try:
+                timestamp, value = float(sample[0]), float(sample[1])
+            except (TypeError, ValueError):
+                continue
+            if timestamp <= now:
+                samples.append((timestamp, value))
+        samples.sort()
+        compressed = []
+        for sample in samples:
+            if compressed and sample[1] == compressed[-1][1]:
+                continue
+            compressed.append(sample)
+        samples = compressed
+        if samples and progress < samples[-1][1]:
+            samples = []
+        if not samples or progress > samples[-1][1]:
+            samples.append((now, progress))
+
+        cutoff = progress - max(0.0, window_progress)
+        first_recent = next(
+            (index for index, sample in enumerate(samples) if sample[1] >= cutoff),
+            len(samples) - 1,
+        )
+        # Keep one sample immediately before the cutoff so sparse progress
+        # updates still provide a usable speed estimate.
+        first_recent = max(0, first_recent - 1)
+        recent = samples[first_recent:]
+        record["samples"] = [[timestamp, value] for timestamp, value in recent]
+
+        estimate_samples = list(recent)
+        if estimate_samples and now > estimate_samples[-1][0]:
+            estimate_samples.append((now, progress))
+        return estimate_samples
+
+    def retain(self, active_task_ids: set[str]) -> None:
+        self.tasks = {
+            task_id: record
+            for task_id, record in self.tasks.items()
+            if task_id in active_task_ids
+        }
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(
+            self.path.suffix + f".{os.getpid()}.tmp"
+        )
+        tmp_path.write_text(json.dumps({"version": 1, "tasks": self.tasks}) + "\n")
+        tmp_path.replace(self.path)
 
 
 def parse_config(path: Path) -> dict[str, str]:
@@ -210,9 +295,18 @@ def estimated_eta_hours(
     progress: Progress,
     run_elapsed_h: float | None,
     history_elapsed_h: float | None,
+    recent_samples: list[tuple[float, float]] | None = None,
 ) -> float | None:
     if progress.current is None or progress.total is None or progress.total <= progress.current:
         return None
+    if recent_samples and len(recent_samples) >= 2:
+        started_at, started_progress = recent_samples[0]
+        ended_at, ended_progress = recent_samples[-1]
+        elapsed_seconds = ended_at - started_at
+        progress_delta = ended_progress - started_progress
+        if elapsed_seconds > 0 and progress_delta > 0:
+            speed_per_hour = progress_delta * 3600.0 / elapsed_seconds
+            return max(0.0, (progress.total - progress.current) / speed_per_hour)
     if status.get("state") == "RUNNING" and run_elapsed_h is not None and run_elapsed_h > 0:
         started_progress = current_run_start_progress(task, status)
         if started_progress is not None and progress.current > started_progress:
@@ -787,12 +881,18 @@ def display_status_timestamp(value: str) -> str:
     return value
 
 
-def render(config: dict[str, str]) -> None:
+def render(
+    config: dict[str, str],
+    recent_progress: RecentProgressHistory | None = None,
+) -> None:
     tasks = read_tasks(resolve_path(cfg(config, "TASKS_FILE", "configs/qrl_tasks.tsv")))
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
     output_root = resolve_path(cfg(config, "RESULTS_ROOT", "online/results_queue"))
     log_dir = resolve_path(cfg(config, "LOG_DIR", "logs/qrl_queue"))
     queue_started = queue_start_timestamp(config)
+    eta_window_steps = max(
+        0.0, float(cfg(config, "ETA_WINDOW_STEPS", "5000"))
+    )
     gpus = cfg(config, "GPU_IDS", "0 1 2 3")
     print(time.strftime("%Y-%m-%d %H:%M:%S"))
     print(nvidia_smi(gpus))
@@ -801,6 +901,7 @@ def render(config: dict[str, str]) -> None:
     counts: dict[str, int] = {}
     total_elapsed = 0.0
     queue_eta = 0.0
+    active_eta_task_ids: set[str] = set()
     for idx, task in enumerate(tasks, start=1):
         status = read_status(status_dir, task.task_id)
         state = status.get("state", "PENDING")
@@ -820,7 +921,34 @@ def render(config: dict[str, str]) -> None:
         display_elapsed = history_elapsed if history_elapsed is not None else run_elapsed
         if display_elapsed is not None:
             total_elapsed += display_elapsed
-        eta = estimated_eta_hours(task, status, progress, run_elapsed, history_elapsed)
+        recent_samples = None
+        if (
+            recent_progress is not None
+            and state == "RUNNING"
+            and progress.current is not None
+        ):
+            active_eta_task_ids.add(task.task_id)
+            attempt = "|".join((
+                status.get("pid", ""),
+                status.get("started_at", ""),
+                status.get("log_file", ""),
+                str(progress.total),
+            ))
+            recent_samples = recent_progress.observe(
+                task.task_id,
+                attempt,
+                progress.current,
+                time.time(),
+                eta_window_steps,
+            )
+        eta = estimated_eta_hours(
+            task,
+            status,
+            progress,
+            run_elapsed,
+            history_elapsed,
+            recent_samples=recent_samples,
+        )
         if state in {"RUNNING", "PENDING"} and eta is not None:
             queue_eta = max(queue_eta, eta)
         last_succ = latest.get("succ_rate", "")
@@ -856,6 +984,10 @@ def render(config: dict[str, str]) -> None:
         ])
         counts[state] = counts.get(state, 0) + 1
 
+    if recent_progress is not None:
+        recent_progress.retain(active_eta_task_ids)
+        recent_progress.save()
+
     print(
         "Status:",
         " ".join(f"{k}={v}" for k, v in sorted(counts.items())),
@@ -888,13 +1020,20 @@ def main() -> int:
     )
     args = parser.parse_args()
     config = parse_config(resolve_path(args.config))
+    eta_sample_file = resolve_path(cfg(
+        config,
+        "ETA_SAMPLE_FILE",
+        str(resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
+            / "watch_eta_samples.json"),
+    ))
+    recent_progress = RecentProgressHistory(eta_sample_file)
     watch = args.watch
     if watch is None:
         watch = float(cfg(config, "WATCH_SECONDS", cfg(config, "POLL_SECONDS", "30")))
     while True:
         if args.clear_screen:
             print("\033[2J\033[H", end="")
-        render(config)
+        render(config, recent_progress)
         if watch <= 0:
             return 0
         time.sleep(watch)
