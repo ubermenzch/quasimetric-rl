@@ -291,6 +291,23 @@ class LatentGoalAdamTest(unittest.TestCase):
             torch.sqrt(torch.tensor(5.0)),
         )
 
+    def test_inner_zero_returns_the_initial_sample_without_gradients(self):
+        loss, critic = self.make_loss_and_critic('min')
+        loss.latent_goal_steps = 0
+        predicted = torch.tensor([[0.5, -0.25, 2.0, -3.0]])
+        sampled_goal = torch.tensor([[0.5, -0.25, 1.0, -2.0]])
+
+        completed, diagnostics = loss._optimize_latent_goal(
+            critic, predicted, sampled_goal
+        )
+
+        torch.testing.assert_close(completed, sampled_goal)
+        self.assertEqual(diagnostics['latent_goal_improvement'].item(), 0)
+        self.assertEqual(diagnostics['latent_goal_gradient_norm'].item(), 0)
+        self.assertEqual(diagnostics['latent_goal_update_norm'].item(), 0)
+        self.assertEqual(diagnostics['latent_goal_best_step'].item(), 0)
+        self.assertEqual(critic.quasimetric_model.project_calls, 3)
+
     def test_inner_sgd_uses_the_raw_gradient(self):
         loss, critic = self.make_loss_and_critic('min')
         loss.latent_goal_steps = 1

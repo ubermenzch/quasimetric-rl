@@ -51,7 +51,7 @@ class MinDistLoss(ActorLossBase):
         latent_goal_mode: str = attrs.field(
             default='none', validator=attrs.validators.in_(LATENT_GOAL_MODES)
         )
-        latent_goal_steps: int = attrs.field(default=8, validator=attrs.validators.gt(0))
+        latent_goal_steps: int = attrs.field(default=8, validator=attrs.validators.ge(0))
         latent_goal_optim: str = attrs.field(
             default='adam', validator=attrs.validators.in_(LATENT_GOAL_OPTIMIZERS)
         )
@@ -128,10 +128,11 @@ class MinDistLoss(ActorLossBase):
             raise ValueError(f'Unknown latent_goal_optim={latent_goal_optim!r}')
         if latent_goal_search not in LATENT_GOAL_SEARCHES:
             raise ValueError(f'Unknown latent_goal_search={latent_goal_search!r}')
-        if (latent_goal_steps <= 0 or latent_goal_lr <= 0
+        if (latent_goal_steps < 0 or latent_goal_lr <= 0
                 or latent_goal_eps <= 0 or latent_goal_residual_radius <= 0):
             raise ValueError(
-                'Latent goal steps, lr, eps, and residual radius must be positive'
+                'Latent goal steps must be non-negative; lr, eps, and residual '
+                'radius must be positive'
             )
         if (len(latent_goal_betas) != 2
                 or not all(0 <= beta < 1 for beta in latent_goal_betas)):
@@ -455,6 +456,23 @@ class MinDistLoss(ActorLossBase):
             if self.latent_goal_mode == 'min'
             else final_inner_dist - initial_dist
         )
+        zero_diagnostic = initial_dist.new_zeros(())
+        gradient_norm = (
+            torch.stack(gradient_norms).mean()
+            if gradient_norms else zero_diagnostic
+        )
+        gradient_norm_max = (
+            torch.stack(gradient_norms).max()
+            if gradient_norms else zero_diagnostic
+        )
+        update_norm = (
+            torch.stack(update_norms).mean()
+            if update_norms else zero_diagnostic
+        )
+        update_norm_max = (
+            torch.stack(update_norms).max()
+            if update_norms else zero_diagnostic
+        )
         diagnostics = dict(
             latent_goal_initial_dist=initial_dist.mean(),
             latent_goal_final_inner_dist=final_inner_dist.mean(),
@@ -466,10 +484,10 @@ class MinDistLoss(ActorLossBase):
             latent_goal_initial_norm_max=torch.linalg.vector_norm(
                 initial_h, dim=-1
             ).max(),
-            latent_goal_gradient_norm=torch.stack(gradient_norms).mean(),
-            latent_goal_gradient_norm_max=torch.stack(gradient_norms).max(),
-            latent_goal_update_norm=torch.stack(update_norms).mean(),
-            latent_goal_update_norm_max=torch.stack(update_norms).max(),
+            latent_goal_gradient_norm=gradient_norm,
+            latent_goal_gradient_norm_max=gradient_norm_max,
+            latent_goal_update_norm=update_norm,
+            latent_goal_update_norm_max=update_norm_max,
             latent_goal_final_norm=torch.linalg.vector_norm(
                 final_h, dim=-1
             ).mean(),

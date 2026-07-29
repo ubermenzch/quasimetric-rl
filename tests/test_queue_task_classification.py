@@ -164,6 +164,28 @@ class QueueTaskClassificationTest(unittest.TestCase):
             "GSD",
         )
 
+    def test_reward_free_baselines_have_algorithm_labels(self):
+        common = dict(
+            task_id="reference_baseline_s1000",
+            mode="online",
+            env_name="FetchReach",
+            seed="1000",
+            steps="200000",
+        )
+        expected = {
+            "td_infonce": "TD-InfoNCE",
+            "crl": "CRL",
+            "gcbc": "GCBC",
+            "gcsl": "GCSL/GCBC",
+            "c_learning": "C-Learning",
+        }
+        for algorithm, label in expected.items():
+            with self.subTest(algorithm=algorithm):
+                task = WatcherTask(
+                    extra_args=f"agent.algorithm={algorithm}", **common
+                )
+                self.assertEqual(task_variant(task), label)
+
     def test_base_task_properties_are_split_into_monitor_columns(self):
         task = WatcherTask(
             task_id=(
@@ -216,6 +238,21 @@ class QueueTaskClassificationTest(unittest.TestCase):
             " agent.actor.losses.min_dist.latent_goal_residual_radius=1.0"
         )
         self.assertEqual(task_variant(task), "GO-QRL+Max8+BR1")
+
+    def test_zero_inner_steps_are_labeled_inner0(self):
+        task = WatcherTask(
+            task_id="ablation_GO-QRL+Inner0-M_fetchpush_s1000",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+            extra_args=(
+                "+go_qrl_model_size=m "
+                "agent.actor.losses.min_dist.latent_goal_mode=min "
+                "agent.actor.losses.min_dist.latent_goal_steps=0"
+            ),
+        )
+        self.assertEqual(task_variant(task), "GO-QRL+Inner0")
 
     def test_layernorm_go_qrl_variant_has_a_distinct_monitor_label(self):
         task = WatcherTask(

@@ -187,6 +187,9 @@ class ReplayBuffer(Dataset):
             kind, name, future_observation_discount=future_observation_discount,
             transition_history_length=transition_history_length,
             dummy=dummy)
+        self.training_episode_mask = torch.zeros(
+            self.episodes_capacity, dtype=torch.bool,
+        )
         self.num_episodes_realized = 0
         if load_offline_data and not dummy:  # load data if required.
             for episode in super().load_episodes():
@@ -223,6 +226,10 @@ class ReplayBuffer(Dataset):
             self.indices_to_episode_timesteps,
             torch.arange(self.episode_length).repeat(new_capacity - original_capacity),
         ], dim=0)
+        self.training_episode_mask = torch.cat([
+            self.training_episode_mask,
+            torch.zeros(new_capacity - original_capacity, dtype=torch.bool),
+        ])
 
         logging.info(f'ReplayBuffer: Expanded from capacity={original_capacity} to {new_capacity} episodes')
 
@@ -242,6 +249,7 @@ class ReplayBuffer(Dataset):
             "num_episodes_realized": self.num_episodes_realized,
             "num_successful_episodes": self.num_successful_episodes,
             "num_successful_transitions": self.num_successful_transitions,
+            "training_episode_mask": self.training_episode_mask[:n].clone(),
             "episode_lengths": self.raw_data.episode_lengths[:n].clone(),
             "all_observations": self.raw_data.all_observations[:obs_n].clone(),
             "actions": self.raw_data.actions[:trans_n].clone(),
@@ -273,6 +281,19 @@ class ReplayBuffer(Dataset):
         self.num_episodes_realized = n
         self.num_successful_episodes = int(state["num_successful_episodes"])
         self.num_successful_transitions = int(state["num_successful_transitions"])
+        training_episode_mask = state.get("training_episode_mask")
+        if training_episode_mask is None:
+            self.training_episode_mask[:n] = True
+        else:
+            if len(training_episode_mask) != n:
+                raise ValueError(
+                    'training_episode_mask length does not match '
+                    f'num_episodes_realized: {len(training_episode_mask)} != {n}'
+                )
+            self.training_episode_mask[:n] = torch.as_tensor(
+                training_episode_mask, dtype=torch.bool,
+            )
+        self.training_episode_mask[n:] = False
         self._observation_bounds_cache = None
         self._goal_condition_coordinate_caches = {}
         self._goal_condition_grid_caches = {}
@@ -335,7 +356,7 @@ class ReplayBuffer(Dataset):
             assert (timeout or terminal) == (t == self.episode_length)
         return epi
 
-    def add_rollout(self, episode: EpisodeData):
+    def add_rollout(self, episode: EpisodeData, *, training: bool = True):
         if self.num_episodes_realized == self.episodes_capacity:
             self._expand()
 
@@ -363,6 +384,7 @@ class ReplayBuffer(Dataset):
         self.raw_data.transition_infos['is_success'].unflatten(
             0, [self.episodes_capacity, self.episode_length],
         )[self.num_episodes_realized] = episode.transition_infos['is_success']
+        self.training_episode_mask[self.num_episodes_realized] = training
 
         num_successful_transitions = episode.transition_infos['is_success'].sum(dtype=torch.int64).item()
         self.num_successful_transitions += num_successful_transitions
@@ -370,21 +392,49 @@ class ReplayBuffer(Dataset):
 
         self.num_episodes_realized += 1
 
-    def sample(self, batch_size: int) -> BatchData:
+    def sample(
+            self, batch_size: int,
+            *, max_transitions: Optional[int] = None) -> BatchData:
+        first_transition = 0
+        if max_transitions is not None:
+            if max_transitions <= 0:
+                raise ValueError('max_transitions must be positive')
+            first_transition = max(
+                0, self.num_transitions_realized - max_transitions,
+            )
         indices = torch.as_tensor(
-            np.random.choice(self.num_transitions_realized, size=[batch_size])
+            np.random.choice(
+                np.arange(first_transition, self.num_transitions_realized),
+                size=[batch_size],
+            )
         )
         return self[indices]
 
-    def sample_uniform_future_pairs(self, batch_size: int) -> BatchData:
+    def sample_uniform_future_pairs(
+            self, batch_size: int, *, training_only: bool = False,
+            max_episodes: Optional[int] = None) -> BatchData:
         """Sample the ordered within-trajectory state pairs used by GCSL."""
         if self.num_episodes_realized <= 0:
             raise RuntimeError('Cannot sample from an empty replay buffer')
         if self.episode_length <= 1:
             raise RuntimeError('Uniform future-pair sampling requires horizon > 1')
 
+        eligible_episode_indices = np.arange(self.num_episodes_realized)
+        if training_only:
+            training_episode_mask = getattr(self, 'training_episode_mask', None)
+            if training_episode_mask is not None:
+                eligible_episode_indices = torch.nonzero(
+                    training_episode_mask[:self.num_episodes_realized],
+                    as_tuple=False,
+                ).flatten().cpu().numpy()
+            if len(eligible_episode_indices) == 0:
+                raise RuntimeError('Cannot sample GCSL pairs without training trajectories')
+        if max_episodes is not None:
+            if max_episodes <= 0:
+                raise ValueError('max_episodes must be positive')
+            eligible_episode_indices = eligible_episode_indices[-max_episodes:]
         episode_indices = np.random.choice(
-            self.num_episodes_realized, size=[batch_size],
+            eligible_episode_indices, size=[batch_size],
         )
         first = np.floor(
             np.random.rand(batch_size) * (self.episode_length - 1)

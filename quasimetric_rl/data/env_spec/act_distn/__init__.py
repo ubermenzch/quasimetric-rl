@@ -152,14 +152,13 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
             error_msgs,
         )
 
-    def forward(self, feature: torch.Tensor) -> torch.distributions.Distribution:
-        gmean, grawstd = feature.view(
-            *feature.shape[:-1], 2, *self.action_shape
-        ).unbind(dim=-len(self.action_shape) - 1)
-        mean, half_len = self._action_bounds_like(feature)
+    def from_mean_and_std(
+            self, gmean: torch.Tensor,
+            gstd: torch.Tensor) -> torch.distributions.Distribution:
+        mean, half_len = self._action_bounds_like(gmean)
         pre_tanh_distn = torch.distributions.Normal(
             loc=gmean,
-            scale=F.softplus(grawstd) + 1e-4,
+            scale=gstd,
             validate_args=FLAGS.DEBUG,
         )
 
@@ -188,3 +187,9 @@ class BoxOutputLinearNormalization(ActionOutputConverter):
         )
 
         return distn
+
+    def forward(self, feature: torch.Tensor) -> torch.distributions.Distribution:
+        gmean, grawstd = feature.view(
+            *feature.shape[:-1], 2, *self.action_shape
+        ).unbind(dim=-len(self.action_shape) - 1)
+        return self.from_mean_and_std(gmean, F.softplus(grawstd) + 1e-4)

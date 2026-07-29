@@ -7,12 +7,15 @@ import argparse
 from collections import Counter
 from pathlib import Path
 import sys
+from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.run_qrl_queue import Task
+from quasimetric_rl.model_size import load_model_size_preset
+from quasimetric_rl.modules.gcrl_baselines import GCRLBaselinesConf
+from tools.run_qrl_queue import Task, read_tasks
 
 
 DEFAULT_OUTPUT = ROOT / 'configs/gcrl_baselines_4alg_7env_5seed_200k.tsv'
@@ -35,8 +38,16 @@ ALGORITHMS = (
     ('GCBC', 'gcbc'),
     ('C-Learning', 'c_learning'),
 )
+MODEL_SIZE_LEVEL = 'm'
+MODEL_SIZE_FAMILIES = {
+    'td_infonce': 'td_infonce',
+    'crl': 'crl',
+    'gcbc': 'gcbc',
+    'c_learning': 'c_learning',
+}
 
 COMMON_ARGS = (
+    'batch_size=256',
     'interaction.exploration_eps=0',
     'interaction.validation_seed=1000',
     'interaction.test_seed=2000000',
@@ -67,10 +78,16 @@ def _mlp_parameters(input_dim: int, hidden_sizes, output_dim: int) -> int:
 def baseline_parameter_count(
         algorithm: str, state_dim: int, action_dim: int,
         goal_dim: int) -> int:
+    family = MODEL_SIZE_FAMILIES.get(algorithm)
+    if family is None:
+        raise ValueError(f'Unknown algorithm: {algorithm!r}')
+    preset = load_model_size_preset(family, MODEL_SIZE_LEVEL)
+    conf = getattr(preset.baselines, algorithm)
+    source_conf = getattr(GCRLBaselinesConf(), algorithm)
+    hidden = tuple(map(int, conf.hidden_sizes))
     action_output_dim = 2 * action_dim
     if algorithm == 'td_infonce':
-        hidden = (512, 512, 512, 512)
-        representation_dim = 16
+        representation_dim = source_conf.representation_dim
         return (
             _mlp_parameters(state_dim + goal_dim, hidden, action_output_dim)
             + 2 * _mlp_parameters(
@@ -79,8 +96,7 @@ def baseline_parameter_count(
             + 2 * _mlp_parameters(goal_dim, hidden, representation_dim)
         )
     if algorithm == 'crl':
-        hidden = (256, 256)
-        representation_dim = 64
+        representation_dim = source_conf.representation_dim
         return (
             _mlp_parameters(state_dim + goal_dim, hidden, action_output_dim)
             + _mlp_parameters(state_dim + action_dim, hidden, representation_dim)
@@ -88,18 +104,18 @@ def baseline_parameter_count(
             + 1  # adaptive log-alpha
         )
     if algorithm == 'gcbc':
+        action_output_dim = 3 ** action_dim
         return _mlp_parameters(
-            state_dim + goal_dim, (400, 300), action_output_dim,
+            state_dim + goal_dim, hidden, action_output_dim,
         )
     if algorithm == 'c_learning':
-        hidden = (256, 256)
         return (
             _mlp_parameters(state_dim + goal_dim, hidden, action_output_dim)
             + 2 * _mlp_parameters(
                 state_dim + action_dim + goal_dim, hidden, 1,
             )
         )
-    raise ValueError(f'Unknown algorithm: {algorithm!r}')
+    raise AssertionError(algorithm)
 
 
 def compact_parameter_count(count: int) -> str:
@@ -110,23 +126,30 @@ def compact_parameter_count(count: int) -> str:
     return str(count)
 
 
-def generate_tasks() -> list[Task]:
+def generate_tasks(algorithms: Iterable[str] | None = None) -> list[Task]:
+    selected = set(MODEL_SIZE_FAMILIES if algorithms is None else algorithms)
+    unknown = selected.difference(MODEL_SIZE_FAMILIES)
+    if unknown:
+        raise ValueError(f'Unknown algorithms: {sorted(unknown)}')
     tasks = []
     for env_kind, env_name, env_slug, state_dim, action_dim, goal_dim in ENVIRONMENTS:
         evaluation_episodes = evaluation_episode_count(env_kind, env_name)
         for display_name, algorithm in ALGORITHMS:
+            if algorithm not in selected:
+                continue
             parameter_count = baseline_parameter_count(
                 algorithm, state_dim, action_dim, goal_dim,
             )
             for seed in TRAINING_SEEDS:
                 task_id = (
-                    f'reference_{display_name}_200k_20kckpt_'
+                    f'reference_{display_name}-M_200k_20kckpt_'
                     f'val{evaluation_episodes}_test{evaluation_episodes}_'
                     f'{env_slug}_online_s{seed}'
                 )
                 extra_args = ' '.join((
                     f'env.kind={env_kind}',
                     f'agent.algorithm={algorithm}',
+                    f'+{MODEL_SIZE_FAMILIES[algorithm]}_model_size={MODEL_SIZE_LEVEL}',
                     f'interaction.num_eval_episodes={evaluation_episodes}',
                     f'interaction.num_test_episodes={evaluation_episodes}',
                     *COMMON_ARGS,
@@ -140,12 +163,13 @@ def generate_tasks() -> list[Task]:
                     params=compact_parameter_count(parameter_count),
                     extra_args=extra_args,
                 ))
-    validate_tasks(tasks)
+    validate_tasks(tasks, selected)
     return tasks
 
 
-def validate_tasks(tasks: list[Task]) -> None:
-    expected = len(ENVIRONMENTS) * len(ALGORITHMS) * len(TRAINING_SEEDS)
+def validate_tasks(tasks: list[Task], algorithms: Iterable[str] | None = None) -> None:
+    selected = set(MODEL_SIZE_FAMILIES if algorithms is None else algorithms)
+    expected = len(ENVIRONMENTS) * len(selected) * len(TRAINING_SEEDS)
     if len(tasks) != expected:
         raise ValueError(f'Expected {expected} tasks, got {len(tasks)}')
     counts = Counter(task.task_id for task in tasks)
@@ -169,21 +193,52 @@ def task_line(task: Task) -> str:
 def render_tasks(tasks: list[Task]) -> str:
     lines = [
         '# task_id\tmode\tenv_name\tseed\tsteps\tparams\textra_args',
-        '# Four reference baselines x seven validated environments x five seeds.',
+        '# Reward-free M-level baselines x seven validated environments x five seeds.',
+        '# Every trainable model contains 4.0M-4.5M parameters.',
         '# Checkpoint-bound validation every 20k; test runs only on the selected best model.',
     ]
     lines.extend(task_line(task) for task in tasks)
     return '\n'.join(lines) + '\n'
 
 
+def append_tasks(path: Path, tasks: list[Task]) -> int:
+    existing_ids = {task.task_id for task in read_tasks(path)}
+    additions = [task for task in tasks if task.task_id not in existing_ids]
+    if not additions:
+        return 0
+    current = path.read_text() if path.exists() else ''
+    separator = '' if not current or current.endswith('\n\n') else (
+        '\n' if current.endswith('\n') else '\n\n'
+    )
+    block = '\n'.join([
+        '# Reward-free GCRL M-level baseline tasks.',
+        '# Frozen target copies are excluded from the displayed trainable count.',
+        *(task_line(task) for task in additions),
+    ]) + '\n'
+    path.write_text(current + separator + block)
+    return len(additions)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--append-to', type=Path)
+    parser.add_argument(
+        '--algorithms', nargs='+', choices=tuple(MODEL_SIZE_FAMILIES),
+        default=tuple(MODEL_SIZE_FAMILIES),
+    )
     args = parser.parse_args()
-    tasks = generate_tasks()
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render_tasks(tasks))
-    print(f'Wrote {len(tasks)} tasks to {args.output}')
+    tasks = generate_tasks(args.algorithms)
+    output = args.output
+    if output is None and args.append_to is None:
+        output = DEFAULT_OUTPUT
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(render_tasks(tasks))
+        print(f'Wrote {len(tasks)} tasks to {output}')
+    if args.append_to is not None:
+        added = append_tasks(args.append_to, tasks)
+        print(f'Added {added} tasks to {args.append_to}')
     return 0
 
 

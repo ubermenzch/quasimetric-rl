@@ -144,6 +144,28 @@ class SampleDist(torch.distributions.Distribution):
     def rsample(self):
         return self._dist.rsample()
 
+    def rsample_with_log_prob(self):
+        if self._pre_tanh_distn is None:
+            sample = self._dist.rsample()
+            return sample, self._dist.log_prob(sample)
+
+        pre_tanh_sample = self._pre_tanh_distn.rsample()
+        normalized_sample = torch.tanh(pre_tanh_sample)
+        sample = (
+            self._affine_loc
+            + self._affine_scale * normalized_sample
+        )
+        elementwise_log_prob = (
+            self._pre_tanh_distn.log_prob(pre_tanh_sample)
+            - stable_tanh_log_abs_det_jacobian(pre_tanh_sample)
+            - self._affine_scale.abs().log()
+        )
+        event_ndims = len(self._dist.event_shape)
+        if event_ndims > 0:
+            event_dims = tuple(range(-event_ndims, 0))
+            elementwise_log_prob = elementwise_log_prob.sum(dim=event_dims)
+        return sample, elementwise_log_prob
+
     def log_prob(self, value):
         return self._dist.log_prob(value)
 

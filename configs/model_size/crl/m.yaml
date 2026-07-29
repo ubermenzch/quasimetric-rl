@@ -1,0 +1,5 @@
+# CRL-M: preserve the official two-layer topology and scale only its width.
+model_size: CRL-M
+baselines:
+  crl:
+    hidden_sizes: [1152, 1152]

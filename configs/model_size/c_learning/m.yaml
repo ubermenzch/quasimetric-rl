@@ -1,0 +1,5 @@
+# C-Learning-M: actor plus twin trainable critics in the M comparison budget.
+model_size: C-Learning-M
+baselines:
+  c_learning:
+    hidden_sizes: [1184, 1184]

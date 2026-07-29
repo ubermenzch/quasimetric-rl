@@ -205,6 +205,48 @@ class QRLModelSizePresetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'No QRL model-size level'):
             select_qrl_model_size(256)
 
+    def test_reward_free_baseline_m_presets_merge_into_structured_config(self):
+        expected = {
+            'td_infonce': ('TD-InfoNCE-M', (512, 512, 512, 512), 16),
+            'crl': ('CRL-M', (1152, 1152), 64),
+            'gcbc': ('GCBC-M', (2304, 1728), None),
+            'c_learning': ('C-Learning-M', (1184, 1184), None),
+        }
+        for family, (label, hidden_sizes, representation_dim) in expected.items():
+            with self.subTest(family=family):
+                merged = OmegaConf.merge(
+                    OmegaConf.structured(QRLConf()),
+                    load_model_size_preset(family, 'm'),
+                )
+                conf = OmegaConf.to_container(
+                    merged, structured_config_mode=SCMode.INSTANTIATE,
+                )
+                baseline = getattr(conf.baselines, family)
+                self.assertEqual(conf.model_size, label)
+                self.assertEqual(tuple(baseline.hidden_sizes), hidden_sizes)
+                if representation_dim is not None:
+                    self.assertEqual(
+                        baseline.representation_dim, representation_dim,
+                    )
+
+    def test_reward_free_m_presets_only_record_capacity_fields(self):
+        allowed = {
+            'td_infonce': {'hidden_sizes'},
+            'crl': {'hidden_sizes'},
+            'gcbc': {'hidden_sizes'},
+            'c_learning': {'hidden_sizes'},
+        }
+        for family, expected_fields in allowed.items():
+            with self.subTest(family=family):
+                raw = OmegaConf.to_container(
+                    load_model_size_preset(family, 'm'), resolve=True,
+                )
+                self.assertEqual(set(raw), {'model_size', 'baselines'})
+                self.assertEqual(set(raw['baselines']), {family})
+                self.assertEqual(
+                    set(raw['baselines'][family]), expected_fields,
+                )
+
 
 if __name__ == '__main__':
     unittest.main()

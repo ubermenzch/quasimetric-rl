@@ -64,7 +64,12 @@ class InteractionConf:
     validation_seed: int = 1_000_000
     test_seed: int = 2_000_000
 
-    prefill_env_steps: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    prefill_env_steps: Optional[int] = attrs.field(
+        default=None, validator=attrs.validators.optional(attrs.validators.gt(0)),
+    )
+    random_policy_env_steps: Optional[int] = attrs.field(
+        default=None, validator=attrs.validators.optional(attrs.validators.ge(0)),
+    )
     env_steps_per_cycle: int = attrs.field(default=500, validator=attrs.validators.gt(0))
     eval_env_steps: int = attrs.field(default=2_500, validator=attrs.validators.gt(0))
     optim_steps_per_env_step: float = attrs.field(
@@ -83,13 +88,19 @@ class ResolvedInteractionSchedule:
 
 
 def resolve_interaction_schedule(
-        conf: InteractionConf, episode_length: int) -> ResolvedInteractionSchedule:
+        conf: InteractionConf, episode_length: int, *,
+        default_prefill_env_steps: int = 10_000) -> ResolvedInteractionSchedule:
     if episode_length <= 0:
         raise ValueError(f'episode_length must be positive, got {episode_length}')
 
     num_prefill_episodes = conf.num_prefill_episodes
     if num_prefill_episodes is None:
-        num_prefill_episodes = int(np.ceil(conf.prefill_env_steps / episode_length))
+        prefill_env_steps = (
+            default_prefill_env_steps
+            if conf.prefill_env_steps is None
+            else conf.prefill_env_steps
+        )
+        num_prefill_episodes = int(np.ceil(prefill_env_steps / episode_length))
 
     num_rollouts_per_cycle = conf.num_rollouts_per_cycle
     if num_rollouts_per_cycle is None:
@@ -148,6 +159,7 @@ class Trainer(object):
     validation_seed: int
     test_seed: int
     exploration_eps: float
+    random_policy_env_steps: int
     profiler: Optional[TimingProfiler]
     replay_sampling: str
 
@@ -207,11 +219,84 @@ class Trainer(object):
         self.replay = replay
         self.eval_seed = eval_seed
         self.batch_size = batch_size
+        self.algorithm = agent_conf.algorithm
 
         self.exploration_eps = interaction_conf.exploration_eps
         self.total_env_steps = interaction_conf.total_env_steps
+
+        if self.algorithm == 'td_infonce':
+            baseline_conf = agent_conf.baselines.td_infonce
+            default_prefill_env_steps = baseline_conf.min_replay_size
+            default_random_policy_env_steps = default_prefill_env_steps
+            self.replay_sample_max_transitions = baseline_conf.max_replay_size
+            self.replay_sample_max_episodes = None
+        elif self.algorithm == 'crl':
+            baseline_conf = agent_conf.baselines.crl
+            default_prefill_env_steps = baseline_conf.min_replay_size
+            default_random_policy_env_steps = 0
+            self.replay_sample_max_transitions = baseline_conf.max_replay_size
+            self.replay_sample_max_episodes = None
+        elif self.algorithm in ('gcbc', 'gcsl'):
+            baseline_conf = agent_conf.baselines.gcbc
+            default_prefill_env_steps = baseline_conf.start_policy_timesteps
+            default_random_policy_env_steps = baseline_conf.explore_timesteps
+            self.gcbc_validation_fraction = baseline_conf.validation_fraction
+            self.replay_sample_max_transitions = None
+            self.replay_sample_max_episodes = baseline_conf.replay_capacity_trajectories
+        elif self.algorithm == 'c_learning':
+            baseline_conf = agent_conf.baselines.c_learning
+            default_prefill_env_steps = baseline_conf.initial_collect_steps
+            default_random_policy_env_steps = default_prefill_env_steps
+            self.replay_sample_max_transitions = baseline_conf.replay_buffer_capacity
+            self.replay_sample_max_episodes = None
+        else:
+            baseline_conf = None
+            default_prefill_env_steps = 10_000
+            default_random_policy_env_steps = default_prefill_env_steps
+            self.replay_sample_max_transitions = None
+            self.replay_sample_max_episodes = None
+        if self.algorithm not in ('gcbc', 'gcsl'):
+            self.gcbc_validation_fraction = 0.0
+
+        if baseline_conf is not None and batch_size != baseline_conf.batch_size:
+            raise ValueError(
+                f'{self.algorithm} reference default requires batch_size='
+                f'{baseline_conf.batch_size}, got {batch_size}'
+            )
+
+        schedule_conf = interaction_conf
+        if baseline_conf is not None:
+            schedule_conf = attrs.evolve(
+                schedule_conf,
+                optim_steps_per_env_step=baseline_conf.updates_per_env_step,
+            )
+        if (
+                self.algorithm in ('gcbc', 'gcsl')
+                and interaction_conf.num_prefill_episodes is None
+                and interaction_conf.prefill_env_steps is None):
+            schedule_conf = attrs.evolve(
+                schedule_conf,
+                num_prefill_episodes=(
+                    default_prefill_env_steps // replay.episode_length + 1
+                ),
+                num_rollouts_per_cycle=(
+                    1 if interaction_conf.num_rollouts_per_cycle is None
+                    else interaction_conf.num_rollouts_per_cycle
+                ),
+                num_samples_per_cycle=(
+                    replay.episode_length
+                    if interaction_conf.num_samples_per_cycle is None
+                    else interaction_conf.num_samples_per_cycle
+                ),
+            )
         schedule = resolve_interaction_schedule(
-            interaction_conf, replay.episode_length,
+            schedule_conf, replay.episode_length,
+            default_prefill_env_steps=default_prefill_env_steps,
+        )
+        self.random_policy_env_steps = (
+            default_random_policy_env_steps
+            if interaction_conf.random_policy_env_steps is None
+            else interaction_conf.random_policy_env_steps
         )
         self.num_samples_per_cycle = schedule.num_samples_per_cycle
         self.num_rollouts_per_cycle = schedule.num_rollouts_per_cycle
@@ -231,11 +316,12 @@ class Trainer(object):
         logging.info(
             'Resolved interaction schedule for episode_length=%d: '
             'prefill_episodes=%d, rollouts_per_cycle=%d, '
-            'samples_per_cycle=%d, eval_episodes=%d',
+            'samples_per_cycle=%d, random_policy_env_steps=%d, eval_episodes=%d',
             replay.episode_length,
             self.num_prefill_episodes,
             self.num_rollouts_per_cycle,
             self.num_samples_per_cycle,
+            self.random_policy_env_steps,
             self.num_eval_episodes,
         )
         self.profiler = profiler
@@ -296,9 +382,15 @@ class Trainer(object):
     def sample(self) -> BatchData:
         with self._record('data/sample_replay'):
             if self.replay_sampling == 'uniform_future_pair':
-                batch = self.replay.sample_uniform_future_pairs(self.batch_size)
+                batch = self.replay.sample_uniform_future_pairs(
+                    self.batch_size, training_only=True,
+                    max_episodes=self.replay_sample_max_episodes,
+                )
             else:
-                batch = self.replay.sample(self.batch_size)
+                batch = self.replay.sample(
+                    self.batch_size,
+                    max_transitions=self.replay_sample_max_transitions,
+                )
         with self._record('data/to_device'):
             return batch.to(self.device)
 
@@ -307,15 +399,28 @@ class Trainer(object):
             return contextlib.nullcontext()
         return self.profiler.record(name)
 
+    def _store_rollout(self, rollout: EpisodeData) -> None:
+        training = not (
+            self.algorithm in ('gcbc', 'gcsl')
+            and np.random.rand() < self.gcbc_validation_fraction
+        )
+        self.replay.add_rollout(rollout, training=training)
+
     def collect_random_rollout(self, *, store: bool = True, env: Optional[FixedLengthEnvWrapper] = None) -> EpisodeData:
         with self._record('env/random_rollout'):
+            if self.algorithm in ('gcbc', 'gcsl'):
+                random_actor = lambda _obs, _goal, _space: (
+                    self.agent.actor.sample_uniform_action().cpu().numpy()
+                )
+            else:
+                random_actor = lambda _obs, _goal, space: space.sample()
             rollout = self.replay.collect_rollout(
-                lambda obs, goal, space: space.sample(),
+                random_actor,
                 env=env,
             )
         if store:
             with self._record('env/add_rollout'):
-                self.replay.add_rollout(rollout)
+                self._store_rollout(rollout)
         return rollout
 
     def collect_rollout(self, *, eval: bool = False, store: bool = True,
@@ -328,7 +433,7 @@ class Trainer(object):
                 goal = goal[None].to(self.device)
             with self._record('env/actor_forward'):
                 adistn = self.agent.act(obs, goal)
-            if eval:
+            if eval or self.algorithm in ('gcbc', 'gcsl'):
                 with self._record('env/action_to_cpu'):
                     a = adistn.mean.cpu().numpy()[0]
             else:
@@ -346,7 +451,7 @@ class Trainer(object):
             rollout = self.replay.collect_rollout(actor, env=env)
         if store:
             with self._record('env/add_rollout'):
-                self.replay.add_rollout(rollout)
+                self._store_rollout(rollout)
         return rollout
 
     def evaluate(
@@ -429,7 +534,10 @@ class Trainer(object):
                 for _ in tqdm(
                         range(self.replay.num_episodes_realized, num_prefill_episodes),
                         desc='prefill'):
-                    self.collect_random_rollout(env=env)
+                    if self.algorithm == 'crl':
+                        self.collect_rollout(env=env)
+                    else:
+                        self.collect_random_rollout(env=env)
         else:
             logging.info(
                 f"Skipping prefill because replay already has "
@@ -444,7 +552,12 @@ class Trainer(object):
                 env = self.make_collect_env()
             with self._record('env/rollout_cycle'):
                 for _ in range(self.num_rollouts_per_cycle):
-                    self.collect_rollout(env=env)
+                    if (
+                            self.replay.num_transitions_realized
+                            < self.random_policy_env_steps):
+                        self.collect_random_rollout(env=env)
+                    else:
+                        self.collect_rollout(env=env)
 
                     if self.replay.num_transitions_realized >= total_env_steps:
                         break

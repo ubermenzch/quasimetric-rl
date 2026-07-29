@@ -1,0 +1,5 @@
+# TD-InfoNCE-M: official deep online architecture, already in the M budget.
+model_size: TD-InfoNCE-M
+baselines:
+  td_infonce:
+    hidden_sizes: [512, 512, 512, 512]

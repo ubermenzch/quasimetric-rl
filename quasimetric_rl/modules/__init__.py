@@ -238,6 +238,7 @@ class QRLConf:
             attrs.validators.in_((
                 'QRL-S', 'QRL-M', 'QRL-L',
                 'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L',
+                'TD-InfoNCE-M', 'CRL-M', 'GCBC-M', 'C-Learning-M',
             ))
         ),
     )

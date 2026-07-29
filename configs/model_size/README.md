@@ -10,12 +10,41 @@ Tasks select a QRL or GO-QRL network with one Hydra config-group override:
 +go_qrl_model_size=s
 +go_qrl_model_size=m
 +go_qrl_model_size=l
+
++td_infonce_model_size=m
++crl_model_size=m
++gcbc_model_size=m
++c_learning_model_size=m
 ```
 
 The selected level is recorded as `agent.model_size` in each run's
 `config.yaml`. Edit the corresponding YAML under `qrl/` or `go_qrl/` to change
 every future task that selects that level. `+base_model_size=...` remains a
 compatibility alias for `+qrl_model_size=...`.
+
+The four reward-free baselines currently define an M level only. M is an
+algorithm-specific trainable-parameter budget, not a requirement that every
+method use the same depth, width, or representation dimension. This preserves
+each method's structure while keeping all seven task shapes between 4.0M and
+4.5M trainable parameters:
+
+| Family | M hidden layers | Representation | Trainable range |
+| --- | --- | ---: | ---: |
+| TD-InfoNCE | `512 x 4` | 16 | 3.994M-4.030M |
+| CRL | `1152 x 2` | 64 | 4.161M-4.214M |
+| GCBC | `2304 -> 1728` | n/a | 4.019M-4.190M |
+| C-Learning | `1184 x 2` | n/a | 4.253M-4.334M |
+
+Counts include the actor, trainable critics/encoders, and CRL's trainable
+entropy scalar. They exclude frozen target-network copies, matching the
+trainable-parameter convention used by QRL and GO-QRL. TD-InfoNCE and
+C-Learning retain roughly 7.2M and 7.1M resident parameters respectively when
+their frozen targets are included. The YAML files are the source of truth for
+future M-level tasks. They override hidden widths only. Representation
+dimensions, layer count, and every non-capacity setting come from the corresponding
+reference default in `quasimetric_rl/modules/gcrl_baselines.py` and are
+protected by regression tests. Selecting M does not change an optimizer,
+objective, batch size, replay setting, relabeling rule, or update frequency.
 
 ## Selection rule
 

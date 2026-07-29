@@ -579,6 +579,17 @@ def task_parameter_count(task: Task) -> str:
 
 
 def task_variant(task: Task) -> str:
+    algorithm = extra_arg_value(task.extra_args, "agent.algorithm")
+    baseline_labels = {
+        "td_infonce": "TD-InfoNCE",
+        "crl": "CRL",
+        "gcbc": "GCBC",
+        "gcsl": "GCSL/GCBC",
+        "c_learning": "C-Learning",
+    }
+    if algorithm in baseline_labels:
+        return baseline_labels[algorithm]
+
     implementation = extra_arg_value(
         task.extra_args, "agent.goal_set_distance.losses.implementation"
     )
@@ -642,7 +653,11 @@ def task_variant(task: Task) -> str:
             latent_goal_steps = extra_arg_value(
                 task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
             )
-            mode_label = f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
+            mode_label = (
+                "Inner0"
+                if latent_goal_steps == "0"
+                else f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
+            )
             modules = ["GO-QRL", mode_label]
             if latent_goal_search == "residual":
                 modules.append("Res")

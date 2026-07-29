@@ -1,9 +1,17 @@
 import unittest
 from collections import Counter
 
+import gym
+import numpy as np
+from omegaconf import OmegaConf, SCMode
+
+from quasimetric_rl.data.env_spec import EnvSpec
+from quasimetric_rl.model_size import load_model_size_preset
+from quasimetric_rl.modules import QRLConf
 from tools.generate_online_baseline_tasks import (
     ALGORITHMS,
     ENVIRONMENTS,
+    MODEL_SIZE_FAMILIES,
     TRAINING_SEEDS,
     baseline_parameter_count,
     evaluation_episode_count,
@@ -42,18 +50,70 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
             self.assertIn('keep_only_latest_checkpoint=false', args)
             self.assertIn('save_replay_buffer=true', args)
             self.assertIn('save_final_replay_buffer=true', args)
+            self.assertIn('batch_size=256', args)
             self.assertEqual(
                 sum(value.startswith('agent.algorithm=') for value in args), 1,
             )
+            algorithm = next(
+                value.split('=', 1)[1]
+                for value in args if value.startswith('agent.algorithm=')
+            )
+            self.assertIn(
+                f'+{MODEL_SIZE_FAMILIES[algorithm]}_model_size=m', args,
+            )
+            self.assertIn('-M_', task.task_id)
 
-    def test_parameter_counts_are_positive_for_every_task_shape(self):
+    def test_parameter_counts_are_in_m_budget_for_every_task_shape(self):
         for _, algorithm in ALGORITHMS:
             for _, _, _, state_dim, action_dim, goal_dim in ENVIRONMENTS:
-                self.assertGreater(
+                count = baseline_parameter_count(
+                    algorithm, state_dim, action_dim, goal_dim,
+                )
+                self.assertGreaterEqual(count, 3_990_000)
+                self.assertLessEqual(count, 4_500_000)
+
+    def test_can_generate_one_algorithm_for_server_assignment(self):
+        tasks = generate_tasks(('crl',))
+        self.assertEqual(len(tasks), len(ENVIRONMENTS) * len(TRAINING_SEEDS))
+        self.assertTrue(all('agent.algorithm=crl' in task.extra_args for task in tasks))
+
+    def test_count_formula_matches_instantiated_trainable_modules(self):
+        _kind, _name, _slug, state_dim, action_dim, goal_dim = ENVIRONMENTS[0]
+        env_spec = EnvSpec(
+            observation_space=gym.spaces.Box(
+                -np.inf, np.inf, shape=(state_dim,), dtype=np.float32,
+            ),
+            observation_space_is_dict=True,
+            action_space=gym.spaces.Box(
+                -1, 1, shape=(action_dim,), dtype=np.float32,
+            ),
+        )
+        for _display_name, algorithm in ALGORITHMS:
+            with self.subTest(algorithm=algorithm):
+                merged = OmegaConf.merge(
+                    OmegaConf.structured(QRLConf()),
+                    load_model_size_preset(algorithm, 'm'),
+                )
+                conf = OmegaConf.to_container(
+                    merged, structured_config_mode=SCMode.INSTANTIATE,
+                )
+                conf.algorithm = algorithm
+                agent, losses = conf.make(
+                    env_spec=env_spec,
+                    total_optim_steps=1,
+                    goal_set_dims=tuple(range(goal_dim)),
+                )
+                actual = sum(
+                    parameter.numel()
+                    for module in (agent, losses)
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                )
+                self.assertEqual(
+                    actual,
                     baseline_parameter_count(
                         algorithm, state_dim, action_dim, goal_dim,
                     ),
-                    0,
                 )
 
 

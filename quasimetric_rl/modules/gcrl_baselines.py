@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from typing import Any, Mapping, Optional, Tuple
 
 import attrs
+import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +14,10 @@ from .utils import InfoT, LossResult, MLP, Module
 
 
 BASELINE_ALGORITHMS = ('td_infonce', 'crl', 'gcbc', 'gcsl', 'c_learning')
+TD_INFONCE_REFERENCE_REVISION = '18f4e7e5872da9c3653f57661d01b4fbce85b50e'
+CRL_REFERENCE_REVISION = '7c53a0743a41423029abd17eb365c4822bf13687'
+GCSL_REFERENCE_REVISION = 'cfae5609cee79e5a2228fb7653451023c41a64cb'
+C_LEARNING_REFERENCE_REVISION = 'ec7c3d346277b737bc2decffcd1b533d4b7ec105'
 
 
 def _positive_tuple(value):
@@ -24,6 +29,7 @@ def _positive_tuple(value):
 
 @attrs.define(kw_only=True)
 class TDInfoNCEConf:
+    reference_revision: str = TD_INFONCE_REFERENCE_REVISION
     hidden_sizes: Tuple[int, ...] = attrs.field(
         default=(512, 512, 512, 512), converter=_positive_tuple,
     )
@@ -42,10 +48,17 @@ class TDInfoNCEConf:
     representation_temperature: float = attrs.field(
         default=1.0, validator=attrs.validators.gt(0),
     )
+    batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
+    updates_per_env_step: float = attrs.field(
+        default=1.0, validator=attrs.validators.gt(0),
+    )
+    min_replay_size: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    max_replay_size: int = attrs.field(default=1_000_000, validator=attrs.validators.gt(0))
 
 
 @attrs.define(kw_only=True)
 class CRLConf:
+    reference_revision: str = CRL_REFERENCE_REVISION
     hidden_sizes: Tuple[int, ...] = attrs.field(
         default=(256, 256), converter=_positive_tuple,
     )
@@ -83,18 +96,46 @@ class CRLConf:
     random_goal_fraction: float = attrs.field(
         default=0.0, validator=attrs.validators.in_((0.0, 0.5, 1.0)),
     )
+    batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
+    # JaxGCRL computes this from its default 1001-step episode, 256 batch,
+    # and 62 updates per unroll (approximately 1:16).
+    updates_per_env_step: float = attrs.field(
+        default=1001 / (256 * 62), validator=attrs.validators.gt(0),
+    )
+    min_replay_size: int = attrs.field(default=1_000, validator=attrs.validators.gt(0))
+    max_replay_size: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
 
 
 @attrs.define(kw_only=True)
 class GCBCConf:
+    reference_revision: str = GCSL_REFERENCE_REVISION
     hidden_sizes: Tuple[int, ...] = attrs.field(
         default=(400, 300), converter=_positive_tuple,
     )
     actor_lr: float = attrs.field(default=5e-4, validator=attrs.validators.gt(0))
+    action_granularity: int = attrs.field(default=3, validator=attrs.validators.gt(1))
+    start_policy_timesteps: int = attrs.field(
+        default=1_000, validator=attrs.validators.ge(0),
+    )
+    explore_timesteps: int = attrs.field(
+        default=10_000, validator=attrs.validators.ge(0),
+    )
+    validation_fraction: float = attrs.field(
+        default=0.2,
+        validator=attrs.validators.and_(attrs.validators.ge(0), attrs.validators.lt(1)),
+    )
+    replay_capacity_trajectories: int = attrs.field(
+        default=20_000, validator=attrs.validators.gt(0),
+    )
+    batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
+    updates_per_env_step: float = attrs.field(
+        default=1.0, validator=attrs.validators.gt(0),
+    )
 
 
 @attrs.define(kw_only=True)
 class CLearningConf:
+    reference_revision: str = C_LEARNING_REFERENCE_REVISION
     hidden_sizes: Tuple[int, ...] = attrs.field(
         default=(256, 256), converter=_positive_tuple,
     )
@@ -109,6 +150,33 @@ class CLearningConf:
         validator=attrs.validators.and_(attrs.validators.gt(0), attrs.validators.le(1)),
     )
     odds_clip: float = attrs.field(default=20.0, validator=attrs.validators.gt(0))
+    critic_loss_weight: float = attrs.field(
+        default=0.5, validator=attrs.validators.ge(0),
+    )
+    relabel_next_probability: float = attrs.field(
+        default=0.5,
+        validator=attrs.validators.and_(attrs.validators.ge(0), attrs.validators.le(1)),
+    )
+    relabel_future_probability: float = attrs.field(
+        default=0.0,
+        validator=attrs.validators.and_(attrs.validators.ge(0), attrs.validators.le(1)),
+    )
+    batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
+    updates_per_env_step: float = attrs.field(
+        default=1.0, validator=attrs.validators.gt(0),
+    )
+    initial_collect_steps: int = attrs.field(
+        default=10_000, validator=attrs.validators.gt(0),
+    )
+    replay_buffer_capacity: int = attrs.field(
+        default=1_000_000, validator=attrs.validators.gt(0),
+    )
+
+    def __attrs_post_init__(self) -> None:
+        if self.relabel_next_probability + self.relabel_future_probability != 0.5:
+            raise ValueError(
+                'C-Learning requires next and future relabel probabilities to sum to 0.5'
+            )
 
 
 @attrs.define(kw_only=True)
@@ -131,11 +199,16 @@ class GCRLBaselinesConf:
         state_dim = env_spec.observation_shape.numel()
         action_dim = env_spec.action_shape.numel()
         _validate_goal_dims(goal_dims, state_dim)
+        actor_log_std_bounds = None
+        actor_min_std = None
+        actor_action_granularity = None
 
         if algorithm == 'td_infonce':
             conf = self.td_infonce
             actor_hidden_sizes = conf.hidden_sizes
             actor_activation = 'relu'
+            actor_init_scheme = 'td_infonce'
+            actor_min_std = 1e-6
             critic = TDInfoNCECritic(
                 state_dim=state_dim,
                 action_dim=action_dim,
@@ -160,6 +233,8 @@ class GCRLBaselinesConf:
             conf = self.crl
             actor_hidden_sizes = conf.hidden_sizes
             actor_activation = conf.activation
+            actor_init_scheme = 'crl'
+            actor_log_std_bounds = (-5.0, 2.0)
             critic = ContrastiveCritic(
                 state_dim=state_dim,
                 action_dim=action_dim,
@@ -175,11 +250,15 @@ class GCRLBaselinesConf:
             conf = self.gcbc
             actor_hidden_sizes = conf.hidden_sizes
             actor_activation = 'relu'
+            actor_init_scheme = 'torch_default'
+            actor_action_granularity = conf.action_granularity
             critic = target_critic = None
         else:
             conf = self.c_learning
             actor_hidden_sizes = conf.hidden_sizes
             actor_activation = 'relu'
+            actor_init_scheme = 'c_learning'
+            actor_min_std = 0.0
             critic = CLearningCritic(
                 state_dim=state_dim,
                 action_dim=action_dim,
@@ -200,6 +279,10 @@ class GCRLBaselinesConf:
             goal_dim=len(goal_dims),
             hidden_sizes=actor_hidden_sizes,
             activation=actor_activation,
+            init_scheme=actor_init_scheme,
+            log_std_bounds=actor_log_std_bounds,
+            min_std=actor_min_std,
+            action_granularity=actor_action_granularity,
         )
         agent = GCRLBaselineAgent(
             algorithm=algorithm,
@@ -238,24 +321,135 @@ def _activation_type(name: str):
     raise ValueError(f'Unknown activation: {name!r}')
 
 
+def _initialize_mlp(mlp: MLP, scheme: str) -> None:
+    with torch.no_grad():
+        for module in mlp.modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            fan_in = module.weight.shape[1]
+            if scheme == 'td_infonce':
+                nn.init.uniform_(module.weight, -(3 / fan_in) ** 0.5, (3 / fan_in) ** 0.5)
+                nn.init.zeros_(module.bias)
+            elif scheme == 'crl':
+                nn.init.uniform_(module.weight, -fan_in ** -0.5, fan_in ** -0.5)
+                nn.init.zeros_(module.bias)
+            elif scheme == 'torch_default':
+                module.reset_parameters()
+            elif scheme == 'c_learning':
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+                if module is mlp.module[-1]:
+                    nn.init.uniform_(
+                        module.weight,
+                        -(0.3 / fan_in) ** 0.5,
+                        (0.3 / fan_in) ** 0.5,
+                    )
+            elif scheme != 'glorot':
+                raise ValueError(f'Unknown MLP initialization scheme: {scheme!r}')
+
+
+class DiscretizedActionDistribution:
+    def __init__(self, logits: torch.Tensor, action_table: torch.Tensor):
+        self.logits = logits
+        self.action_table = action_table
+        self._categorical = torch.distributions.Categorical(logits=logits)
+        self.batch_shape = logits.shape[:-1]
+        self.event_shape = action_table.shape[1:]
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self.action_table[self.logits.argmax(dim=-1)]
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return self.mean
+
+    def sample(self, sample_shape=torch.Size()) -> torch.Tensor:
+        return self.action_table[self._categorical.sample(sample_shape)]
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        distance = (
+            value.unsqueeze(-2) - self.action_table
+        ).square().sum(dim=-1)
+        return self._categorical.log_prob(distance.argmin(dim=-1))
+
+
 class GoalConditionedPolicy(Module):
     def __init__(
             self, *, env_spec: EnvSpec, goal_dim: int,
-            hidden_sizes: Tuple[int, ...], activation: str):
+            hidden_sizes: Tuple[int, ...], activation: str,
+            init_scheme: str,
+            log_std_bounds: Optional[Tuple[float, float]] = None,
+            min_std: Optional[float] = None,
+            action_granularity: Optional[int] = None):
         super().__init__()
         state_dim = env_spec.observation_shape.numel()
+        self.action_output = env_spec.make_action_output_distn()
+        if action_granularity is None:
+            output_size = self.action_output.input_size
+            action_table = None
+        else:
+            if not isinstance(env_spec.action_space, gym.spaces.Box):
+                raise TypeError('GCSL action discretization requires Box actions')
+            axes = [
+                torch.linspace(float(low), float(high), action_granularity)
+                for low, high in zip(
+                    env_spec.action_space.low.reshape(-1),
+                    env_spec.action_space.high.reshape(-1),
+                )
+            ]
+            mesh = torch.meshgrid(*axes, indexing='xy')
+            action_table = torch.stack(
+                [values.reshape(-1) for values in mesh], dim=-1,
+            ).reshape(-1, *env_spec.action_shape)
+            output_size = action_granularity ** env_spec.action_shape.numel()
         self.backbone = MLP(
             state_dim + goal_dim,
-            env_spec.make_action_output_distn().input_size,
+            output_size,
             hidden_sizes=hidden_sizes,
             activation_fn=_activation_type(activation),
         )
-        self.action_output = env_spec.make_action_output_distn()
+        _initialize_mlp(self.backbone, init_scheme)
+        self.register_buffer('action_table', action_table)
+        if (log_std_bounds is not None or min_std is not None) and not hasattr(
+                self.action_output, 'from_mean_and_std'):
+            raise TypeError('Custom policy standard deviation requires Box actions')
+        if min_std is not None and min_std < 0:
+            raise ValueError(f'Expected min_std >= 0, got {min_std}')
+        self.log_std_bounds = log_std_bounds
+        self.min_std = min_std
+
+    def sample_uniform_action(self) -> torch.Tensor:
+        if self.action_table is None:
+            raise RuntimeError('Uniform discrete actions are only defined for GCSL')
+        index = torch.randint(
+            self.action_table.shape[0], (), device=self.action_table.device,
+        )
+        return self.action_table[index]
 
     def forward(
             self, observation: torch.Tensor,
             goal: torch.Tensor) -> torch.distributions.Distribution:
-        return self.action_output(self.backbone(torch.cat([observation, goal], dim=-1)))
+        features = self.backbone(torch.cat([observation, goal], dim=-1))
+        if self.action_table is not None:
+            return DiscretizedActionDistribution(features, self.action_table)
+        if self.log_std_bounds is None and self.min_std is None:
+            return self.action_output(features)
+
+        action_shape = self.action_output.action_shape
+        mean, raw_log_std = features.view(
+            *features.shape[:-1], 2, *action_shape
+        ).unbind(dim=-len(action_shape) - 1)
+        if self.log_std_bounds is None:
+            return self.action_output.from_mean_and_std(
+                mean, F.softplus(raw_log_std) + self.min_std,
+            )
+
+        lower, upper = self.log_std_bounds
+        log_std = lower + 0.5 * (upper - lower) * (
+            torch.tanh(raw_log_std) + 1
+        )
+        return self.action_output.from_mean_and_std(mean, log_std.exp())
 
 
 class ContrastiveCritic(Module):
@@ -277,6 +471,8 @@ class ContrastiveCritic(Module):
             hidden_sizes=hidden_sizes,
             activation_fn=activation_fn,
         )
+        _initialize_mlp(self.sa_encoder, 'crl')
+        _initialize_mlp(self.goal_encoder, 'crl')
         self.energy = energy
         self.representation_norm = representation_norm
 
@@ -298,7 +494,14 @@ class ContrastiveCritic(Module):
         if self.energy == 'dot':
             return (left * right).sum(dim=-1)
         if self.energy == 'cosine':
-            return F.cosine_similarity(left, right, dim=-1, eps=1e-6)
+            return (
+                (left * right).sum(dim=-1)
+                / (
+                    torch.linalg.vector_norm(left)
+                    * torch.linalg.vector_norm(right)
+                    + 1e-6
+                )
+            )
         raise RuntimeError(f'Unknown energy: {self.energy!r}')
 
     def pairwise(
@@ -329,6 +532,8 @@ class TDInfoNCECritic(Module):
             MLP(goal_dim, representation_dim, hidden_sizes=hidden_sizes)
             for _ in range(2)
         ])
+        for encoder in (*self.sag_encoders, *self.future_encoders):
+            _initialize_mlp(encoder, 'td_infonce')
         self.representation_norm = representation_norm
         self.representation_temperature = representation_temperature
 
@@ -343,8 +548,12 @@ class TDInfoNCECritic(Module):
             sag_repr = sag_encoder(sag_input)
             future_repr = future_encoder(candidate_goals)
             if self.representation_norm:
-                sag_repr = F.normalize(sag_repr, dim=-1)
-                future_repr = F.normalize(future_repr, dim=-1)
+                sag_repr = sag_repr / (
+                    torch.linalg.vector_norm(sag_repr, dim=-1, keepdim=True) + 1e-8
+                )
+                future_repr = future_repr / (
+                    torch.linalg.vector_norm(future_repr, dim=-1, keepdim=True) + 1e-8
+                )
                 sag_repr = sag_repr / self.representation_temperature
             outputs.append(torch.einsum('ik,jk->ij', sag_repr, future_repr))
         return torch.stack(outputs, dim=-1)
@@ -469,8 +678,10 @@ class GCRLBaselineLosses(Module):
         batch_size = data.num_transitions
         labels = torch.arange(batch_size, device=data.device)
 
-        permutation = torch.randperm(batch_size, device=data.device)
-        random_goal = agent.extract_goal(data.observations[permutation])
+        shift = int(torch.randint(batch_size, (), device=data.device).item())
+        random_goal = agent.extract_goal(torch.roll(
+            data.observations, shifts=shift, dims=0,
+        ))
         next_goal = agent.extract_goal(data.next_observations)
         negative_goal = torch.roll(random_goal, shifts=-1, dims=0)
 
@@ -542,10 +753,7 @@ class GCRLBaselineLosses(Module):
                 + F.cross_entropy(logits.transpose(0, 1), labels)
             )
         else:
-            identity = torch.eye(
-                data.num_transitions, device=data.device, dtype=logits.dtype,
-            )
-            critic_loss = F.binary_cross_entropy_with_logits(logits, identity)
+            critic_loss = -torch.sigmoid(logits).mean()
         logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
         critic_loss = critic_loss + conf.logsumexp_penalty * logsumexp.square().mean()
 
@@ -560,8 +768,7 @@ class GCRLBaselineLosses(Module):
             actor_goal = torch.roll(future_goal, 1, 0)
 
         actor_dist = agent.actor(actor_observation, actor_goal)
-        actor_action = actor_dist.rsample()
-        log_prob = actor_dist.log_prob(actor_action)
+        actor_action, log_prob = actor_dist.rsample_with_log_prob()
         with _frozen(critic):
             actor_value = critic.paired(actor_observation, actor_action, actor_goal)
 
@@ -602,9 +809,37 @@ class GCRLBaselineLosses(Module):
             'negative_log_likelihood': nll.mean(),
         }
 
-    def _c_learning_losses(
+    def _c_learning_goals(
             self, agent: GCRLBaselineAgent,
-            data: BatchData) -> Tuple[torch.Tensor, torch.Tensor, InfoT]:
+            data: BatchData) -> torch.Tensor:
+        batch_size = data.num_transitions
+        conf = self.c_learning_conf
+        num_next = round(batch_size * conf.relabel_next_probability)
+        num_future = round(batch_size * conf.relabel_future_probability)
+        half_batch = batch_size // 2
+        if half_batch == 0:
+            raise ValueError('C-Learning requires batch_size >= 2')
+        if num_future != 0:
+            raise NotImplementedError(
+                'The source-default TD C-Learning port requires '
+                'relabel_future_probability=0'
+            )
+        if num_next != half_batch:
+            raise ValueError(
+                f'Expected {half_batch} next goals for batch_size={batch_size}, '
+                f'got {num_next}'
+            )
+
+        num_random = batch_size - num_next - num_future
+        random_pool = data.observations[:num_random]
+        permutation = torch.randperm(num_random, device=data.device)
+        random_goal = agent.extract_goal(random_pool[permutation])
+        next_goal = agent.extract_goal(data.next_observations[:num_next])
+        return torch.cat([next_goal, random_goal], dim=0)
+
+    def _c_learning_critic_loss(
+            self, agent: GCRLBaselineAgent, data: BatchData,
+            goals: torch.Tensor) -> Tuple[torch.Tensor, InfoT]:
         critic = agent.critic
         target_critic = agent.target_critic
         assert isinstance(critic, CLearningCritic)
@@ -612,22 +847,13 @@ class GCRLBaselineLosses(Module):
         conf = self.c_learning_conf
         batch_size = data.num_transitions
         half_batch = batch_size // 2
-        if half_batch == 0:
-            raise ValueError('C-Learning requires batch_size >= 2')
-
-        num_random = batch_size - half_batch
-        random_pool = data.observations[:num_random]
-        permutation = torch.randperm(num_random, device=data.device)
-        random_goal = agent.extract_goal(random_pool[permutation])
-        next_goal = agent.extract_goal(data.next_observations[:half_batch])
-        goals = torch.cat([next_goal, random_goal], dim=0)
 
         with torch.no_grad():
             next_action = agent.actor(data.next_observations, goals).sample()
             target_probability = target_critic.logits(
                 data.next_observations, next_action, goals,
             ).sigmoid().amin(dim=-1)
-            odds = target_probability / (1 - target_probability).clamp_min(1e-6)
+            odds = target_probability / (1 - target_probability)
             odds = odds.clamp(max=conf.odds_clip)
             recursive_target = conf.discount * odds / (1 + conf.discount * odds)
             next_achieved_goal = agent.extract_goal(data.next_observations)
@@ -642,7 +868,23 @@ class GCRLBaselineLosses(Module):
         per_classifier_loss = F.binary_cross_entropy_with_logits(
             logits, targets[:, None].expand_as(logits), reduction='none',
         )
-        critic_loss = (sample_weights * per_classifier_loss.sum(dim=-1)).mean()
+        critic_loss = conf.critic_loss_weight * (
+            sample_weights * per_classifier_loss.sum(dim=-1)
+        ).mean()
+
+        return critic_loss, {
+            'critic_loss': critic_loss,
+            'classifier_probability': logits.sigmoid().mean(),
+            'target_probability': targets.mean(),
+            'importance_weight': sample_weights.mean(),
+            'odds': odds.mean(),
+        }
+
+    def _c_learning_actor_loss(
+            self, agent: GCRLBaselineAgent, data: BatchData,
+            goals: torch.Tensor) -> Tuple[torch.Tensor, InfoT]:
+        critic = agent.critic
+        assert isinstance(critic, CLearningCritic)
 
         actor_dist = agent.actor(data.observations, goals)
         actor_action = actor_dist.rsample()
@@ -652,14 +894,20 @@ class GCRLBaselineLosses(Module):
             ).sigmoid().amin(dim=-1)
             actor_loss = -actor_probability.mean()
 
-        info = {
-            'critic_loss': critic_loss,
-            'actor_loss': actor_loss,
-            'classifier_probability': logits.sigmoid().mean(),
-            'target_probability': targets.mean(),
-            'importance_weight': sample_weights.mean(),
-            'odds': odds.mean(),
-        }
+        return actor_loss, {'actor_loss': actor_loss}
+
+    def _c_learning_losses(
+            self, agent: GCRLBaselineAgent,
+            data: BatchData) -> Tuple[torch.Tensor, torch.Tensor, InfoT]:
+        goals = self._c_learning_goals(agent, data)
+        critic_loss, critic_info = self._c_learning_critic_loss(
+            agent, data, goals,
+        )
+        actor_loss, actor_info = self._c_learning_actor_loss(
+            agent, data, goals,
+        )
+
+        info = {**critic_info, **actor_info}
         return critic_loss, actor_loss, info
 
     def forward(
@@ -675,6 +923,7 @@ class GCRLBaselineLosses(Module):
         if self.alpha_optim is not None:
             self.alpha_optim.zero_grad()
 
+        critic_already_optimized = False
         if self.algorithm == 'td_infonce':
             critic_loss, actor_loss, info = self._td_infonce_losses(agent, data)
             alpha_loss = None
@@ -685,16 +934,28 @@ class GCRLBaselineLosses(Module):
             critic_loss = actor_loss.new_zeros(())
             alpha_loss = None
         else:
-            critic_loss, actor_loss, info = self._c_learning_losses(agent, data)
+            goals = self._c_learning_goals(agent, data)
+            critic_loss, critic_info = self._c_learning_critic_loss(
+                agent, data, goals,
+            )
+            if optimize:
+                assert self.critic_optim is not None
+                critic_loss.backward()
+                self.critic_optim.step()
+                critic_already_optimized = True
+            actor_loss, actor_info = self._c_learning_actor_loss(
+                agent, data, goals,
+            )
+            info = {**critic_info, **actor_info}
             alpha_loss = None
 
         if optimize:
-            if self.critic_optim is not None:
+            if self.critic_optim is not None and not critic_already_optimized:
                 critic_loss.backward()
             actor_loss.backward()
             if alpha_loss is not None:
                 alpha_loss.backward()
-            if self.critic_optim is not None:
+            if self.critic_optim is not None and not critic_already_optimized:
                 self.critic_optim.step()
             self.actor_optim.step()
             if self.alpha_optim is not None:
