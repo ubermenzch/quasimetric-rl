@@ -12,6 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -637,10 +638,36 @@ def compact_count(value: str) -> str:
     return str(count)
 
 
+@lru_cache(maxsize=None)
+def model_size_preset_critic_count(family: str, level: str) -> str:
+    if family == "base":
+        family = "qrl"
+    path = ROOT / "configs" / "model_size" / family / f"{level.lower()}.yaml"
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        match = re.fullmatch(r"num_critics:\s*(\d+)\s*(?:#.*)?", line)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def task_critic_count(task: Task) -> str:
     value = extra_arg_value(task.extra_args, "agent.num_critics")
     if value:
         return value
+    for group, family in (
+        ("+go_qrl_model_size", "go_qrl"),
+        ("+qrl_model_size", "qrl"),
+        ("+base_model_size", "base"),
+    ):
+        level = extra_arg_value(task.extra_args, group)
+        if level:
+            value = model_size_preset_critic_count(family, level)
+            if value:
+                return value
     match = re.search(r"(?:^|_)(\d+)q(?:_|$)", task.task_id, re.IGNORECASE)
     if match:
         return match.group(1)
@@ -672,6 +699,87 @@ def task_parameter_count(task: Task) -> str:
         return value
 
 
+def task_dynamics_factorial_variant(task: Task) -> str:
+    if "dynfac_" not in task.task_id:
+        return ""
+
+    id_match = re.search(
+        r"dynfac_(?:(A\d{2})-)?(S[01])-(IQE|MSE|Hybrid)-(ReLU|Leaky)",
+        task.task_id,
+        re.IGNORECASE,
+    )
+    code = id_match.group(1).upper() if id_match and id_match.group(1) else ""
+
+    separate = extra_arg_value(
+        task.extra_args,
+        "agent.quasimetric_critic.losses.separate_latent_dynamics",
+    ).lower()
+    separate_label = {"false": "S0", "true": "S1"}.get(separate, "")
+    if not separate_label and id_match:
+        separate_label = id_match.group(2).upper()
+
+    distance = extra_arg_value(
+        task.extra_args,
+        "agent.quasimetric_critic.losses.latent_dynamics.distance",
+    ).lower()
+    distance_label = {
+        "iqe": "IQE",
+        "mse": "MSE",
+        "iqe_mse": "Hybrid",
+    }.get(distance, "")
+    if not distance_label and id_match:
+        distance_label = {
+            "iqe": "IQE",
+            "mse": "MSE",
+            "hybrid": "Hybrid",
+        }[id_match.group(3).lower()]
+
+    activation = extra_arg_value(
+        task.extra_args,
+        "agent.quasimetric_critic.model.quasimetric_model.projector_activation",
+    ).lower()
+    activation_label = {
+        "relu": "ReLU",
+        "leaky_relu": "Leaky",
+    }.get(activation, "")
+    if not activation_label and id_match:
+        activation_label = {
+            "relu": "ReLU",
+            "leaky": "Leaky",
+        }[id_match.group(4).lower()]
+
+    goal_variant = re.search(
+        r"GO-QRL(?:\+|-)(?:Max|Min)\d+",
+        task.task_id,
+        re.IGNORECASE,
+    )
+    if goal_variant:
+        prefix = re.sub(
+            r"^GO-QRL-",
+            "GO-QRL+",
+            goal_variant.group(0),
+            flags=re.IGNORECASE,
+        )
+    else:
+        mode = extra_arg_value(
+            task.extra_args, "agent.actor.losses.min_dist.latent_goal_mode"
+        )
+        steps = extra_arg_value(
+            task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
+        )
+        prefix = (
+            f"GO-QRL+{mode.capitalize()}{steps}"
+            if mode in {"max", "min"} and steps
+            else "GO-QRL"
+        )
+
+    labels = [label for label in (separate_label, distance_label, activation_label) if label]
+    suffix = "-".join(labels)
+    if code:
+        suffix = f"{code}:{suffix}" if suffix else code
+    return f"{prefix}/{suffix}" if suffix else prefix
+
+
 def task_variant(task: Task) -> str:
     algorithm = extra_arg_value(task.extra_args, "agent.algorithm")
     baseline_labels = {
@@ -683,6 +791,10 @@ def task_variant(task: Task) -> str:
     }
     if algorithm in baseline_labels:
         return baseline_labels[algorithm]
+
+    dynamics_factorial_variant = task_dynamics_factorial_variant(task)
+    if dynamics_factorial_variant:
+        return dynamics_factorial_variant
 
     implementation = extra_arg_value(
         task.extra_args, "agent.goal_set_distance.losses.implementation"

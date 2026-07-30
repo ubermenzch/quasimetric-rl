@@ -291,6 +291,58 @@ class QueueTaskClassificationTest(unittest.TestCase):
         self.assertEqual(compact_count(task.steps), "100k")
         self.assertEqual(task_checkpoint_interval(task), "5k")
 
+    def test_model_size_presets_report_one_critic(self):
+        common = dict(
+            task_id="ablation_without_critic_metadata",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+        )
+        for group in (
+            "+go_qrl_model_size=m",
+            "+qrl_model_size=m",
+            "+base_model_size=m",
+        ):
+            with self.subTest(group=group):
+                task = WatcherTask(extra_args=group, **common)
+                self.assertEqual(task_critic_count(task), "1")
+
+    def test_unknown_model_size_preset_does_not_invent_a_critic_count(self):
+        task = WatcherTask(
+            task_id="ablation_without_critic_metadata",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+            extra_args="+go_qrl_model_size=unknown",
+        )
+
+        self.assertEqual(task_critic_count(task), "2")
+
+    def test_explicit_critic_count_overrides_model_size_preset(self):
+        task = WatcherTask(
+            task_id="ablation_without_critic_metadata",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+            extra_args="+go_qrl_model_size=m agent.num_critics=3",
+        )
+
+        self.assertEqual(task_critic_count(task), "3")
+
+    def test_task_without_critic_metadata_uses_legacy_default(self):
+        task = WatcherTask(
+            task_id="legacy_task",
+            mode="offline",
+            env_name="maze2d-umaze-v1",
+            seed="1000",
+            steps="40000",
+        )
+
+        self.assertEqual(task_critic_count(task), "2")
+
     def test_go_qrl_variant_is_derived_from_task_arguments(self):
         task = WatcherTask(
             task_id=(
@@ -320,6 +372,72 @@ class QueueTaskClassificationTest(unittest.TestCase):
             " agent.actor.losses.min_dist.latent_goal_residual_radius=1.0"
         )
         self.assertEqual(task_variant(task), "GO-QRL+Max8+BR1")
+
+    def test_dynamics_factorial_variants_are_distinct(self):
+        cases = (
+            ("A01", False, "iqe", "relu", "S0-IQE-ReLU"),
+            ("A02", False, "iqe", "leaky_relu", "S0-IQE-Leaky"),
+            ("A03", False, "mse", "relu", "S0-MSE-ReLU"),
+            ("A04", False, "mse", "leaky_relu", "S0-MSE-Leaky"),
+            ("A05", False, "iqe_mse", "relu", "S0-Hybrid-ReLU"),
+            ("A06", False, "iqe_mse", "leaky_relu", "S0-Hybrid-Leaky"),
+            ("A07", True, "iqe", "relu", "S1-IQE-ReLU"),
+            ("A08", True, "iqe", "leaky_relu", "S1-IQE-Leaky"),
+            ("A09", True, "mse", "relu", "S1-MSE-ReLU"),
+            ("A10", True, "mse", "leaky_relu", "S1-MSE-Leaky"),
+            ("A11", True, "iqe_mse", "relu", "S1-Hybrid-ReLU"),
+            ("A12", True, "iqe_mse", "leaky_relu", "S1-Hybrid-Leaky"),
+        )
+        for code, separate, distance, activation, label in cases:
+            with self.subTest(code=code):
+                task = WatcherTask(
+                    task_id=(
+                        f"ablation_GO-QRL+Max4-dynfac_{code}-{label}-M_"
+                        "200k_fetchpush_online_s1000"
+                    ),
+                    mode="online",
+                    env_name="FetchPush",
+                    seed="1000",
+                    steps="200000",
+                    extra_args=(
+                        "+go_qrl_model_size=m "
+                        "agent.actor.losses.min_dist.latent_goal_mode=max "
+                        "agent.actor.losses.min_dist.latent_goal_steps=4 "
+                        "agent.quasimetric_critic.losses."
+                        f"separate_latent_dynamics={str(separate).lower()} "
+                        "agent.quasimetric_critic.losses.latent_dynamics."
+                        f"distance={distance} "
+                        "agent.quasimetric_critic.model.quasimetric_model."
+                        f"projector_activation={activation}"
+                    ),
+                )
+                self.assertEqual(
+                    task_variant(task), f"GO-QRL+Max4/{code}:{label}"
+                )
+                self.assertEqual(task_critic_count(task), "1")
+
+    def test_legacy_dynamics_factorial_variant_has_no_ablation_code(self):
+        task = WatcherTask(
+            task_id=(
+                "ablation_GO-QRL+Max4-dynfac_S1-Hybrid-Leaky-M_100k_"
+                "antnavigate_v4_s1000"
+            ),
+            mode="online",
+            env_name="AntNavigate-v4",
+            seed="1000",
+            steps="100000",
+            extra_args=(
+                "+go_qrl_model_size=m "
+                "agent.quasimetric_critic.losses.separate_latent_dynamics=true "
+                "agent.quasimetric_critic.losses.latent_dynamics.distance=iqe_mse "
+                "agent.quasimetric_critic.model.quasimetric_model."
+                "projector_activation=leaky_relu"
+            ),
+        )
+
+        self.assertEqual(
+            task_variant(task), "GO-QRL+Max4/S1-Hybrid-Leaky"
+        )
 
     def test_zero_inner_steps_are_labeled_inner0(self):
         task = WatcherTask(

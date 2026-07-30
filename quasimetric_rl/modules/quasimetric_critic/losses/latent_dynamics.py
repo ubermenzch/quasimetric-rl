@@ -24,21 +24,43 @@ class LatentDynamicsLoss(CriticLossBase):
         # config / argparse uses this to specify behavior
 
         weight: float = attrs.field(default=0.1, validator=attrs.validators.gt(0))
-        distance: str = attrs.field(default='iqe', validator=attrs.validators.in_(('iqe', 'mse')))
+        distance: str = attrs.field(
+            default='iqe',
+            validator=attrs.validators.in_(('iqe', 'mse', 'iqe_mse')),
+        )
+        mse_weight: float = attrs.field(default=1.0, validator=attrs.validators.ge(0))
+        iqe_weight: float = attrs.field(default=1.0, validator=attrs.validators.ge(0))
 
         def make(self) -> 'LatentDynamicsLoss':
             return LatentDynamicsLoss(
                 weight=self.weight,
                 distance=self.distance,
+                mse_weight=self.mse_weight,
+                iqe_weight=self.iqe_weight,
             )
 
     weight: float
     distance: str
+    mse_weight: float
+    iqe_weight: float
 
-    def __init__(self, *, weight: float, distance: str):
+    def __init__(self, *, weight: float, distance: str,
+                 mse_weight: float = 1.0, iqe_weight: float = 1.0):
         super().__init__()
         self.weight = weight
         self.distance = distance
+        self.mse_weight = mse_weight
+        self.iqe_weight = iqe_weight
+
+    def _combine_distance_losses(
+            self, *, mse: torch.Tensor, sq_dists: torch.Tensor) -> torch.Tensor:
+        if self.distance == 'mse':
+            return mse
+        if self.distance == 'iqe':
+            return sq_dists
+        if self.distance == 'iqe_mse':
+            return self.iqe_weight * sq_dists + self.mse_weight * mse
+        raise ValueError(f'unknown latent dynamics distance: {self.distance!r}')
 
     @contextlib.contextmanager
     def _quasimetric_model_requiring_grad(self, critic_batch_info: CriticBatchInfo, flag: bool):
@@ -81,13 +103,14 @@ class LatentDynamicsLoss(CriticLossBase):
         sq_dists = dists.square().mean()
         target_zy = critic_batch_info.zy.detach() if detach_critic_outputs else critic_batch_info.zy
         mse = F.mse_loss(pred_zy, target_zy)
-        loss_value = mse if self.distance == 'mse' else sq_dists
+        loss_value = self._combine_distance_losses(mse=mse, sq_dists=sq_dists)
 
         dist_p2n, dist_n2p = dists.unbind(-1)
         return LossResult(
             loss=loss_value * self.weight,
             info=dict(
                 distance_is_mse=float(self.distance == 'mse'),
+                distance_is_iqe_mse=float(self.distance == 'iqe_mse'),
                 mse=mse,
                 sq_dists=sq_dists,
                 dist_p2n=dist_p2n.mean(),
@@ -141,11 +164,12 @@ class LatentDynamicsLoss(CriticLossBase):
             dist_p2n = dist_p2n.mean()
             dist_n2p = dist_n2p.mean()
             mse = F.mse_loss(pred_z, z_target)
-        loss_value = mse if self.distance == 'mse' else sq_dists
+        loss_value = self._combine_distance_losses(mse=mse, sq_dists=sq_dists)
         return LossResult(
             loss=loss_value * self.weight,
             info=dict(
                 distance_is_mse=float(self.distance == 'mse'),
+                distance_is_iqe_mse=float(self.distance == 'iqe_mse'),
                 mse=mse,
                 sq_dists=sq_dists,
                 dist_p2n=dist_p2n,
@@ -154,4 +178,8 @@ class LatentDynamicsLoss(CriticLossBase):
         )
 
     def extra_repr(self) -> str:
-        return f"weight={self.weight:g}, distance={self.distance}"
+        weights = (
+            f", mse_weight={self.mse_weight:g}, iqe_weight={self.iqe_weight:g}"
+            if self.distance == 'iqe_mse' else ''
+        )
+        return f"weight={self.weight:g}, distance={self.distance}{weights}"

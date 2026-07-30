@@ -137,6 +137,12 @@ class BaseConf(abc.ABC):
                 specs.append(f"T={self.agent.quasimetric_critic.model.latent_dynamics.kind}")
             if self.agent.quasimetric_critic.losses.separate_latent_dynamics:
                 specs.append('Tsep')
+            quasimetric_model_conf = self.agent.quasimetric_critic.model.quasimetric_model
+            if quasimetric_model_conf.projector_activation != 'relu':
+                specs.append(
+                    f'Pact={quasimetric_model_conf.projector_activation}:'
+                    f'{quasimetric_model_conf.projector_negative_slope:g}'
+                )
             if self.agent.training_schedule != 'joint':
                 specs.append(self.agent.training_schedule)
             if self.agent.num_critics > 1:

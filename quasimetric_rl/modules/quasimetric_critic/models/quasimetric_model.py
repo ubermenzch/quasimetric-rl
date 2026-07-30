@@ -1,6 +1,7 @@
 from typing import *
 
 import attrs
+import functools
 
 import torch
 import torch.nn as nn
@@ -67,12 +68,22 @@ class QuasimetricModel(nn.Module):
         # config / argparse uses this to specify behavior
 
         projector_arch: Tuple[int, ...] = (512,)
+        projector_activation: str = attrs.field(
+            default='relu',
+            validator=attrs.validators.in_(('relu', 'leaky_relu')),
+        )
+        projector_negative_slope: float = attrs.field(
+            default=0.01,
+            validator=attrs.validators.ge(0),
+        )
         quasimetric_head_spec: str = 'iqe(dim=2048,components=64)'
 
         def make(self, *, input_size: int) -> 'QuasimetricModel':
             return QuasimetricModel(
                 input_size=input_size,
                 projector_arch=self.projector_arch,
+                projector_activation=self.projector_activation,
+                projector_negative_slope=self.projector_negative_slope,
                 quasimetric_head_spec=self.quasimetric_head_spec,
             )
 
@@ -80,11 +91,27 @@ class QuasimetricModel(nn.Module):
     projector: MLP
     quasimetric_head: torchqmet.QuasimetricBase
 
-    def __init__(self, *, input_size: int, projector_arch: Tuple[int, ...], quasimetric_head_spec: str):
+    def __init__(self, *, input_size: int, projector_arch: Tuple[int, ...],
+                 projector_activation: str = 'relu', projector_negative_slope: float = 0.01,
+                 quasimetric_head_spec: str):
         super().__init__()
         self.input_size = input_size
         self.quasimetric_head = create_quasimetric_head_from_spec(quasimetric_head_spec)
-        self.projector = MLP(input_size, self.quasimetric_head.input_size, hidden_sizes=projector_arch)
+        if projector_activation == 'relu':
+            activation_fn = nn.ReLU
+        elif projector_activation == 'leaky_relu':
+            activation_fn = functools.partial(
+                nn.LeakyReLU,
+                negative_slope=projector_negative_slope,
+            )
+        else:
+            raise ValueError(f'unknown projector activation: {projector_activation!r}')
+        self.projector = MLP(
+            input_size,
+            self.quasimetric_head.input_size,
+            hidden_sizes=projector_arch,
+            activation_fn=activation_fn,
+        )
 
     def project(self, z: LatentTensor) -> torch.Tensor:
         return self.projector(z)

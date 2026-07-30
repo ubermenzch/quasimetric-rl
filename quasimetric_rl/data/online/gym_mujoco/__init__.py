@@ -142,7 +142,11 @@ class GymMujocoGoalEnv(gym.Env):
         if self.name == 'Reacher-v4':
             return self._body_com('target')[:2].astype(np.float32)
         if self.name == 'Pusher-v4':
-            return self._body_com('goal').astype(np.float32)
+            goal = self._body_com('goal').copy()
+            # The visual marker lies on the table, while the task goal is the
+            # center of the object when it is positioned over that marker.
+            goal[2] = self._body_com('object')[2]
+            return goal.astype(np.float32)
         if self.name == 'AntNavigate-v4':
             angle = self._goal_rng.uniform(-np.pi, np.pi)
             radius = self._goal_rng.uniform(1.0, 5.0)
