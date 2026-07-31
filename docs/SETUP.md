@@ -183,6 +183,37 @@ Queue rows use seven tab-separated columns: `task_id`, `mode`, `env_name`,
 `params` when adding the task, either as an integer or a compact value such as
 `11.6m`. Legacy six-column rows remain valid and show an empty parameter field.
 
+The queue watcher's `#` column is recalculated from the current task-file order
+on every refresh. It is a display position, not a persistent task identifier.
+Use the stable first-column `task_id` when managing tasks.
+
+Permanently deleting a task removes its rows from the active task table and
+local `tasks.tsv.before_*` histories, its status and status temporary file, all
+attempt logs, result directory, and watcher ETA history. Deletion defaults to a
+dry run and requires an exact expected count when executed:
+
+```bash
+.venv/bin/python tools/delete_qrl_tasks.py \
+  --task-id 'official_qrl_1q_Base_M_200k_fetchpush_online_s1000'
+
+.venv/bin/python tools/delete_qrl_tasks.py \
+  --task-id 'official_qrl_1q_Base_M_200k_fetchpush_online_s1000' \
+  --yes --expect 1
+```
+
+Tasks can also be selected without knowing their full ID by combining stable
+metadata filters. Filters are ANDed across categories and ORed when a category
+is repeated:
+
+```bash
+.venv/bin/python tools/delete_qrl_tasks.py \
+  --task-id-glob 'official_qrl_1q_*' \
+  --state PAUSED --env-name FetchPush --seed 1000
+```
+
+Stop the scheduler before deleting any task still present in the active task
+table. Orphaned status records can be selected explicitly with `--orphaned`.
+
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set
 `SCALING_CRL_ROOT` to that checkout when using the diagnostic.

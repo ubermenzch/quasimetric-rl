@@ -924,7 +924,8 @@ def output_started(output_dir: Path) -> bool:
     if not output_dir.exists():
         return False
     try:
-        return any(path.name != TASK_MANIFEST_NAME for path in output_dir.iterdir())
+        manifest_files = {TASK_MANIFEST_NAME, f"{TASK_MANIFEST_NAME}.tmp"}
+        return any(path.name not in manifest_files for path in output_dir.iterdir())
     except OSError:
         return True
 
