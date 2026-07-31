@@ -18,8 +18,12 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +40,7 @@ CUDA_OOM_PATTERNS = (
 )
 TRANSIENT_LOG_TAIL_BYTES = 1024 * 1024
 TASK_MANIFEST_NAME = ".qrl_task.json"
+NOTIFICATION_STATE_VERSION = 1
 
 
 @dataclass
@@ -185,6 +190,488 @@ def resolve_executable(value: str) -> Path:
     """Resolve a configured executable without dereferencing virtualenv links."""
     path = Path(value)
     return path if path.is_absolute() else ROOT / path
+
+
+def notification_state_path(config: dict[str, str], status_dir: Path) -> Path:
+    configured = cfg(
+        config,
+        "NOTIFY_STATE_FILE",
+        cfg(config, "NTFY_STATE_FILE", ""),
+    ).strip()
+    return resolve_path(configured) if configured else status_dir / "notifications.json"
+
+
+def load_notification_state(path: Path) -> tuple[set[str], bool | None] | None:
+    """Load notification state, or return None when first enabled."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != NOTIFICATION_STATE_VERSION:
+        return None
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return None
+    pending_present = payload.get("pending_present")
+    if not isinstance(pending_present, bool):
+        pending_present = None
+    return (
+        {event for event in events if isinstance(event, str)},
+        pending_present,
+    )
+
+
+def save_notification_state(
+    path: Path,
+    events: set[str],
+    pending_present: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": NOTIFICATION_STATE_VERSION,
+        "updated_at": timestamp(),
+        "events": sorted(events),
+        "pending_present": pending_present,
+    }
+    tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp_path.replace(path)
+
+
+def send_ntfy_notification(
+    config: dict[str, str],
+    title: str,
+    message: str,
+    *,
+    priority: str = "default",
+    tags: str = "",
+) -> bool:
+    """Publish one ntfy message without allowing errors to stop training."""
+    topic_url = cfg(config, "NTFY_TOPIC_URL", "").strip()
+    if not topic_url:
+        return False
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Title": title,
+        "Priority": priority,
+    }
+    if tags:
+        headers["Tags"] = tags
+    token = cfg(config, "NTFY_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        topic_url,
+        data=message.encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    timeout = max(0.1, as_float(cfg(config, "NTFY_TIMEOUT_SECONDS", "10"), 10.0))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        print(
+            f"[{timestamp()}] WARNING: ntfy notification failed: HTTP {exc.code}",
+            flush=True,
+        )
+        return False
+    except urllib.error.URLError as exc:
+        print(
+            f"[{timestamp()}] WARNING: ntfy notification failed: {exc.reason}",
+            flush=True,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[{timestamp()}] WARNING: ntfy notification failed: {type(exc).__name__}",
+            flush=True,
+        )
+        return False
+    print(f"[{timestamp()}] NOTIFY_SENT title={title!r}", flush=True)
+    return True
+
+
+def send_serverchan_notification(
+    config: dict[str, str],
+    title: str,
+    message: str,
+) -> bool:
+    """Publish one ServerChan Turbo message without exposing the SendKey."""
+    sendkey = cfg(config, "SERVERCHAN_SENDKEY", "").strip()
+    if not sendkey:
+        return False
+    if not sendkey.startswith("SCT"):
+        print(
+            f"[{timestamp()}] WARNING: unsupported ServerChan SendKey format",
+            flush=True,
+        )
+        return False
+    endpoint = (
+        "https://sctapi.ftqq.com/"
+        f"{urllib.parse.quote(sendkey, safe='')}.send"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=urllib.parse.urlencode({"title": title, "desp": message}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    timeout = max(
+        0.1,
+        as_float(
+            cfg(
+                config,
+                "NOTIFY_TIMEOUT_SECONDS",
+                cfg(config, "NTFY_TIMEOUT_SECONDS", "10"),
+            ),
+            10.0,
+        ),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read()
+    except urllib.error.HTTPError as exc:
+        print(
+            f"[{timestamp()}] WARNING: ServerChan notification failed: HTTP {exc.code}",
+            flush=True,
+        )
+        return False
+    except urllib.error.URLError as exc:
+        print(
+            f"[{timestamp()}] WARNING: ServerChan notification failed: {exc.reason}",
+            flush=True,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[{timestamp()}] WARNING: ServerChan notification failed: "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+        return False
+    try:
+        payload = json.loads(response_body.decode(errors="replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if str(code) != "0":
+        print(
+            f"[{timestamp()}] WARNING: ServerChan notification rejected: code={code!r}",
+            flush=True,
+        )
+        return False
+    print(
+        f"[{timestamp()}] NOTIFY_SENT provider=serverchan title={title!r}",
+        flush=True,
+    )
+    return True
+
+
+def notification_configured(config: dict[str, str]) -> bool:
+    return bool(
+        cfg(config, "SERVERCHAN_SENDKEY", "").strip()
+        or cfg(config, "NTFY_TOPIC_URL", "").strip()
+    )
+
+
+def notification_host_label(config: dict[str, str]) -> str:
+    return cfg(config, "NOTIFY_HOST_LABEL", "").strip() or socket.gethostname()
+
+
+def notification_enabled(
+    config: dict[str, str],
+    name: str,
+    default: str,
+) -> bool:
+    legacy_key = f"NTFY_NOTIFY_{name}"
+    return as_bool(cfg(config, f"NOTIFY_{name}", cfg(config, legacy_key, default)))
+
+
+def send_phone_notification(
+    config: dict[str, str],
+    title: str,
+    message: str,
+    *,
+    priority: str = "default",
+    tags: str = "",
+) -> bool:
+    if cfg(config, "SERVERCHAN_SENDKEY", "").strip():
+        return send_serverchan_notification(config, title, message)
+    return send_ntfy_notification(
+        config,
+        title,
+        message,
+        priority=priority,
+        tags=tags,
+    )
+
+
+def task_notification_event(task: Task, status: dict[str, str]) -> str:
+    fingerprint = status.get("task_fingerprint") or task_fingerprint(task)
+    return ":".join((
+        "task",
+        task.task_id,
+        fingerprint,
+        status.get("state", "PENDING"),
+        status.get("finished_at", ""),
+    ))
+
+
+def queue_notification_event(
+    tasks: list[Task],
+    statuses: dict[str, dict[str, str]],
+) -> str:
+    snapshot = [
+        {
+            "task_id": task.task_id,
+            "fingerprint": (
+                statuses[task.task_id].get("task_fingerprint")
+                or task_fingerprint(task)
+            ),
+            "state": statuses[task.task_id].get("state", "PENDING"),
+            "finished_at": statuses[task.task_id].get("finished_at", ""),
+        }
+        for task in tasks
+    ]
+    digest = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"queue:{digest}"
+
+
+def task_issue_details(
+    task: Task,
+    status: dict[str, str],
+    index: int,
+) -> str:
+    lines = [
+        f"### {index}. {task.task_id}",
+        f"- State: {status.get('state', 'UNKNOWN')}",
+        f"- Mode/env: {task.mode} / {task.env_name}",
+        f"- Seed: {task.seed}",
+        f"- Exit code: {status.get('exit_code') or '-'}",
+        f"- Error: {status.get('error') or '-'}",
+        f"- Finished: {status.get('finished_at') or '-'}",
+        f"- Log: {status.get('log_file') or '-'}",
+    ]
+    log_file = status.get("log_file", "")
+    if log_file:
+        tail_lines = [
+            line.strip()
+            for line in log_tail(Path(log_file), max_bytes=8192).splitlines()
+            if line.strip()
+        ]
+        excerpt = "\n".join(tail_lines[-6:])[-800:]
+        if excerpt:
+            lines.extend(("- Log tail:", "```text", excerpt, "```"))
+    return "\n".join(lines)
+
+
+def notify_queue_events(
+    config: dict[str, str],
+    tasks: list[Task],
+    status_dir: Path,
+    *,
+    queue_terminal: bool,
+    pending_was_present: bool = False,
+) -> None:
+    """Notify queue transitions requested by the local phone configuration."""
+    if not notification_configured(config):
+        return
+    statuses = {task.task_id: read_status(status_dir, task.task_id) for task in tasks}
+    state_path = notification_state_path(config, status_dir)
+    loaded_state = load_notification_state(state_path)
+    current_terminal_events = {
+        task_notification_event(task, statuses[task.task_id])
+        for task in tasks
+        if statuses[task.task_id].get("state") in {"DONE", "FAILED", "PAUSED"}
+    }
+    initializing = loaded_state is None
+    if initializing:
+        # Enabling notifications on a long-lived queue should not replay all
+        # historical completions to the phone.
+        events = current_terminal_events
+        if queue_terminal and tasks:
+            events.add(queue_notification_event(tasks, statuses))
+        pending_present = None
+        print(
+            f"[{timestamp()}] NOTIFY_BASELINE events={len(events)} state_file={state_path}",
+            flush=True,
+        )
+    else:
+        events, pending_present = loaded_state
+
+    current_pending = sum(
+        status.get("state", "PENDING") == "PENDING"
+        for status in statuses.values()
+    )
+    if pending_present is None:
+        pending_present = current_pending > 0
+    previous_pending_present = pending_present
+    pending_present = pending_present or pending_was_present or current_pending > 0
+    changed = initializing or pending_present != previous_pending_present
+    delivery_available = True
+    hostname = notification_host_label(config)
+
+    if current_pending == 0 and pending_present:
+        if notification_enabled(config, "NO_PENDING", "1"):
+            counts = {
+                state: sum(
+                    status.get("state", "PENDING") == state
+                    for status in statuses.values()
+                )
+                for state in ("RUNNING", "DONE", "FAILED", "PAUSED")
+            }
+            message = (
+                "No PENDING tasks are waiting for GPU allocation.\n\n"
+                f"- Host: {hostname}\n"
+                "- PENDING: 0\n"
+                f"- RUNNING: {counts['RUNNING']}\n"
+                f"- DONE: {counts['DONE']}\n"
+                f"- FAILED: {counts['FAILED']}\n"
+                f"- PAUSED: {counts['PAUSED']}\n"
+                f"- Total tasks: {len(tasks)}\n\n"
+                "RUNNING tasks continue training; only the scheduling backlog is empty."
+            )
+            if send_phone_notification(
+                config,
+                "QRL no schedulable tasks",
+                message,
+                tags="outbox_tray",
+            ):
+                pending_present = False
+                changed = True
+            else:
+                delivery_available = False
+        else:
+            pending_present = False
+            changed = True
+
+    notify_done = notification_enabled(config, "TASK_DONE", "0")
+    notify_failed = notification_enabled(config, "TASK_FAILED", "1")
+    task_issues: list[tuple[Task, dict[str, str], str]] = []
+    for task in tasks:
+        status = statuses[task.task_id]
+        state = status.get("state", "PENDING")
+        event = task_notification_event(task, status)
+        if state in {"FAILED", "PAUSED"}:
+            if event in events:
+                continue
+            if notify_failed:
+                task_issues.append((task, status, event))
+            else:
+                events.add(event)
+                changed = True
+            continue
+        enabled = state == "DONE" and notify_done
+        if not enabled:
+            if state == "DONE" and event not in events:
+                events.add(event)
+                changed = True
+            continue
+        if event in events:
+            continue
+        title = "QRL task completed"
+        message_lines = [
+            f"Host: {hostname}",
+            f"Task: {task.task_id}",
+            f"State: {state}",
+            f"Mode/env: {task.mode} / {task.env_name}",
+            f"Seed: {task.seed}",
+            f"Finished: {status.get('finished_at', timestamp())}",
+        ]
+        if status.get("error"):
+            message_lines.append(f"Error: {status['error']}")
+        if status.get("output_dir"):
+            message_lines.append(f"Output: {status['output_dir']}")
+        if not delivery_available or not send_phone_notification(
+            config,
+            title,
+            "\n".join(message_lines),
+            priority="default",
+            tags="white_check_mark",
+        ):
+            delivery_available = False
+            break
+        events.add(event)
+        changed = True
+
+    if task_issues and delivery_available:
+        detail_limit = 5
+        details = [
+            task_issue_details(task, status, index)
+            for index, (task, status, _) in enumerate(
+                task_issues[:detail_limit],
+                start=1,
+            )
+        ]
+        if len(task_issues) > detail_limit:
+            details.append(
+                f"{len(task_issues) - detail_limit} additional task issue(s); "
+                "check the queue watcher for details."
+            )
+        failed_count = sum(
+            status.get("state") == "FAILED" for _, status, _ in task_issues
+        )
+        paused_count = len(task_issues) - failed_count
+        message = (
+            f"Host: {hostname}\n"
+            f"New task issues this cycle: {len(task_issues)}\n"
+            f"FAILED: {failed_count}\n"
+            f"PAUSED: {paused_count}\n\n"
+            + "\n\n".join(details)
+        )
+        if send_phone_notification(
+            config,
+            f"QRL task errors/issues ({len(task_issues)})",
+            message,
+            priority="high",
+            tags="warning",
+        ):
+            events.update(event for _, _, event in task_issues)
+            changed = True
+        else:
+            delivery_available = False
+
+    if tasks and queue_terminal:
+        event = queue_notification_event(tasks, statuses)
+        notify_queue_done = notification_enabled(config, "QUEUE_DONE", "0")
+        if not notify_queue_done and event not in events:
+            events.add(event)
+            changed = True
+        elif delivery_available and event not in events:
+            counts = {
+                state: sum(
+                    status.get("state") == state for status in statuses.values()
+                )
+                for state in ("DONE", "FAILED", "PAUSED")
+            }
+            clean = counts["FAILED"] == 0 and counts["PAUSED"] == 0
+            title = "QRL queue completed" if clean else "QRL queue finished with issues"
+            message = (
+                f"Host: {hostname}\n"
+                f"Tasks: {len(tasks)}\n"
+                f"Done: {counts['DONE']}\n"
+                f"Failed: {counts['FAILED']}\n"
+                f"Paused: {counts['PAUSED']}"
+            )
+            if send_phone_notification(
+                config,
+                title,
+                message,
+                priority="default" if clean else "high",
+                tags="checkered_flag" if clean else "warning",
+            ):
+                events.add(event)
+                changed = True
+
+    if changed:
+        save_notification_state(state_path, events, pending_present)
 
 
 def default_nvidia_library_dir() -> str:
@@ -1640,10 +2127,26 @@ def main() -> int:
     parser.add_argument("--config", default="configs/qrl_queue.env")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--sync-only", action="store_true")
+    parser.add_argument(
+        "--test-notification",
+        action="store_true",
+        help="send one phone test message and exit without acquiring the queue lock",
+    )
     args = parser.parse_args()
 
     config_path = resolve_path(args.config)
     initial_config = parse_config(config_path)
+    if args.test_notification:
+        if not notification_configured(initial_config):
+            print("No phone notification provider is configured.", flush=True)
+            return 2
+        sent = send_phone_notification(
+            initial_config,
+            "QRL notification test",
+            f"Notifications from {notification_host_label(initial_config)} are working.",
+            tags="test_tube",
+        )
+        return 0 if sent else 1
     lock = QueueLock(resolve_path(cfg(initial_config, "LOCK_FILE", "runs/qrl_queue/qrl_queue.lock")))
     if not lock.acquire():
         print(f"[{timestamp()}] Another qrl queue runner is already active: {lock.path}", flush=True)
@@ -1672,9 +2175,41 @@ def main() -> int:
             stop_on_failure = as_bool(cfg(config, "STOP_ON_FAILURE", "0"))
             requeue_existing_cuda_oom_failures(config, tasks, status_dir, dry_run)
             requeue_existing_transient_failures(config, tasks, status_dir, dry_run)
+            pending_before_scheduling = any(
+                read_status(status_dir, task.task_id).get("state", "PENDING")
+                == "PENDING"
+                for task in tasks
+            )
+            if (
+                not dry_run
+                and notification_configured(config)
+                and load_notification_state(
+                    notification_state_path(config, status_dir)
+                ) is None
+            ):
+                # Establish the historical baseline before launches can create
+                # new FAILED states during this scheduler cycle.
+                notify_queue_events(
+                    config,
+                    tasks,
+                    status_dir,
+                    queue_terminal=False,
+                )
 
             if args.sync_only:
                 sync_finished_outputs(config, tasks, status_dir)
+                terminal = bool(tasks) and all(
+                    task_terminal(read_status(status_dir, task.task_id), retry_failed)
+                    for task in tasks
+                )
+                if not dry_run:
+                    notify_queue_events(
+                        config,
+                        tasks,
+                        status_dir,
+                        queue_terminal=terminal,
+                        pending_was_present=pending_before_scheduling,
+                    )
                 return 0
 
             evict_disallowed_active_jobs(config, active, status_dir, allowed_gpus, dry_run)
@@ -1687,6 +2222,14 @@ def main() -> int:
                 del active[task_id]
                 finished_state = read_status(status_dir, job.task.task_id).get("state")
                 if exit_code != 0 and stop_on_failure and finished_state == "FAILED":
+                    if not dry_run:
+                        notify_queue_events(
+                            config,
+                            tasks,
+                            status_dir,
+                            queue_terminal=False,
+                            pending_was_present=pending_before_scheduling,
+                        )
                     return exit_code
 
             apps = gpu_compute_apps()
@@ -1796,7 +2339,16 @@ def main() -> int:
             for task in tasks:
                 if task_terminal(read_status(status_dir, task.task_id), retry_failed):
                     terminal_count += 1
-            if tasks and terminal_count >= len(tasks) and not active:
+            queue_terminal = bool(tasks) and terminal_count >= len(tasks) and not active
+            if not dry_run:
+                notify_queue_events(
+                    config,
+                    tasks,
+                    status_dir,
+                    queue_terminal=queue_terminal,
+                    pending_was_present=pending_before_scheduling,
+                )
+            if queue_terminal:
                 print(f"[{timestamp()}] All QRL tasks are terminal.", flush=True)
                 return 0
 

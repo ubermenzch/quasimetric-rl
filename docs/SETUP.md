@@ -187,6 +187,48 @@ The queue watcher's `#` column is recalculated from the current task-file order
 on every refresh. It is a display position, not a persistent task identifier.
 Use the stable first-column `task_id` when managing tasks.
 
+### Phone Notifications
+
+The queue runner supports ServerChan Turbo and ntfy. ServerChan is the default
+choice for Android/WeChat delivery on networks where `ntfy.sh` is unavailable.
+Obtain an `SCT` SendKey from [ServerChan](https://sct.ftqq.com/), and add it only
+to the ignored local configuration. The SendKey is a credential: never commit
+or print it.
+
+```bash
+# configs/qrl_queue.env
+SERVERCHAN_SENDKEY="<SCT SendKey>"
+NOTIFY_HOST_LABEL="<friendly server name>"
+NTFY_TOPIC_URL=""
+NOTIFY_NO_PENDING=1
+NOTIFY_TASK_DONE=0
+NOTIFY_TASK_FAILED=1
+NOTIFY_QUEUE_DONE=0
+```
+
+Configure a ServerChan delivery channel, then send a lock-free test message:
+
+```bash
+.venv/bin/python tools/run_qrl_queue.py \
+  --config configs/qrl_queue.env --test-notification
+```
+
+Set a different `NOTIFY_HOST_LABEL` on each machine (for example `226`, `L40`,
+and `225`) even when they share one SendKey. The label is included in test,
+queue-drained, completion, and task-error notifications.
+
+The running scheduler reloads this configuration on every polling cycle.
+When notifications are first enabled, it records the current queue state as a
+baseline instead of replaying historical events. By default, one notification
+is sent when the `PENDING` count transitions from a positive number to zero;
+currently running training does not need to finish first. Adding new pending
+tasks rearms the notification for the next drain. Newly `FAILED` or `PAUSED`
+tasks are also reported with their task metadata, error, log path, and a short
+log excerpt; multiple failures found in one scheduler cycle are combined into
+one message. Per-task completion and all-terminal notifications remain
+available through the disabled options above. Delivery errors are logged and
+retried later without stopping training.
+
 Permanently deleting a task removes its rows from the active task table and
 local `tasks.tsv.before_*` histories, its status and status temporary file, all
 attempt logs, result directory, and watcher ETA history. Deletion defaults to a
