@@ -254,7 +254,9 @@ is repeated:
 ```
 
 Stop the scheduler before deleting any task still present in the active task
-table. Orphaned status records can be selected explicitly with `--orphaned`.
+table. A `RUNNING` status whose recorded PID no longer exists is displayed as
+`STALE` and can be deleted; a task with a live PID is always rejected. Orphaned
+status records can be selected explicitly with `--orphaned`.
 
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set

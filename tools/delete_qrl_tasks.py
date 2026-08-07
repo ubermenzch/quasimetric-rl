@@ -25,13 +25,22 @@ from tools.run_qrl_queue import (
     Task,
     cfg,
     parse_config,
+    pid_alive,
     read_status,
     read_tasks,
     resolve_path,
 )
 
 
-KNOWN_STATES = ("PENDING", "RUNNING", "DONE", "FAILED", "PAUSED", "MISSING")
+KNOWN_STATES = (
+    "PENDING",
+    "RUNNING",
+    "STALE",
+    "DONE",
+    "FAILED",
+    "PAUSED",
+    "MISSING",
+)
 
 
 class DeletionError(RuntimeError):
@@ -60,8 +69,11 @@ class TaskEntry:
 
     @property
     def state(self) -> str:
-        if self.status.get("state"):
-            return self.status["state"]
+        state = self.status.get("state", "")
+        if state == "RUNNING" and not pid_alive(self.status.get("pid", "")):
+            return "STALE"
+        if state:
+            return state
         return "PENDING" if self.active else "MISSING"
 
     def field(self, task_name: str, status_name: str) -> str:

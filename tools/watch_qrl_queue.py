@@ -379,6 +379,28 @@ def latest_eval(output_dir: Path) -> dict[str, str]:
     return out
 
 
+def latest_test(output_dir: Path) -> dict[str, str]:
+    test_log = output_dir / "test.log"
+    if not test_log.exists():
+        return {}
+    latest = None
+    for line in test_log.read_text(errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("split", "test") == "test":
+            latest = row
+    if latest is None:
+        return {}
+    out: dict[str, str] = {}
+    for key in ("env_steps", "optim_steps", "succ_rate", "epi_return"):
+        if key in latest:
+            value = latest[key]
+            out[key] = f"{float(value):.4g}" if isinstance(value, (float, int)) else str(value)
+    return out
+
+
 def online_progress(
     output_dir: Path,
     task: Task,
@@ -1024,6 +1046,7 @@ def render(
             status = {**status, "state": state}
         output_dir = Path(status.get("output_dir") or str(output_root / task.task_id))
         latest = latest_eval(output_dir)
+        test = latest_test(output_dir)
         if task.mode == "online":
             progress = online_progress(output_dir, task, status, latest)
         else:
@@ -1063,8 +1086,9 @@ def render(
         )
         if state in {"RUNNING", "PENDING"} and eta is not None:
             queue_eta = max(queue_eta, eta)
-        last_succ = latest.get("succ_rate", "")
-        best_succ = latest.get("best_succ_rate", "")
+        val_last = latest.get("succ_rate", "")
+        val_best = latest.get("best_succ_rate", "")
+        test_succ = test.get("succ_rate", "")
         err = status.get("error", "")
         submitted_at = status.get("submitted_at") or status.get("started_at", "")
         gpu_started_at = status.get("gpu_started_at") or status.get("started_at", "")
@@ -1090,8 +1114,9 @@ def render(
             f"{eta:.2f}" if eta is not None else "",
             f"{display_elapsed:.2f}" if display_elapsed is not None else "",
             progress.text,
-            last_succ,
-            best_succ,
+            val_last,
+            val_best,
+            test_succ,
             err,
         ])
         counts[state] = counts.get(state, 0) + 1
@@ -1109,11 +1134,12 @@ def render(
     headers = [
         "#", "state", "gpu", "pid", "variant", "params", "critics", "mode", "env",
         "seed", "steps", "ckpt", "submitted", "gpu_start", "peak_mb", "oom_n", "mem_cap",
-        "%", "eta_h", "elapsed_h", "progress", "last_succ", "best_succ", "err",
+        "%", "eta_h", "elapsed_h", "progress", "val_last", "val_best", "test_succ",
+        "err",
     ]
     widths = [
         4, 8, 4, 8, 34, 7, 7, 7, 22, 6, 6, 6, 14, 14, 8, 5, 8, 6, 7,
-        9, 17, 9, 9, 18,
+        9, 17, 9, 9, 9, 18,
     ]
     print(" ".join(fmt(h, w) for h, w in zip(headers, widths)))
     print(" ".join("-" * w for w in widths))
