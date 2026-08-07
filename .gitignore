@@ -32,6 +32,8 @@ __pycache__
 .mujoco/
 qrl-assets/
 base_qrl/
+base-qrl/
+exports/
 offline_models/
 configs/qrl_queue.env
 

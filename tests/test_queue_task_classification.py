@@ -11,6 +11,7 @@ from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
 from tools.run_qrl_queue import kill_illegal_user_gpu_jobs
 from tools.run_qrl_queue import mark_finished
+from tools.run_qrl_queue import output_started
 from tools.run_qrl_queue import read_status
 from tools.run_qrl_queue import reconcile_running_statuses
 from tools.run_qrl_queue import requeue_cuda_oom_status
@@ -31,6 +32,16 @@ from tools.watch_qrl_queue import task_variant
 
 
 class QueueTaskClassificationTest(unittest.TestCase):
+    def test_manifest_temp_file_does_not_mark_output_as_started(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / ".qrl_task.json.tmp").write_text("")
+
+            self.assertFalse(output_started(output_dir))
+
+            (output_dir / "checkpoint.pth").write_text("checkpoint")
+            self.assertTrue(output_started(output_dir))
+
     def test_command_env_limits_all_cpu_thread_pools(self):
         env = command_env({"CPU_THREADS_PER_TASK": "4"}, "2")
 

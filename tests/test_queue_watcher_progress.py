@@ -8,6 +8,7 @@ from unittest import mock
 from tools.watch_qrl_queue import Task
 from tools.watch_qrl_queue import latest_eval
 from tools.watch_qrl_queue import latest_number_before_marker
+from tools.watch_qrl_queue import latest_test
 from tools.watch_qrl_queue import online_progress
 from tools.watch_qrl_queue import render
 
@@ -27,6 +28,21 @@ class QueueWatcherProgressTest(unittest.TestCase):
         self.assertEqual(summary["env_steps"], "6e+04")
         self.assertEqual(summary["succ_rate"], "0.6")
         self.assertEqual(summary["best_succ_rate"], "0.8")
+
+    def test_latest_test_reports_last_completed_test(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / "test.log").write_text(
+                '{"split": "test", "env_steps": 20000, "succ_rate": 0.4}\n'
+                'not json\n'
+                '{"split": "validation", "env_steps": 40000, "succ_rate": 0.9}\n'
+                '{"split": "test", "env_steps": 60000, "succ_rate": 0.7}\n'
+            )
+
+            summary = latest_test(output_dir)
+
+        self.assertEqual(summary["env_steps"], "6e+04")
+        self.assertEqual(summary["succ_rate"], "0.7")
 
     def test_latest_number_before_marker_uses_last_valid_value(self):
         with TemporaryDirectory() as directory:
@@ -105,8 +121,42 @@ class QueueWatcherProgressTest(unittest.TestCase):
         )
         self.assertNotIn("task", header.split())
         self.assertEqual(header.split()[4], "variant")
-        self.assertIn("last_succ", header.split())
-        self.assertIn("best_succ", header.split())
+        self.assertIn("val_last", header.split())
+        self.assertIn("val_best", header.split())
+        self.assertIn("test_succ", header.split())
+
+    def test_render_numbers_current_task_file_order_dynamically(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks_file = root / "tasks.tsv"
+            tasks_file.write_text(
+                "task_a\tonline\tFetchPush\t1000\t1000\t2.1m\t\n"
+                "task_b\tonline\tFetchSlide\t1001\t1000\t2.1m\t\n"
+            )
+            config = {
+                "TASKS_FILE": str(tasks_file),
+                "STATUS_DIR": str(root / "status"),
+                "RESULTS_ROOT": str(root / "results"),
+                "LOG_DIR": str(root / "logs"),
+            }
+
+            def rendered_task_rows():
+                output = io.StringIO()
+                with mock.patch(
+                    "tools.watch_qrl_queue.nvidia_smi", return_value="no gpus"
+                ), redirect_stdout(output):
+                    render(config)
+                return [
+                    line.split()
+                    for line in output.getvalue().splitlines()
+                    if line.split() and line.split()[0].isdigit()
+                ]
+
+            self.assertEqual([row[0] for row in rendered_task_rows()], ["1", "2"])
+            tasks_file.write_text(
+                "task_b\tonline\tFetchSlide\t1001\t1000\t2.1m\t\n"
+            )
+            self.assertEqual([row[0] for row in rendered_task_rows()], ["1"])
 
 
 if __name__ == "__main__":
