@@ -278,6 +278,36 @@ After a successful cleanup, the result directory contains a
 `CHECKPOINTS_DELETED` manifest with the deletion time, file count, and reclaimed
 bytes. The queue monitor displays `deleted` in that task's `ckpt` column.
 
+### Automatic checkpoint cleanup
+
+To reclaim storage automatically for an individual task, append this
+queue-only option to its `extra_args` field:
+
+```text
+queue.delete_checkpoints_after_completion=true
+```
+
+The queue runner does not pass this option to Hydra and does not include it in
+the training-definition fingerprint. It can therefore be added before a task
+runs or to an already completed task. For an online task, cleanup starts only
+after `COMPLETE`, `best_checkpoint.json`, and a non-empty `test.log` confirm
+that validation-based checkpoint selection and final test evaluation have
+finished. A `COMPLETE` marker alone is deliberately insufficient because the
+offline training entry point writes it before the separate offline evaluation
+workflow. The runner then deletes every top-level `*.pth` file, including
+replay, periodic, final, agent-only, and selected-best checkpoints, while
+preserving task/status records, logs, TensorBoard data, configuration, and
+evaluation summaries. Cleanup is irreversible and prevents later
+checkpoint-based continuation.
+
+The running scheduler notices the flag on its next polling cycle. With the
+scheduler stopped, process newly marked completed tasks once with:
+
+```bash
+.venv/bin/python tools/run_qrl_queue.py \
+  --config configs/qrl_queue.env --sync-only
+```
+
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set
 `SCALING_CRL_ROOT` to that checkout when using the diagnostic.

@@ -1,12 +1,15 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
 from tools.run_qrl_queue import ActiveJob
+from tools.run_qrl_queue import build_command
 from tools.run_qrl_queue import GpuState
 from tools.run_qrl_queue import Task as RunnerTask
 from tools.run_qrl_queue import command_env
+from tools.run_qrl_queue import cleanup_completed_task_checkpoints
 from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
 from tools.run_qrl_queue import kill_illegal_user_gpu_jobs
@@ -18,8 +21,11 @@ from tools.run_qrl_queue import requeue_cuda_oom_status
 from tools.run_qrl_queue import requeue_existing_transient_failures
 from tools.run_qrl_queue import task_uses_goal_set_objective
 from tools.run_qrl_queue import task_fingerprint
+from tools.run_qrl_queue import task_training_args
+from tools.run_qrl_queue import sync_finished_outputs
 from tools.run_qrl_queue import update_running_gpu_memory_peaks
 from tools.run_qrl_queue import write_status
+from tools.run_qrl_queue import write_task_manifest
 from tools.watch_qrl_queue import Task as WatcherTask
 from tools.watch_qrl_queue import compact_count
 from tools.watch_qrl_queue import compact_parameter_count
@@ -585,6 +591,184 @@ class QueueTaskClassificationTest(unittest.TestCase):
         fingerprint = task_fingerprint(task)
         task.params = "2112257"
         self.assertEqual(task_fingerprint(task), fingerprint)
+
+    def test_checkpoint_cleanup_flag_is_queue_metadata(self):
+        task = RunnerTask(
+            task_id="run_Base_s1000",
+            mode="offline",
+            env_name="maze2d-umaze-v1",
+            seed="1000",
+            steps="40000",
+            extra_args="agent.num_critics=1",
+        )
+        fingerprint = task_fingerprint(task)
+        task.extra_args += " queue.delete_checkpoints_after_completion=true"
+
+        self.assertEqual(task_fingerprint(task), fingerprint)
+        self.assertEqual(task_training_args(task), ["agent.num_critics=1"])
+
+    def test_checkpoint_cleanup_flag_is_not_passed_to_hydra(self):
+        task = RunnerTask(
+            task_id="run_Base_s1000",
+            mode="offline",
+            env_name="maze2d-umaze-v1",
+            seed="1000",
+            steps="40000",
+            extra_args=(
+                "agent.num_critics=1 "
+                "queue.delete_checkpoints_after_completion=true"
+            ),
+        )
+        with TemporaryDirectory() as directory:
+            command, _, _, _ = build_command(
+                {
+                    "RESULTS_ROOT": directory,
+                    "RESUME_IF_POSSIBLE": "0",
+                },
+                task,
+                "0",
+            )
+
+        self.assertIn("agent.num_critics=1", command)
+        self.assertFalse(any(arg.startswith("queue.") for arg in command))
+
+    def test_completed_online_task_can_delete_checkpoints_automatically(self):
+        task = RunnerTask(
+            task_id="cleanup_task",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+            extra_args="queue.delete_checkpoints_after_completion=true",
+        )
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            checkpoint_payloads = {
+                "checkpoint_env00200000_opt00190000.pth": "full",
+                "agent_checkpoint_env00200000_opt00190000.pth": "agent",
+                "selected_best_agent.pth": "selected",
+            }
+            for name, payload in checkpoint_payloads.items():
+                (output_dir / name).write_text(payload)
+            (output_dir / "eval.log").write_text('{"succ_rate": 0.8}\n')
+            (output_dir / "test.log").write_text('{"succ_rate": 0.7}\n')
+            (output_dir / "best_checkpoint.json").write_text(json.dumps({
+                "validation": {"succ_rate": 0.8},
+                "test": {"succ_rate": 0.7},
+                "selected_model": "selected_best_agent.pth",
+            }))
+            (output_dir / "COMPLETE").touch()
+
+            cleaned = cleanup_completed_task_checkpoints(task, output_dir)
+
+            self.assertTrue(cleaned)
+            self.assertFalse(any(output_dir.glob("*.pth")))
+            for name in ("eval.log", "test.log", "best_checkpoint.json", "COMPLETE"):
+                self.assertTrue((output_dir / name).exists())
+            marker = json.loads(
+                (output_dir / "CHECKPOINTS_DELETED").read_text()
+            )
+            self.assertEqual(marker["task_id"], task.task_id)
+            self.assertEqual(marker["checkpoint_count"], len(checkpoint_payloads))
+            self.assertEqual(
+                marker["checkpoint_bytes"],
+                sum(len(payload) for payload in checkpoint_payloads.values()),
+            )
+
+    def test_checkpoint_cleanup_waits_for_final_evaluation(self):
+        task = RunnerTask(
+            task_id="cleanup_task",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+            extra_args="queue.delete_checkpoints_after_completion=true",
+        )
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            checkpoint = output_dir / "checkpoint_env00200000_opt00190000.pth"
+            checkpoint.write_text("checkpoint")
+            (output_dir / "test.log").write_text('{"succ_rate": 0.7}\n')
+
+            self.assertFalse(
+                cleanup_completed_task_checkpoints(task, output_dir)
+            )
+            self.assertTrue(checkpoint.exists())
+            self.assertFalse((output_dir / "CHECKPOINTS_DELETED").exists())
+
+            (output_dir / "COMPLETE").touch()
+            self.assertFalse(
+                cleanup_completed_task_checkpoints(task, output_dir)
+            )
+            self.assertTrue(checkpoint.exists())
+
+    def test_offline_complete_marker_alone_does_not_trigger_cleanup(self):
+        task = RunnerTask(
+            task_id="offline_cleanup_task",
+            mode="offline",
+            env_name="maze2d-umaze-v1",
+            seed="1000",
+            steps="40000",
+            extra_args="queue.delete_checkpoints_after_completion=true",
+        )
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            checkpoint = output_dir / "checkpoint_00001_00001_final.pth"
+            checkpoint.write_text("checkpoint")
+            (output_dir / "COMPLETE").touch()
+
+            self.assertFalse(
+                cleanup_completed_task_checkpoints(task, output_dir)
+            )
+            self.assertTrue(checkpoint.exists())
+            self.assertFalse((output_dir / "CHECKPOINTS_DELETED").exists())
+
+    def test_completed_task_accepts_cleanup_flag_added_later(self):
+        task = RunnerTask(
+            task_id="cleanup_task",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="200000",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "results" / task.task_id
+            status_dir = root / "status"
+            output_dir.mkdir(parents=True)
+            write_task_manifest(output_dir, task)
+            write_status(
+                status_dir,
+                task,
+                "DONE",
+                {
+                    "output_dir": str(output_dir),
+                    "completion_evidence": "COMPLETE",
+                },
+            )
+            checkpoint = output_dir / "selected_best_agent.pth"
+            checkpoint.write_text("selected")
+            (output_dir / "test.log").write_text('{"succ_rate": 0.7}\n')
+            (output_dir / "best_checkpoint.json").write_text(json.dumps({
+                "validation": {"succ_rate": 0.8},
+                "test": {"succ_rate": 0.7},
+                "selected_model": checkpoint.name,
+            }))
+            (output_dir / "COMPLETE").touch()
+            original_fingerprint = task_fingerprint(task)
+            task.extra_args = "queue.delete_checkpoints_after_completion=true"
+
+            sync_finished_outputs(
+                {"RESULTS_ROOT": str(root / "results")},
+                [task],
+                status_dir,
+            )
+
+            status = read_status(status_dir, task.task_id)
+            self.assertEqual(status["state"], "DONE")
+            self.assertEqual(status["task_fingerprint"], original_fingerprint)
+            self.assertFalse(checkpoint.exists())
+            self.assertTrue((output_dir / "CHECKPOINTS_DELETED").exists())
 
     def test_runner_detects_direct_goal_set_tasks_from_arguments(self):
         task = RunnerTask(

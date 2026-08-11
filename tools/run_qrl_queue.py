@@ -27,6 +27,11 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from tools.checkpoint_cleanup import cleanup_task_checkpoints
+except ModuleNotFoundError:  # Direct execution via tools/run_qrl_queue.py.
+    from checkpoint_cleanup import cleanup_task_checkpoints
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TRANSIENT_FAILURE_PATTERNS = (
@@ -41,6 +46,9 @@ CUDA_OOM_PATTERNS = (
 TRANSIENT_LOG_TAIL_BYTES = 1024 * 1024
 TASK_MANIFEST_NAME = ".qrl_task.json"
 NOTIFICATION_STATE_VERSION = 1
+DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG = (
+    "queue.delete_checkpoints_after_completion"
+)
 
 
 @dataclass
@@ -71,6 +79,23 @@ class GpuState:
     util_pct: int
 
 
+def task_training_args(task: Task) -> list[str]:
+    prefix = DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG + "="
+    return [
+        arg
+        for arg in task.extra_args.split()
+        if not arg.startswith(prefix)
+    ]
+
+
+def task_deletes_checkpoints_after_completion(task: Task) -> bool:
+    return bool_arg_value(
+        task.extra_args.split(),
+        DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG,
+        False,
+    )
+
+
 def normalized_task_definition(task: Task) -> dict[str, object]:
     return {
         "task_id": task.task_id,
@@ -79,7 +104,7 @@ def normalized_task_definition(task: Task) -> dict[str, object]:
         "seed": task.seed,
         "steps": task.steps,
         "params": task.params,
-        "extra_args": task.extra_args.split(),
+        "extra_args": task_training_args(task),
     }
 
 
@@ -1230,6 +1255,50 @@ def completion_evidence(output_dir: Path) -> str:
     return final_ckpts[-1].name if final_ckpts else ""
 
 
+def final_evaluation_complete(task: Task, output_dir: Path) -> bool:
+    """Return whether it is safe to discard this task's model files."""
+    if not output_complete(output_dir):
+        return False
+
+    test_log = output_dir / "test.log"
+    selection_path = output_dir / "best_checkpoint.json"
+    try:
+        if test_log.stat().st_size <= 0:
+            return False
+        selection = json.loads(selection_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(selection, dict)
+        and isinstance(selection.get("validation"), dict)
+        and isinstance(selection.get("test"), dict)
+        and selection.get("selected_model")
+    )
+
+
+def cleanup_completed_task_checkpoints(task: Task, output_dir: Path) -> bool:
+    if not task_deletes_checkpoints_after_completion(task):
+        return False
+    if not final_evaluation_complete(task, output_dir):
+        return False
+    try:
+        result = cleanup_task_checkpoints(output_dir, task.task_id)
+    except OSError as exc:
+        print(
+            f"[{timestamp()}] WARNING: checkpoint cleanup failed for "
+            f"{task.task_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+    if not result.already_clean:
+        print(
+            f"[{timestamp()}] CHECKPOINTS_DELETED {task.task_id} "
+            f"count={result.checkpoint_count} bytes={result.checkpoint_bytes}",
+            flush=True,
+        )
+    return True
+
+
 def log_tail(log_file: Path, max_bytes: int = TRANSIENT_LOG_TAIL_BYTES) -> str:
     try:
         with log_file.open("rb") as f:
@@ -1482,6 +1551,9 @@ def sync_finished_outputs(config: dict[str, str], tasks: list[Task], status_dir:
                 "completion_evidence": completion_evidence(output_dir),
             })
             print(f"[{timestamp()}] MARK_DONE_FINISHED_OUTPUT {task.task_id}", flush=True)
+            status = read_status(status_dir, task.task_id)
+        if status.get("state") == "DONE":
+            cleanup_completed_task_checkpoints(task, output_dir)
 
 
 def clear_non_running_transient_fields(tasks: list[Task], status_dir: Path, dry_run: bool) -> None:
@@ -1963,7 +2035,7 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
     output_dir = task_output_dir(config, task)
     output_dir.mkdir(parents=True, exist_ok=True)
     env = command_env(config, gpu)
-    extra = task.extra_args.split() if task.extra_args.strip() else []
+    extra = task_training_args(task)
     resume_enabled = bool_arg_value(
         extra,
         "resume_if_possible",
@@ -2125,6 +2197,8 @@ def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> Non
         f"completion_evidence={extra['completion_evidence']}",
         flush=True,
     )
+    if state == "DONE":
+        cleanup_completed_task_checkpoints(job.task, job.output_dir)
 
 
 def main() -> int:

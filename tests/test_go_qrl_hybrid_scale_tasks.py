@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 from tools.generate_go_qrl_hybrid_scale_tasks import (
+    DELETE_CHECKPOINTS_AFTER_COMPLETION,
     ENVIRONMENTS,
     MODEL_SCALES,
     PARTITION_GROUPS,
@@ -57,6 +58,22 @@ class GOQRLHybridScaleTaskGeneratorTest(unittest.TestCase):
                 'projector_activation',
                 args,
             )
+            self.assertEqual(
+                args.get('queue.delete_checkpoints_after_completion'),
+                (
+                    'true'
+                    if task_group(task) in PARTITION_GROUPS['local_1x']
+                    else None
+                ),
+            )
+
+        self.assertEqual(
+            sum(
+                DELETE_CHECKPOINTS_AFTER_COMPLETION in task.extra_args.split()
+                for task in self.tasks
+            ),
+            30,
+        )
 
     def test_partitions_are_disjoint_complete_and_keep_seed_groups(self):
         validate_partitions(self.tasks)

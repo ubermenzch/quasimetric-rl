@@ -29,8 +29,11 @@ from tools.run_qrl_queue import (
     read_status,
     read_tasks,
     resolve_path,
-    timestamp,
 )
+from tools.checkpoint_cleanup import CHECKPOINTS_DELETED_MARKER
+from tools.checkpoint_cleanup import checkpoint_file_bytes
+from tools.checkpoint_cleanup import cleanup_task_checkpoints
+from tools.checkpoint_cleanup import task_checkpoint_files
 
 
 KNOWN_STATES = (
@@ -42,8 +45,6 @@ KNOWN_STATES = (
     "PAUSED",
     "MISSING",
 )
-
-CHECKPOINTS_DELETED_MARKER = "CHECKPOINTS_DELETED"
 
 
 class DeletionError(RuntimeError):
@@ -117,13 +118,7 @@ class TaskArtifacts:
 
     @property
     def checkpoint_bytes(self) -> int:
-        total = 0
-        for path in self.checkpoint_files:
-            try:
-                total += path.lstat().st_size
-            except OSError:
-                pass
-        return total
+        return checkpoint_file_bytes(self.checkpoint_files)
 
     @property
     def checkpoints_deleted_marker(self) -> Path:
@@ -307,16 +302,6 @@ def task_log_files(paths: QueuePaths, task_id: str) -> tuple[Path, ...]:
     ))
 
 
-def task_checkpoint_files(output_path: Path) -> tuple[Path, ...]:
-    if not output_path.is_dir():
-        return ()
-    return tuple(sorted(
-        path
-        for path in output_path.glob("*.pth")
-        if path.is_file() or path.is_symlink()
-    ))
-
-
 def build_artifact_plan(paths: QueuePaths, entries: Sequence[TaskEntry]) -> list[TaskArtifacts]:
     plan = []
     for entry in entries:
@@ -430,34 +415,6 @@ def remove_path(path: Path) -> None:
         path.unlink()
     elif path.is_dir():
         shutil.rmtree(path)
-
-
-def write_checkpoints_deleted_marker(
-    item: TaskArtifacts,
-    checkpoint_bytes: int,
-) -> None:
-    payload = {
-        "version": 1,
-        "task_id": item.entry.task_id,
-        "deleted_at": timestamp(),
-        "checkpoint_count": len(item.checkpoint_files),
-        "checkpoint_bytes": checkpoint_bytes,
-    }
-    marker = item.checkpoints_deleted_marker
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{marker.name}.", suffix=".tmp", dir=marker.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, marker)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def remove_eta_history(path: Path, task_ids: set[str]) -> None:
@@ -576,17 +533,13 @@ def execute_checkpoint_deletion(
                 + ", ".join(missing_outputs)
             )
 
-        reclaimed = sum(item.checkpoint_bytes for item in plan)
+        reclaimed = 0
         for item in plan:
-            if (
-                not item.checkpoint_files
-                and item.checkpoints_deleted_marker.is_file()
-            ):
-                continue
-            checkpoint_bytes = item.checkpoint_bytes
-            for checkpoint in item.checkpoint_files:
-                remove_path(checkpoint)
-            write_checkpoints_deleted_marker(item, checkpoint_bytes)
+            result = cleanup_task_checkpoints(
+                item.output_path,
+                item.entry.task_id,
+            )
+            reclaimed += result.checkpoint_bytes
         return reclaimed
 
 
