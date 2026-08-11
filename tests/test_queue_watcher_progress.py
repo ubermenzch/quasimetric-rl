@@ -11,6 +11,7 @@ from tools.watch_qrl_queue import latest_number_before_marker
 from tools.watch_qrl_queue import latest_test
 from tools.watch_qrl_queue import online_progress
 from tools.watch_qrl_queue import render
+from tools.watch_qrl_queue import task_checkpoint_display
 
 
 class QueueWatcherProgressTest(unittest.TestCase):
@@ -157,6 +158,45 @@ class QueueWatcherProgressTest(unittest.TestCase):
                 "task_b\tonline\tFetchSlide\t1001\t1000\t2.1m\t\n"
             )
             self.assertEqual([row[0] for row in rendered_task_rows()], ["1"])
+
+    def test_render_marks_tasks_whose_checkpoints_were_deleted(self):
+        task = Task(
+            task_id="task_a",
+            mode="online",
+            env_name="FetchPush",
+            seed="1000",
+            steps="1000",
+            params="2.1m",
+            extra_args="save_steps=200",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks_file = root / "tasks.tsv"
+            tasks_file.write_text(
+                "task_a\tonline\tFetchPush\t1000\t1000\t2.1m\tsave_steps=200\n"
+            )
+            output_dir = root / "results" / task.task_id
+            output_dir.mkdir(parents=True)
+            (output_dir / "CHECKPOINTS_DELETED").write_text("{}\n")
+            config = {
+                "TASKS_FILE": str(tasks_file),
+                "STATUS_DIR": str(root / "status"),
+                "RESULTS_ROOT": str(root / "results"),
+                "LOG_DIR": str(root / "logs"),
+            }
+
+            self.assertEqual(task_checkpoint_display(task, output_dir), "deleted")
+            output = io.StringIO()
+            with mock.patch(
+                "tools.watch_qrl_queue.nvidia_smi", return_value="no gpus"
+            ), redirect_stdout(output):
+                render(config)
+
+        task_row = next(
+            line for line in output.getvalue().splitlines()
+            if line.split() and line.split()[0] == "1"
+        )
+        self.assertIn("deleted", task_row.split())
 
 
 if __name__ == "__main__":

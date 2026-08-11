@@ -19,6 +19,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHECKPOINTS_DELETED_MARKER = "CHECKPOINTS_DELETED"
 
 
 @dataclass
@@ -703,6 +704,12 @@ def task_checkpoint_interval(task: Task) -> str:
     return compact_count(value)
 
 
+def task_checkpoint_display(task: Task, output_dir: Path) -> str:
+    if (output_dir / CHECKPOINTS_DELETED_MARKER).is_file():
+        return "deleted"
+    return task_checkpoint_interval(task)
+
+
 def compact_parameter_count(count: int) -> str:
     for scale, suffix in ((1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")):
         if count >= scale:
@@ -1104,7 +1111,7 @@ def render(
             task.env_name,
             task.seed,
             compact_count(task.steps),
-            task_checkpoint_interval(task),
+            task_checkpoint_display(task, output_dir),
             display_status_timestamp(submitted_at),
             display_status_timestamp(gpu_started_at),
             status.get("gpu_mem_peak_mb", ""),
@@ -1138,7 +1145,7 @@ def render(
         "err",
     ]
     widths = [
-        4, 8, 4, 8, 34, 7, 7, 7, 22, 6, 6, 6, 14, 14, 8, 5, 8, 6, 7,
+        4, 8, 4, 8, 34, 7, 7, 7, 22, 6, 6, 7, 14, 14, 8, 5, 8, 6, 7,
         9, 17, 9, 9, 9, 18,
     ]
     print(" ".join(fmt(h, w) for h, w in zip(headers, widths)))

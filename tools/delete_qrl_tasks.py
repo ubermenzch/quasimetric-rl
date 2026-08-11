@@ -29,6 +29,7 @@ from tools.run_qrl_queue import (
     read_status,
     read_tasks,
     resolve_path,
+    timestamp,
 )
 
 
@@ -41,6 +42,8 @@ KNOWN_STATES = (
     "PAUSED",
     "MISSING",
 )
+
+CHECKPOINTS_DELETED_MARKER = "CHECKPOINTS_DELETED"
 
 
 class DeletionError(RuntimeError):
@@ -110,6 +113,21 @@ class TaskArtifacts:
     status_files: tuple[Path, ...]
     output_path: Path
     log_files: tuple[Path, ...]
+    checkpoint_files: tuple[Path, ...]
+
+    @property
+    def checkpoint_bytes(self) -> int:
+        total = 0
+        for path in self.checkpoint_files:
+            try:
+                total += path.lstat().st_size
+            except OSError:
+                pass
+        return total
+
+    @property
+    def checkpoints_deleted_marker(self) -> Path:
+        return self.output_path / CHECKPOINTS_DELETED_MARKER
 
 
 def resolve_override(value: str | None, config: dict[str, str], key: str, default: str) -> Path:
@@ -289,29 +307,60 @@ def task_log_files(paths: QueuePaths, task_id: str) -> tuple[Path, ...]:
     ))
 
 
+def task_checkpoint_files(output_path: Path) -> tuple[Path, ...]:
+    if not output_path.is_dir():
+        return ()
+    return tuple(sorted(
+        path
+        for path in output_path.glob("*.pth")
+        if path.is_file() or path.is_symlink()
+    ))
+
+
 def build_artifact_plan(paths: QueuePaths, entries: Sequence[TaskEntry]) -> list[TaskArtifacts]:
-    return [
-        TaskArtifacts(
-            entry=entry,
-            status_files=(
-                paths.status_dir / f"{entry.task_id}.status",
-                paths.status_dir / f"{entry.task_id}.status.tmp",
-            ),
-            output_path=status_output_path(paths, entry),
-            log_files=task_log_files(paths, entry.task_id),
+    plan = []
+    for entry in entries:
+        output_path = status_output_path(paths, entry)
+        plan.append(
+            TaskArtifacts(
+                entry=entry,
+                status_files=(
+                    paths.status_dir / f"{entry.task_id}.status",
+                    paths.status_dir / f"{entry.task_id}.status.tmp",
+                ),
+                output_path=output_path,
+                log_files=task_log_files(paths, entry.task_id),
+                checkpoint_files=task_checkpoint_files(output_path),
+            )
         )
-        for entry in entries
-    ]
+    return plan
 
 
-def print_plan(plan: Sequence[TaskArtifacts]) -> None:
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or suffix == "TiB":
+            return f"{value:.1f}{suffix}"
+        value /= 1024.0
+    raise AssertionError("unreachable")
+
+
+def print_plan(plan: Sequence[TaskArtifacts], *, checkpoints_only: bool = False) -> None:
     print(f"Matched tasks: {len(plan)}")
     for item in plan:
         entry = item.entry
+        checkpoint_details = ""
+        if checkpoints_only:
+            checkpoint_details = (
+                f"\tcheckpoints={len(item.checkpoint_files)}"
+                f"\tcheckpoint_bytes={format_bytes(item.checkpoint_bytes)}"
+                f"\tmarked={str(item.checkpoints_deleted_marker.is_file()).lower()}"
+            )
         print(
             f"{entry.task_id}\tstate={entry.state}\tactive={str(entry.active).lower()}"
             f"\tenv={entry.field('env_name', 'env_name')}\tseed={entry.field('seed', 'seed')}"
             f"\toutput={str(item.output_path) if item.output_path.exists() else '-'}"
+            f"{checkpoint_details}"
             f"\tlogs={len(item.log_files)}"
             f"\tstatus={str(item.status_files[0]) if item.status_files[0].exists() else '-'}"
         )
@@ -383,6 +432,34 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def write_checkpoints_deleted_marker(
+    item: TaskArtifacts,
+    checkpoint_bytes: int,
+) -> None:
+    payload = {
+        "version": 1,
+        "task_id": item.entry.task_id,
+        "deleted_at": timestamp(),
+        "checkpoint_count": len(item.checkpoint_files),
+        "checkpoint_bytes": checkpoint_bytes,
+    }
+    marker = item.checkpoints_deleted_marker
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{marker.name}.", suffix=".tmp", dir=marker.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def remove_eta_history(path: Path, task_ids: set[str]) -> None:
     if not path.is_file():
         return
@@ -449,11 +526,76 @@ def execute_deletion(paths: QueuePaths, selected: Sequence[TaskEntry]) -> None:
                 remove_path(status_file)
 
 
+def execute_checkpoint_deletion(
+    paths: QueuePaths,
+    selected: Sequence[TaskEntry],
+) -> int:
+    not_done = [entry.task_id for entry in selected if entry.state != "DONE"]
+    if not_done:
+        raise DeletionError(
+            "checkpoint-only deletion requires DONE task(s): " + ", ".join(not_done)
+        )
+
+    selected_ids = {entry.task_id for entry in selected}
+    lock = (
+        exclusive_queue_lock(paths.lock_file)
+        if any(entry.active for entry in selected)
+        else nullcontext()
+    )
+    with lock:
+        current = {
+            entry.task_id: entry
+            for entry in load_entries(
+                paths,
+                exact_ids=frozenset(selected_ids),
+                include_orphans=True,
+            )
+            if entry.task_id in selected_ids
+        }
+        if set(current) != selected_ids:
+            missing = ", ".join(sorted(selected_ids - current.keys()))
+            raise DeletionError(
+                f"task set changed before checkpoint deletion; missing: {missing}"
+            )
+        no_longer_done = [
+            entry.task_id for entry in current.values() if entry.state != "DONE"
+        ]
+        if no_longer_done:
+            raise DeletionError(
+                "task state changed before checkpoint deletion: "
+                + ", ".join(no_longer_done)
+            )
+
+        plan = build_artifact_plan(paths, list(current.values()))
+        missing_outputs = [
+            item.entry.task_id for item in plan if not item.output_path.is_dir()
+        ]
+        if missing_outputs:
+            raise DeletionError(
+                "checkpoint-only deletion requires result directories: "
+                + ", ".join(missing_outputs)
+            )
+
+        reclaimed = sum(item.checkpoint_bytes for item in plan)
+        for item in plan:
+            if (
+                not item.checkpoint_files
+                and item.checkpoints_deleted_marker.is_file()
+            ):
+                continue
+            checkpoint_bytes = item.checkpoint_bytes
+            for checkpoint in item.checkpoint_files:
+                remove_path(checkpoint)
+            write_checkpoints_deleted_marker(item, checkpoint_bytes)
+        return reclaimed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Permanently delete QRL queue tasks by stable task_id or metadata. "
-            "Without --yes, only a deletion plan is printed."
+            "Permanently delete QRL queue tasks, or only their checkpoints, "
+            "by stable task_id or metadata. Without --yes, only a deletion "
+            "plan is printed."
         )
     )
     parser.add_argument("--config", default="configs/qrl_queue.env")
@@ -482,6 +624,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only match status records whose task_id is absent from the active task table",
     )
+    parser.add_argument(
+        "--checkpoints-only",
+        action="store_true",
+        help=(
+            "Delete every top-level *.pth file from matched DONE task result "
+            "directories, preserving task records, logs, and result summaries"
+        ),
+    )
     parser.add_argument("--yes", action="store_true", help="Execute permanent deletion")
     parser.add_argument(
         "--expect",
@@ -496,10 +646,11 @@ def run(args: argparse.Namespace) -> int:
     selectors = build_selectors(args)
     selected = select_entries(paths, selectors)
     plan = build_artifact_plan(paths, selected)
-    print_plan(plan)
+    print_plan(plan, checkpoints_only=args.checkpoints_only)
 
     if not args.yes:
-        print("Dry run only. Re-run with --yes --expect N to delete these tasks.")
+        target = "their checkpoints" if args.checkpoints_only else "these tasks"
+        print(f"Dry run only. Re-run with --yes --expect N to delete {target}.")
         return 0
     if args.expect is None:
         raise DeletionError("--yes requires --expect N")
@@ -507,8 +658,15 @@ def run(args: argparse.Namespace) -> int:
         raise DeletionError(
             f"expected {args.expect} matched tasks, but selector matched {len(selected)}"
         )
-    execute_deletion(paths, selected)
-    print(f"Permanently deleted {len(selected)} task(s).")
+    if args.checkpoints_only:
+        reclaimed = execute_checkpoint_deletion(paths, selected)
+        print(
+            f"Deleted checkpoints from {len(selected)} task(s); "
+            f"reclaimed {format_bytes(reclaimed)}."
+        )
+    else:
+        execute_deletion(paths, selected)
+        print(f"Permanently deleted {len(selected)} task(s).")
     return 0
 
 

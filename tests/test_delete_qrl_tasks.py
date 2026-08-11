@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from tools.delete_qrl_tasks import CHECKPOINTS_DELETED_MARKER
 from tools.delete_qrl_tasks import main
 from tools.run_qrl_queue import Task
 from tools.run_qrl_queue import write_status
@@ -129,6 +130,102 @@ class DeleteQrlTasksTest(unittest.TestCase):
         self.assertNotIn("task_beta\t", output.getvalue())
         self.assertIn("task_alpha", self.tasks_file.read_text())
         self.assertTrue((self.results_root / "task_alpha").exists())
+
+    def test_checkpoints_only_deletes_models_and_preserves_task_results(self):
+        self.make_artifacts("task_alpha", state="DONE")
+        output_dir = self.results_root / "task_alpha"
+        checkpoint_payloads = {
+            "checkpoint.pth": "full checkpoint",
+            "agent_checkpoint_step00020000.pth": "agent checkpoint",
+            "selected_best_agent.pth": "selected checkpoint",
+            "preserved_checkpoint_00001_00001_final.pth": "preserved checkpoint",
+        }
+        for name, payload in checkpoint_payloads.items():
+            (output_dir / name).write_text(payload)
+        (output_dir / "eval.log").write_text('{"succ_rate": 0.8}\n')
+        (output_dir / "test.log").write_text('{"succ_rate": 0.7}\n')
+        (output_dir / "config.yaml").write_text("seed: 1000\n")
+        (output_dir / "COMPLETE").touch()
+        self.eta_file.write_text(json.dumps({
+            "version": 1,
+            "tasks": {"task_alpha": {"samples": []}},
+        }))
+        tasks_before = self.tasks_file.read_text()
+        archive_before = self.tasks_archive.read_text()
+        status_before = (self.status_dir / "task_alpha.status").read_text()
+        expected_bytes = sum(len(payload) for payload in checkpoint_payloads.values())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(self.args(
+                "--task-id", "task_alpha",
+                "--checkpoints-only",
+                "--yes", "--expect", "1",
+            ))
+
+        self.assertEqual(result, 0)
+        self.assertIn("Deleted checkpoints from 1 task(s)", output.getvalue())
+        self.assertFalse(any(output_dir.glob("*.pth")))
+        for name in ("eval.log", "test.log", "config.yaml", "COMPLETE"):
+            self.assertTrue((output_dir / name).exists())
+        marker = json.loads((output_dir / CHECKPOINTS_DELETED_MARKER).read_text())
+        self.assertEqual(marker["task_id"], "task_alpha")
+        self.assertEqual(marker["checkpoint_count"], len(checkpoint_payloads))
+        self.assertEqual(marker["checkpoint_bytes"], expected_bytes)
+        self.assertTrue(marker["deleted_at"])
+        self.assertEqual(self.tasks_file.read_text(), tasks_before)
+        self.assertEqual(self.tasks_archive.read_text(), archive_before)
+        self.assertEqual(
+            (self.status_dir / "task_alpha.status").read_text(), status_before
+        )
+        self.assertTrue(any(self.log_dir.glob("task_alpha_*.log")))
+        self.assertIn("task_alpha", json.loads(self.eta_file.read_text())["tasks"])
+
+        marker_before = (output_dir / CHECKPOINTS_DELETED_MARKER).read_text()
+        with redirect_stdout(io.StringIO()):
+            repeated_result = main(self.args(
+                "--task-id", "task_alpha",
+                "--checkpoints-only",
+                "--yes", "--expect", "1",
+            ))
+        self.assertEqual(repeated_result, 0)
+        self.assertEqual(
+            (output_dir / CHECKPOINTS_DELETED_MARKER).read_text(), marker_before
+        )
+
+    def test_checkpoints_only_dry_run_reports_size_without_deleting(self):
+        self.make_artifacts("task_alpha", state="DONE")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(self.args(
+                "--task-id", "task_alpha", "--checkpoints-only"
+            ))
+
+        self.assertEqual(result, 0)
+        self.assertIn("checkpoints=1", output.getvalue())
+        self.assertIn("checkpoint_bytes=10.0B", output.getvalue())
+        self.assertIn("delete their checkpoints", output.getvalue())
+        self.assertTrue((self.results_root / "task_alpha" / "checkpoint.pth").exists())
+        self.assertFalse(
+            (self.results_root / "task_alpha" / CHECKPOINTS_DELETED_MARKER).exists()
+        )
+
+    def test_checkpoints_only_rejects_non_done_task(self):
+        self.make_artifacts("task_alpha", state="PAUSED")
+
+        error = io.StringIO()
+        with redirect_stderr(error):
+            result = main(self.args(
+                "--task-id", "task_alpha",
+                "--checkpoints-only",
+                "--yes", "--expect", "1",
+            ))
+
+        self.assertEqual(result, 2)
+        self.assertIn("requires DONE task", error.getvalue())
+        self.assertTrue((self.results_root / "task_alpha" / "checkpoint.pth").exists())
+        self.assertIn("task_alpha", self.tasks_file.read_text())
 
     def test_execute_requires_exact_expected_count(self):
         self.make_artifacts("task_alpha")

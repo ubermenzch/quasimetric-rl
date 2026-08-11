@@ -258,6 +258,25 @@ table. A `RUNNING` status whose recorded PID no longer exists is displayed as
 `STALE` and can be deleted; a task with a live PID is always rejected. Orphaned
 status records can be selected explicitly with `--orphaned`.
 
+To reclaim checkpoint storage from completed tasks while preserving their task
+rows, status, attempt logs, configuration, TensorBoard data, and evaluation
+summaries, add `--checkpoints-only`. This mode only accepts `DONE` tasks and
+deletes every top-level `*.pth` file in each matched result directory. It uses
+the same dry-run and exact-count confirmation flow:
+
+```bash
+.venv/bin/python tools/delete_qrl_tasks.py \
+  --state DONE --env-name FetchPush --checkpoints-only
+
+.venv/bin/python tools/delete_qrl_tasks.py \
+  --state DONE --env-name FetchPush --checkpoints-only \
+  --yes --expect 3
+```
+
+After a successful cleanup, the result directory contains a
+`CHECKPOINTS_DELETED` manifest with the deletion time, file count, and reclaimed
+bytes. The queue monitor displays `deleted` in that task's `ckpt` column.
+
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set
 `SCALING_CRL_ROOT` to that checkout when using the diagnostic.
