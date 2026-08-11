@@ -15,7 +15,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quasimetric_rl.model_size import go_qrl_agent_parameter_count
-from tools.run_qrl_queue import DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG
 from tools.run_qrl_queue import Task, read_tasks
 
 
@@ -26,9 +25,6 @@ VALIDATION_SEED = 1000
 VALIDATION_EPISODES = 500
 TEST_SEED = 1500
 TEST_EPISODES = 1000
-DELETE_CHECKPOINTS_AFTER_COMPLETION = (
-    f'{DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG}=true'
-)
 
 
 @dataclass(frozen=True)
@@ -185,12 +181,6 @@ def generate_all_tasks() -> list[Task]:
                     f'env.kind={environment.kind}',
                     f'+go_qrl_model_size={scale.level}',
                     *COMMON_ARGS,
-                    *(
-                        (DELETE_CHECKPOINTS_AFTER_COMPLETION,)
-                        if (environment.name, scale.level)
-                        in PARTITION_GROUPS['local_1x']
-                        else ()
-                    ),
                 ))
                 tasks.append(Task(
                     task_id=task_id,
