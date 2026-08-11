@@ -123,6 +123,136 @@ class MLP(nn.Module):
         )
 
 
+class ResidualBlock(nn.Module):
+    """Four-layer residual block used by the Scaling CRL architecture."""
+
+    def __init__(
+            self, width: int, *, depth: int = 4,
+            activation_fn: Type[nn.Module] = nn.SiLU):
+        super().__init__()
+        if width <= 0 or depth <= 0:
+            raise ValueError(f'width and depth must be positive, got {width}, {depth}')
+        layers: List[nn.Module] = []
+        for _ in range(depth):
+            layers.extend((
+                nn.Linear(width, width),
+                nn.LayerNorm(width),
+                activation_fn(),
+            ))
+        self.module = nn.Sequential(*layers)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return input + self.module(input)
+
+
+class ResidualMLP(nn.Module):
+    """LayerNorm/SiLU residual MLP following Wang et al. (2025)."""
+
+    input_size: int
+    output_size: int
+    width: int
+    depth: int
+    residual_block_size: int
+    zero_init_last_fc: bool
+
+    def __init__(
+            self, input_size: int, output_size: int, *,
+            hidden_sizes: Collection[int], residual_block_size: int = 4,
+            activation_fn: Type[nn.Module] = nn.SiLU,
+            zero_init_last_fc: bool = False):
+        super().__init__()
+        hidden_sizes = tuple(map(int, hidden_sizes))
+        if not hidden_sizes or min(hidden_sizes) <= 0:
+            raise ValueError(
+                f'ResidualMLP requires positive hidden sizes, got {hidden_sizes}'
+            )
+        if len(set(hidden_sizes)) != 1:
+            raise ValueError(
+                'ResidualMLP requires a constant width for identity shortcuts, '
+                f'got {hidden_sizes}'
+            )
+        if residual_block_size <= 0 or len(hidden_sizes) % residual_block_size:
+            raise ValueError(
+                'ResidualMLP depth must be divisible by residual_block_size, got '
+                f'depth={len(hidden_sizes)}, block_size={residual_block_size}'
+            )
+
+        self.input_size = input_size
+        self.output_size = output_size
+        self.width = hidden_sizes[0]
+        self.depth = len(hidden_sizes)
+        self.residual_block_size = residual_block_size
+        self.zero_init_last_fc = zero_init_last_fc
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_size, self.width),
+            nn.LayerNorm(self.width),
+            activation_fn(),
+        )
+        self.blocks = nn.ModuleList(
+            ResidualBlock(
+                self.width,
+                depth=residual_block_size,
+                activation_fn=activation_fn,
+            )
+            for _ in range(self.depth // residual_block_size)
+        )
+        self.output_layer = nn.Linear(self.width, output_size)
+
+        # Match Scaling CRL's variance_scaling(1/3, fan_in, uniform), whose
+        # bounds are +/- 1/sqrt(fan_in).
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    bound = module.in_features ** -0.5
+                    nn.init.uniform_(module.weight, -bound, bound)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            if zero_init_last_fc:
+                self.output_layer.weight.zero_()
+                self.output_layer.bias.zero_()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = self.input_layer(input)
+        for block in self.blocks:
+            output = block(output)
+        return self.output_layer(output)
+
+    def extra_repr(self) -> str:
+        return (
+            f'width={self.width}, depth={self.depth}, '
+            f'residual_block_size={self.residual_block_size}, '
+            f'zero_init_last_fc={self.zero_init_last_fc}'
+        )
+
+
+MLP_KINDS = ('plain', 'residual')
+
+
+def make_mlp(
+        input_size: int, output_size: int, *, hidden_sizes: Collection[int],
+        kind: str = 'plain', residual_block_size: int = 4,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        zero_init_last_fc: bool = False) -> Union[MLP, ResidualMLP]:
+    if kind == 'plain':
+        return MLP(
+            input_size,
+            output_size,
+            hidden_sizes=hidden_sizes,
+            activation_fn=activation_fn,
+            zero_init_last_fc=zero_init_last_fc,
+        )
+    if kind == 'residual':
+        return ResidualMLP(
+            input_size,
+            output_size,
+            hidden_sizes=hidden_sizes,
+            residual_block_size=residual_block_size,
+            activation_fn=activation_fn,
+            zero_init_last_fc=zero_init_last_fc,
+        )
+    raise ValueError(f'Unknown MLP kind: {kind!r}; expected one of {MLP_KINDS}')
+
+
 
 #-----------------------------------------------------------------------------#
 #-------------------------------- Module abc ---------------------------------#

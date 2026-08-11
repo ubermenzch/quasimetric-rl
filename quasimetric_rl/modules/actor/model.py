@@ -5,7 +5,7 @@ import attrs
 import torch
 import torch.nn as nn
 
-from ..utils import MLP
+from ..utils import MLP_KINDS, make_mlp
 
 from ...data import EnvSpec
 from ...data.env_spec.input_encoding import InputEncoding
@@ -21,6 +21,12 @@ class Actor(nn.Module):
         # config / argparse uses this to specify behavior
 
         arch: Tuple[int, ...] = (512, 512)
+        mlp_kind: str = attrs.field(
+            default='plain', validator=attrs.validators.in_(MLP_KINDS)
+        )
+        residual_block_size: int = attrs.field(
+            default=4, validator=attrs.validators.gt(0)
+        )
         input_mode: str = attrs.field(
             default='raw', validator=attrs.validators.in_(ACTOR_INPUT_MODES)
         )
@@ -34,18 +40,21 @@ class Actor(nn.Module):
                 input_mode=self.input_mode,
                 latent_size=latent_size,
                 goal_latent_size=goal_latent_size,
+                mlp_kind=self.mlp_kind,
+                residual_block_size=self.residual_block_size,
             )
 
     observation_shape: torch.Size
     input_mode: str
     observation_encoding: InputEncoding
-    backbone: MLP
+    backbone: nn.Module
     action_output: ActionOutputConverter
 
     def __init__(
             self, *, env_spec: EnvSpec, arch: Tuple[int, ...],
             input_mode: str, latent_size: Optional[int] = None,
-            goal_latent_size: Optional[int] = None, **kwargs):
+            goal_latent_size: Optional[int] = None, mlp_kind: str = 'plain',
+            residual_block_size: int = 4, **kwargs):
         super().__init__(**kwargs)
         self.observation_shape = env_spec.observation_shape
         self.input_mode = input_mode
@@ -66,8 +75,15 @@ class Actor(nn.Module):
             backbone_input_size = latent_size + goal_latent_size
         else:
             raise ValueError(f"Unknown actor input_mode: {input_mode!r}")
-        self.backbone = MLP(backbone_input_size, self.action_output.input_size, hidden_sizes=arch,
-                            zero_init_last_fc=True)
+        self.backbone = make_mlp(
+            backbone_input_size,
+            self.action_output.input_size,
+            hidden_sizes=arch,
+            kind=mlp_kind,
+            residual_block_size=residual_block_size,
+            activation_fn=nn.SiLU if mlp_kind == 'residual' else nn.ReLU,
+            zero_init_last_fc=True,
+        )
 
     def forward(self, o: torch.Tensor, g: torch.Tensor) -> torch.distributions.Distribution:
         if self.input_mode == 'raw':

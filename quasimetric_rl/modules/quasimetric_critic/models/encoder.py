@@ -5,7 +5,7 @@ import attrs
 import torch
 import torch.nn as nn
 
-from ...utils import MLP, LatentTensor
+from ...utils import MLP_KINDS, LatentTensor, make_mlp
 
 from ....data import EnvSpec
 from ....data.env_spec.input_encoding import InputEncoding
@@ -37,6 +37,12 @@ class Encoder(nn.Module):
             default='standard', validator=attrs.validators.in_(ENCODER_KINDS)
         )
         arch: Tuple[int, ...] = (512, 512)
+        mlp_kind: str = attrs.field(
+            default='plain', validator=attrs.validators.in_(MLP_KINDS)
+        )
+        residual_block_size: int = attrs.field(
+            default=4, validator=attrs.validators.gt(0)
+        )
         latent_size: int = 128
         goal_dims: Optional[Tuple[int, ...]] = attrs.field(
             default=None,
@@ -73,6 +79,8 @@ class Encoder(nn.Module):
                 latent_size=self.latent_size,
                 reference_arch=self.arch,
                 min_goal_ratio=self.min_goal_parameter_ratio,
+                mlp_kind=self.mlp_kind,
+                residual_block_size=self.residual_block_size,
             )
             self.goal_arch = plan.goal_arch
             self.non_goal_arch = plan.non_goal_arch
@@ -113,6 +121,8 @@ class Encoder(nn.Module):
                     goal_latent_size=self.goal_latent_size,
                     non_goal_latent_size=self.non_goal_latent_size,
                     branch_normalization=self.branch_normalization,
+                    mlp_kind=self.mlp_kind,
+                    residual_block_size=self.residual_block_size,
                 )
             if self.branch_normalization != 'none':
                 raise ValueError(
@@ -122,20 +132,31 @@ class Encoder(nn.Module):
                 env_spec=env_spec,
                 arch=self.arch,
                 latent_size=self.latent_size,
+                mlp_kind=self.mlp_kind,
+                residual_block_size=self.residual_block_size,
             )
 
     input_shape: torch.Size
     input_encoding: InputEncoding
-    encoder: MLP
+    encoder: nn.Module
     latent_size: int
 
     def __init__(self, *, env_spec: EnvSpec,
-                 arch: Tuple[int, ...], latent_size: int, **kwargs):
+                 arch: Tuple[int, ...], latent_size: int,
+                 mlp_kind: str = 'plain', residual_block_size: int = 4,
+                 **kwargs):
         super().__init__(**kwargs)
         self.input_shape = env_spec.observation_shape
         self.input_encoding = env_spec.make_observation_input()
         encoder_input_size = self.input_encoding.output_size
-        self.encoder = MLP(encoder_input_size, latent_size, hidden_sizes=arch)
+        self.encoder = make_mlp(
+            encoder_input_size,
+            latent_size,
+            hidden_sizes=arch,
+            kind=mlp_kind,
+            residual_block_size=residual_block_size,
+            activation_fn=nn.SiLU if mlp_kind == 'residual' else nn.ReLU,
+        )
         self.latent_size = latent_size
 
     def forward(self, x: torch.Tensor) -> LatentTensor:
@@ -168,8 +189,8 @@ class SplitEncoder(nn.Module):
     non_goal_dims: Tuple[int, ...]
     goal_latent_size: int
     non_goal_latent_size: int
-    goal_encoder: MLP
-    non_goal_encoder: MLP
+    goal_encoder: nn.Module
+    non_goal_encoder: nn.Module
     goal_normalization: nn.Module
     non_goal_normalization: nn.Module
 
@@ -177,7 +198,8 @@ class SplitEncoder(nn.Module):
             self, *, env_spec: EnvSpec, goal_dims: Tuple[int, ...],
             goal_arch: Tuple[int, ...], non_goal_arch: Tuple[int, ...],
             goal_latent_size: int, non_goal_latent_size: int,
-            branch_normalization: str = 'none'):
+            branch_normalization: str = 'none', mlp_kind: str = 'plain',
+            residual_block_size: int = 4):
         super().__init__()
         if len(env_spec.observation_shape) != 1:
             raise RuntimeError('SplitEncoder currently supports vector observations only')
@@ -205,11 +227,18 @@ class SplitEncoder(nn.Module):
         self.non_goal_latent_size = non_goal_latent_size
         self.latent_size = goal_latent_size + non_goal_latent_size
         self.branch_normalization = branch_normalization
-        self.goal_encoder = MLP(
-            len(goal_dims), goal_latent_size, hidden_sizes=goal_arch
+        activation_fn = nn.SiLU if mlp_kind == 'residual' else nn.ReLU
+        self.goal_encoder = make_mlp(
+            len(goal_dims), goal_latent_size, hidden_sizes=goal_arch,
+            kind=mlp_kind,
+            residual_block_size=residual_block_size,
+            activation_fn=activation_fn,
         )
-        self.non_goal_encoder = MLP(
-            len(non_goal_dims), non_goal_latent_size, hidden_sizes=non_goal_arch
+        self.non_goal_encoder = make_mlp(
+            len(non_goal_dims), non_goal_latent_size, hidden_sizes=non_goal_arch,
+            kind=mlp_kind,
+            residual_block_size=residual_block_size,
+            activation_fn=activation_fn,
         )
         if branch_normalization == 'rmsnorm':
             self.goal_normalization = nn.RMSNorm(

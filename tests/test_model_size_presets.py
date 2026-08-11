@@ -2,8 +2,10 @@ import unittest
 
 import gym
 import numpy as np
+import torch
 from omegaconf import OmegaConf, SCMode
 
+from quasimetric_rl.data import BatchData
 from quasimetric_rl.data.env_spec import EnvSpec
 from quasimetric_rl.model_size import (
     MODEL_SIZE_LEVELS,
@@ -14,6 +16,10 @@ from quasimetric_rl.model_size import (
     select_qrl_model_size,
 )
 from quasimetric_rl.modules import QRLConf
+from quasimetric_rl.modules.quasimetric_critic.models.quasimetric_model import (
+    create_quasimetric_head_from_spec,
+)
+from quasimetric_rl.modules.utils import ResidualBlock, ResidualMLP
 
 
 class QRLModelSizePresetTest(unittest.TestCase):
@@ -84,7 +90,8 @@ class QRLModelSizePresetTest(unittest.TestCase):
             observation_space_is_dict=True,
             action_space=gym.spaces.Box(-1, 1, shape=(2,), dtype=np.float32),
         )
-        for level in MODEL_SIZE_LEVELS:
+        # S/M retain the original plain-MLP architecture and exact matching.
+        for level in ('s', 'm'):
             with self.subTest(level=level):
                 expected = self.EXPECTED[level]
                 conf = self.make_conf('go_qrl', level)
@@ -113,6 +120,115 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     go_qrl_agent_parameter_count(4, 2, 2, level),
                     expected['go_params'],
                 )
+
+    def test_go_qrl_deep_presets_follow_the_residual_depth_scale(self):
+        expected = {
+            'l': ('GO-QRL-L', 4, 2048, 64, 21_830_093, 737, 735),
+            'xl': ('GO-QRL-XL', 8, 4096, 128, 40_756_153, 731, 729),
+            'xxl': ('GO-QRL-XXL', 16, 8192, 256, 78_613_803, 727, 727),
+            'xxxl': ('GO-QRL-XXXL', 32, 16384, 512, 154_331_932, 725, 726),
+        }
+        for level, (
+                label, depth, head_dim, components, parameter_count,
+                goal_width, non_goal_width,
+        ) in expected.items():
+            with self.subTest(level=level):
+                conf = self.make_conf('go_qrl', level)
+                encoder = conf.quasimetric_critic.model.encoder
+                quasimetric = conf.quasimetric_critic.model.quasimetric_model
+                dynamics = conf.quasimetric_critic.model.latent_dynamics
+                actor = conf.actor.model
+
+                self.assertEqual(conf.model_size, label)
+                self.assertEqual(encoder.latent_size, 512)
+                self.assertEqual(tuple(encoder.arch), (1024,) * depth)
+                self.assertEqual(tuple(quasimetric.projector_arch), (1024,) * depth)
+                self.assertEqual(tuple(dynamics.arch), (1024,) * depth)
+                self.assertEqual(tuple(actor.arch), (1024,) * depth)
+                self.assertEqual(encoder.mlp_kind, 'residual')
+                self.assertEqual(quasimetric.projector_mlp_kind, 'residual')
+                self.assertEqual(dynamics.mlp_kind, 'residual')
+                self.assertEqual(actor.mlp_kind, 'residual')
+                self.assertEqual(quasimetric.projector_activation, 'silu')
+                self.assertEqual(
+                    quasimetric.quasimetric_head_spec,
+                    f'iqe(dim={head_dim},components={components})',
+                )
+                self.assertEqual(head_dim // components, 32)
+                head = create_quasimetric_head_from_spec(
+                    quasimetric.quasimetric_head_spec
+                )
+                self.assertEqual(head.input_size, head_dim)
+                self.assertEqual(head.num_components, components)
+                self.assertEqual(tuple(head.latent_2d_shape), (components, 32))
+                x = torch.randn(2, head_dim, requires_grad=True)
+                y = torch.randn(2, head_dim, requires_grad=True)
+                distance = head(x, y)
+                self.assertEqual(tuple(distance.shape), (2,))
+                self.assertTrue(torch.isfinite(distance).all())
+                distance.sum().backward()
+                self.assertTrue(torch.isfinite(x.grad).all())
+                self.assertTrue(torch.isfinite(y.grad).all())
+
+                plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
+                self.assertEqual(tuple(encoder.goal_arch), (goal_width,) * depth)
+                self.assertEqual(
+                    tuple(encoder.non_goal_arch), (non_goal_width,) * depth,
+                )
+                encoder_relative_error = abs(
+                    plan.goal_encoder_parameters
+                    + plan.non_goal_encoder_parameters
+                    - plan.qrl_encoder_parameters
+                ) / plan.qrl_encoder_parameters
+                self.assertLessEqual(encoder_relative_error, 0.001)
+                self.assertEqual(
+                    go_qrl_agent_parameter_count(4, 2, 2, level),
+                    parameter_count,
+                )
+
+    def test_go_qrl_l_actual_model_trains_and_matches_parameter_count(self):
+        conf = self.make_conf('go_qrl', 'l')
+        conf.quasimetric_critic.model.encoder.goal_dims = (0, 1)
+        env_spec = EnvSpec(
+            observation_space=gym.spaces.Box(
+                -np.inf, np.inf, shape=(4,), dtype=np.float32,
+            ),
+            observation_space_is_dict=True,
+            action_space=gym.spaces.Box(-1, 1, shape=(2,), dtype=np.float32),
+        )
+        agent, losses = conf.make(env_spec=env_spec, total_optim_steps=1)
+        actual = sum(
+            parameter.numel()
+            for parameter in agent.parameters()
+            if parameter.requires_grad
+        )
+        self.assertEqual(actual, go_qrl_agent_parameter_count(4, 2, 2, 'l'))
+
+        batch_size = 4
+        observations = torch.randn(batch_size, 4)
+        data = BatchData(
+            observations=observations,
+            actions=torch.empty(batch_size, 2).uniform_(-0.8, 0.8),
+            next_observations=torch.randn(batch_size, 4),
+            future_observations=torch.randn(batch_size, 4),
+            rewards=torch.zeros(batch_size),
+            terminals=torch.zeros(batch_size, dtype=torch.bool),
+            timeouts=torch.zeros(batch_size, dtype=torch.bool),
+        )
+        result = losses(agent, data, optimize=True)
+        self.assertTrue(torch.isfinite(result.loss))
+        for module in (
+                agent.critics[0].encoder,
+                agent.critics[0].quasimetric_model.projector,
+                agent.critics[0].latent_dynamics,
+                agent.actor,
+        ):
+            gradients = [parameter.grad for parameter in module.parameters()]
+            self.assertTrue(any(gradient is not None for gradient in gradients))
+            self.assertTrue(all(
+                gradient is None or torch.isfinite(gradient).all()
+                for gradient in gradients
+            ))
 
     def test_go_qrl_goal_branch_respects_parameter_floor(self):
         for level, latent, width in (
@@ -186,6 +302,55 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     abs(actual_share - target_share) / target_share,
                     0.0025,
                 )
+
+    def test_residual_block_is_identity_when_its_dense_layers_are_zero(self):
+        block = ResidualBlock(8, depth=4)
+        with torch.no_grad():
+            for module in block.modules():
+                if isinstance(module, torch.nn.Linear):
+                    module.weight.zero_()
+                    module.bias.zero_()
+        inputs = torch.randn(3, 8)
+        torch.testing.assert_close(block(inputs), inputs)
+
+    def test_residual_mlp_depth_and_parameter_count(self):
+        for depth in (4, 8, 16, 32):
+            with self.subTest(depth=depth):
+                input_size, width, output_size = 7, 32, 5
+                mlp = ResidualMLP(
+                    input_size,
+                    output_size,
+                    hidden_sizes=(width,) * depth,
+                    residual_block_size=4,
+                )
+                expected = (
+                    (input_size + 1) * width + 2 * width
+                    + depth * ((width + 1) * width + 2 * width)
+                    + (width + 1) * output_size
+                )
+                self.assertEqual(len(mlp.blocks), depth // 4)
+                self.assertIsInstance(mlp.output_layer, torch.nn.Linear)
+                self.assertEqual(
+                    sum(parameter.numel() for parameter in mlp.parameters()),
+                    expected,
+                )
+                for block in mlp.blocks:
+                    layers = tuple(block.module)
+                    self.assertEqual(len(layers), 3 * mlp.residual_block_size)
+                    for layer_index in range(mlp.residual_block_size):
+                        linear, normalization, activation = layers[
+                            3 * layer_index:3 * layer_index + 3
+                        ]
+                        self.assertIsInstance(linear, torch.nn.Linear)
+                        self.assertIsInstance(normalization, torch.nn.LayerNorm)
+                        self.assertIsInstance(activation, torch.nn.SiLU)
+                self.assertEqual(
+                    mlp(torch.randn(3, input_size)).shape,
+                    (3, output_size),
+                )
+
+        with self.assertRaisesRegex(ValueError, 'must be divisible'):
+            ResidualMLP(7, 5, hidden_sizes=(32,) * 6, residual_block_size=4)
 
     def test_selects_smallest_level_with_strict_half_latent_capacity(self):
         expected = {

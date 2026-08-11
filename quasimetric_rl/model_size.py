@@ -18,8 +18,8 @@ BASE_MODEL_SIZE_LEVELS = MODEL_SIZE_LEVELS
 
 @dataclass(frozen=True)
 class GOQRLBranchPlan:
-    goal_arch: Tuple[int, int]
-    non_goal_arch: Tuple[int, int]
+    goal_arch: Tuple[int, ...]
+    non_goal_arch: Tuple[int, ...]
     goal_latent_size: int
     non_goal_latent_size: int
     qrl_encoder_parameters: int
@@ -93,6 +93,45 @@ def _mlp_parameter_count(input_size: int, hidden_sizes, output_size: int) -> int
     )
 
 
+def _residual_mlp_parameter_count(
+        input_size: int, hidden_sizes, output_size: int,
+        residual_block_size: int = 4) -> int:
+    hidden_sizes = tuple(map(int, hidden_sizes))
+    if not hidden_sizes or len(set(hidden_sizes)) != 1:
+        raise ValueError(
+            'Residual MLP parameter counting requires a non-empty constant-width '
+            f'architecture, got {hidden_sizes}'
+        )
+    if residual_block_size <= 0 or len(hidden_sizes) % residual_block_size:
+        raise ValueError(
+            'Residual MLP depth must be divisible by residual_block_size, got '
+            f'depth={len(hidden_sizes)}, block_size={residual_block_size}'
+        )
+    width = hidden_sizes[0]
+    depth = len(hidden_sizes)
+    # Input projection and every residual Dense have affine LayerNorm parameters.
+    return (
+        (input_size + 1) * width + 2 * width
+        + depth * ((width + 1) * width + 2 * width)
+        + (width + 1) * output_size
+    )
+
+
+def _configured_mlp_parameter_count(
+        input_size: int, hidden_sizes, output_size: int, *,
+        kind: str = 'plain', residual_block_size: int = 4) -> int:
+    if kind == 'plain':
+        return _mlp_parameter_count(input_size, hidden_sizes, output_size)
+    if kind == 'residual':
+        return _residual_mlp_parameter_count(
+            input_size,
+            hidden_sizes,
+            output_size,
+            residual_block_size,
+        )
+    raise ValueError(f'Unknown MLP kind {kind!r}')
+
+
 def _iqe_head_dim(quasimetric) -> int:
     head_match = re.fullmatch(
         r'iqe\(dim=(\d+),components=(\d+)\)',
@@ -127,15 +166,35 @@ def qrl_agent_parameter_count(state_dim: int, action_dim: int, level: str) -> in
 
     latent_size = int(encoder.latent_size)
     head_dim = _iqe_head_dim(quasimetric)
-    encoder_count = _mlp_parameter_count(state_dim, encoder.arch, latent_size)
-    projector_count = _mlp_parameter_count(
-        latent_size, quasimetric.projector_arch, head_dim,
+    encoder_count = _configured_mlp_parameter_count(
+        state_dim,
+        encoder.arch,
+        latent_size,
+        kind=str(encoder.get('mlp_kind', 'plain')),
+        residual_block_size=int(encoder.get('residual_block_size', 4)),
     )
-    dynamics_count = _mlp_parameter_count(
-        latent_size + action_dim, dynamics.arch, latent_size,
+    projector_count = _configured_mlp_parameter_count(
+        latent_size,
+        quasimetric.projector_arch,
+        head_dim,
+        kind=str(quasimetric.get('projector_mlp_kind', 'plain')),
+        residual_block_size=int(
+            quasimetric.get('projector_residual_block_size', 4)
+        ),
     )
-    actor_count = _mlp_parameter_count(
-        2 * state_dim, actor.arch, 2 * action_dim,
+    dynamics_count = _configured_mlp_parameter_count(
+        latent_size + action_dim,
+        dynamics.arch,
+        latent_size,
+        kind=str(dynamics.get('mlp_kind', 'plain')),
+        residual_block_size=int(dynamics.get('residual_block_size', 4)),
+    )
+    actor_count = _configured_mlp_parameter_count(
+        2 * state_dim,
+        actor.arch,
+        2 * action_dim,
+        kind=str(actor.get('mlp_kind', 'plain')),
+        residual_block_size=int(actor.get('residual_block_size', 4)),
     )
     # IQE max-mean reduction contributes one trainable scalar.
     return encoder_count + projector_count + 1 + dynamics_count + actor_count
@@ -191,8 +250,13 @@ def match_go_qrl_split_encoder(
         state_dim: int, goal_dim: int, latent_size: int,
         reference_arch: Iterable[int], min_goal_ratio: float = 0.125,
         max_relative_budget_error: float = 0.0025,
+        mlp_kind: str = 'plain', residual_block_size: int = 4,
 ) -> GOQRLBranchPlan:
-    """Match two split MLPs to a QRL encoder's exact total parameter count."""
+    """Match two split MLPs to a QRL encoder's parameter budget.
+
+    Plain MLPs are matched exactly. Residual MLP branches must remain
+    constant-width, so their nearest realizable total may differ slightly.
+    """
     reference_arch = tuple(map(int, reference_arch))
     if state_dim <= 1 or not 0 < goal_dim < state_dim:
         raise ValueError(
@@ -200,9 +264,10 @@ def match_go_qrl_split_encoder(
         )
     if latent_size <= 1:
         raise ValueError(f'latent_size must exceed one, got {latent_size}')
-    if len(reference_arch) != 2 or min(reference_arch) <= 0:
+    if len(reference_arch) < 2 or min(reference_arch) <= 0:
         raise ValueError(
-            'Automatic GO-QRL branch matching requires two positive QRL hidden widths, '
+            'Automatic GO-QRL branch matching requires at least two positive '
+            'reference hidden widths, '
             f'got {reference_arch}'
         )
 
@@ -217,10 +282,94 @@ def match_go_qrl_split_encoder(
         ceil(latent_size * goal_weight / total_weight),
     )
     non_goal_latent_size = latent_size - goal_latent_size
-    qrl_parameters = _mlp_parameter_count(
-        state_dim, reference_arch, latent_size,
+    qrl_parameters = _configured_mlp_parameter_count(
+        state_dim,
+        reference_arch,
+        latent_size,
+        kind=mlp_kind,
+        residual_block_size=residual_block_size,
     )
     target_goal_parameters = qrl_parameters * goal_share
+
+    if mlp_kind == 'residual':
+        if len(set(reference_arch)) != 1:
+            raise ValueError(
+                'Residual GO-QRL matching requires a constant reference width, '
+                f'got {reference_arch}'
+            )
+        reference_width = reference_arch[0]
+        depth = len(reference_arch)
+
+        def nearest_widths(input_size: int, output_size: int, target: float):
+            candidates = []
+            for width in range(1, 2 * reference_width + 1):
+                arch = (width,) * depth
+                count = _residual_mlp_parameter_count(
+                    input_size, arch, output_size, residual_block_size,
+                )
+                candidates.append((abs(count - target), width, count))
+            return sorted(candidates)[:32]
+
+        goal_candidates = nearest_widths(
+            goal_dim, goal_latent_size, target_goal_parameters,
+        )
+        non_goal_candidates = nearest_widths(
+            non_goal_dim,
+            non_goal_latent_size,
+            qrl_parameters - target_goal_parameters,
+        )
+        feasible = []
+        for _goal_error, goal_width, goal_parameters in goal_candidates:
+            for _non_goal_error, non_goal_width, non_goal_parameters in non_goal_candidates:
+                if goal_parameters / non_goal_parameters < min_goal_ratio:
+                    continue
+                total_error = abs(
+                    goal_parameters + non_goal_parameters - qrl_parameters
+                ) / qrl_parameters
+                goal_error = abs(
+                    goal_parameters - target_goal_parameters
+                ) / target_goal_parameters
+                if goal_error > max_relative_budget_error:
+                    continue
+                feasible.append((
+                    total_error,
+                    goal_error,
+                    abs(goal_width - reference_width * sqrt(goal_share))
+                    + abs(non_goal_width - reference_width * sqrt(1 - goal_share)),
+                    goal_width,
+                    non_goal_width,
+                    goal_parameters,
+                    non_goal_parameters,
+                ))
+        if not feasible:
+            raise ValueError(
+                'Could not construct residual GO-QRL encoder branches for '
+                f'state_dim={state_dim}, goal_dim={goal_dim}'
+            )
+        (
+            _total_error, _goal_error, _width_error,
+            goal_width, non_goal_width,
+            goal_parameters, non_goal_parameters,
+        ) = min(feasible)
+        return GOQRLBranchPlan(
+            goal_arch=(goal_width,) * depth,
+            non_goal_arch=(non_goal_width,) * depth,
+            goal_latent_size=goal_latent_size,
+            non_goal_latent_size=non_goal_latent_size,
+            qrl_encoder_parameters=qrl_parameters,
+            goal_encoder_parameters=goal_parameters,
+            non_goal_encoder_parameters=non_goal_parameters,
+            goal_parameter_weight=goal_weight,
+            non_goal_parameter_weight=non_goal_weight,
+            minimum_ratio_applied=floor_applied,
+        )
+    if mlp_kind != 'plain':
+        raise ValueError(f'Unknown GO-QRL encoder MLP kind {mlp_kind!r}')
+    if len(reference_arch) != 2:
+        raise ValueError(
+            'Plain GO-QRL branch matching requires two reference hidden widths, '
+            f'got {reference_arch}'
+        )
 
     ideal_goal = tuple(
         max(1, round(width * sqrt(goal_share))) for width in reference_arch
@@ -301,19 +450,33 @@ def go_qrl_agent_parameter_count(
         latent_size=int(encoder.latent_size),
         reference_arch=encoder.arch,
         min_goal_ratio=float(encoder.min_goal_parameter_ratio),
+        mlp_kind=str(encoder.get('mlp_kind', 'plain')),
+        residual_block_size=int(encoder.get('residual_block_size', 4)),
     )
     latent_size = int(encoder.latent_size)
     head_dim = _iqe_head_dim(quasimetric)
-    projector_count = _mlp_parameter_count(
-        latent_size, quasimetric.projector_arch, head_dim,
+    projector_count = _configured_mlp_parameter_count(
+        latent_size,
+        quasimetric.projector_arch,
+        head_dim,
+        kind=str(quasimetric.get('projector_mlp_kind', 'plain')),
+        residual_block_size=int(
+            quasimetric.get('projector_residual_block_size', 4)
+        ),
     )
-    dynamics_count = _mlp_parameter_count(
-        latent_size + action_dim, dynamics.arch, latent_size,
+    dynamics_count = _configured_mlp_parameter_count(
+        latent_size + action_dim,
+        dynamics.arch,
+        latent_size,
+        kind=str(dynamics.get('mlp_kind', 'plain')),
+        residual_block_size=int(dynamics.get('residual_block_size', 4)),
     )
-    actor_count = _mlp_parameter_count(
+    actor_count = _configured_mlp_parameter_count(
         latent_size + plan.goal_latent_size,
         actor.arch,
         2 * action_dim,
+        kind=str(actor.get('mlp_kind', 'plain')),
+        residual_block_size=int(actor.get('residual_block_size', 4)),
     )
     return (
         plan.goal_encoder_parameters

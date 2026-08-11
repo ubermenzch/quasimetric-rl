@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torchqmet
 
-from ...utils import MLP, LatentTensor
+from ...utils import MLP_KINDS, LatentTensor, make_mlp
 
 
 class L2(torchqmet.QuasimetricBase):
@@ -68,9 +68,15 @@ class QuasimetricModel(nn.Module):
         # config / argparse uses this to specify behavior
 
         projector_arch: Tuple[int, ...] = (512,)
+        projector_mlp_kind: str = attrs.field(
+            default='plain', validator=attrs.validators.in_(MLP_KINDS)
+        )
+        projector_residual_block_size: int = attrs.field(
+            default=4, validator=attrs.validators.gt(0)
+        )
         projector_activation: str = attrs.field(
             default='relu',
-            validator=attrs.validators.in_(('relu', 'leaky_relu')),
+            validator=attrs.validators.in_(('relu', 'leaky_relu', 'silu')),
         )
         projector_negative_slope: float = attrs.field(
             default=0.01,
@@ -82,16 +88,20 @@ class QuasimetricModel(nn.Module):
             return QuasimetricModel(
                 input_size=input_size,
                 projector_arch=self.projector_arch,
+                projector_mlp_kind=self.projector_mlp_kind,
+                projector_residual_block_size=self.projector_residual_block_size,
                 projector_activation=self.projector_activation,
                 projector_negative_slope=self.projector_negative_slope,
                 quasimetric_head_spec=self.quasimetric_head_spec,
             )
 
     input_size: int
-    projector: MLP
+    projector: nn.Module
     quasimetric_head: torchqmet.QuasimetricBase
 
     def __init__(self, *, input_size: int, projector_arch: Tuple[int, ...],
+                 projector_mlp_kind: str = 'plain',
+                 projector_residual_block_size: int = 4,
                  projector_activation: str = 'relu', projector_negative_slope: float = 0.01,
                  quasimetric_head_spec: str):
         super().__init__()
@@ -104,12 +114,16 @@ class QuasimetricModel(nn.Module):
                 nn.LeakyReLU,
                 negative_slope=projector_negative_slope,
             )
+        elif projector_activation == 'silu':
+            activation_fn = nn.SiLU
         else:
             raise ValueError(f'unknown projector activation: {projector_activation!r}')
-        self.projector = MLP(
+        self.projector = make_mlp(
             input_size,
             self.quasimetric_head.input_size,
             hidden_sizes=projector_arch,
+            kind=projector_mlp_kind,
+            residual_block_size=projector_residual_block_size,
             activation_fn=activation_fn,
         )
 

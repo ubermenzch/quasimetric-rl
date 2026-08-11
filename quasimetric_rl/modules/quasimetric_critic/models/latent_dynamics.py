@@ -5,7 +5,7 @@ import attrs
 import torch
 import torch.nn as nn
 
-from ...utils import MLP, LatentTensor
+from ...utils import MLP, MLP_KINDS, LatentTensor, make_mlp
 
 from ....data import EnvSpec
 from ....data.env_spec.input_encoding import InputEncoding
@@ -51,6 +51,40 @@ class MlpLatentDynamics(MLP):
 
     def extra_repr(self) -> str:
         return super().extra_repr() + f"\nresidual={self.residual}"
+
+
+class ResidualMlpLatentDynamics(nn.Module):
+    def __init__(
+            self, *, latent_size: int, env_spec: EnvSpec,
+            hidden_sizes: Tuple[int, ...], residual: bool,
+            residual_block_size: int):
+        super().__init__()
+        self.action_input = env_spec.make_action_input()
+        self.residual = residual
+        self.backbone = make_mlp(
+            latent_size + self.action_input.output_size,
+            latent_size,
+            hidden_sizes=hidden_sizes,
+            kind='residual',
+            residual_block_size=residual_block_size,
+            activation_fn=nn.SiLU,
+            zero_init_last_fc=residual,
+        )
+
+    @property
+    def required_transition_history_length(self) -> int:
+        return 0
+
+    def forward(self, zx: LatentTensor, action: torch.Tensor) -> LatentTensor:
+        action = self.action_input(action)
+        broadcast_bshape = torch.broadcast_shapes(zx.shape[:-1], action.shape[:-1])
+        zx = zx.expand(broadcast_bshape + zx.shape[-1:])
+        action = action.expand(broadcast_bshape + action.shape[-1:])
+        zy = self.backbone(torch.cat([zx, action], dim=-1))
+        return zx + zy if self.residual else zy
+
+    def __call__(self, zx: LatentTensor, action: torch.Tensor) -> LatentTensor:
+        return nn.Module.__call__(self, zx, action)
 
 
 class TransformerLatentDynamics(nn.Module):
@@ -162,6 +196,12 @@ class LatentDynamics(nn.Module):
 
         kind: str = 'mlp'
         arch: Tuple[int, ...] = (512, 512)
+        mlp_kind: str = attrs.field(
+            default='plain', validator=attrs.validators.in_(MLP_KINDS)
+        )
+        residual_block_size: int = attrs.field(
+            default=4, validator=attrs.validators.gt(0)
+        )
         residual: bool = True
         # Counts input state frames: h=1 is current state only; h=2 adds one
         # historical state. The following state is the prediction target.
@@ -175,8 +215,16 @@ class LatentDynamics(nn.Module):
         transformer_ff_mult: int = attrs.field(default=4, validator=attrs.validators.gt(0))
         transformer_dropout: float = attrs.field(default=0.0, validator=attrs.validators.ge(0))
 
-        def make(self, *, latent_size: int, env_spec: EnvSpec) -> Union[MlpLatentDynamics, TransformerLatentDynamics]:
+        def make(self, *, latent_size: int, env_spec: EnvSpec) -> Union[MlpLatentDynamics, ResidualMlpLatentDynamics, TransformerLatentDynamics]:
             if self.kind == 'mlp':
+                if self.mlp_kind == 'residual':
+                    return ResidualMlpLatentDynamics(
+                        latent_size=latent_size,
+                        env_spec=env_spec,
+                        hidden_sizes=self.arch,
+                        residual=self.residual,
+                        residual_block_size=self.residual_block_size,
+                    )
                 return MlpLatentDynamics(
                     latent_size=latent_size,
                     env_spec=env_spec,
