@@ -383,6 +383,10 @@ def notification_host_label(config: dict[str, str]) -> str:
     return cfg(config, "NOTIFY_HOST_LABEL", "").strip() or socket.gethostname()
 
 
+def notification_title(config: dict[str, str], title: str) -> str:
+    return f"[{notification_host_label(config)}] {title}"
+
+
 def notification_enabled(
     config: dict[str, str],
     name: str,
@@ -400,6 +404,7 @@ def send_phone_notification(
     priority: str = "default",
     tags: str = "",
 ) -> bool:
+    title = notification_title(config, title)
     if cfg(config, "SERVERCHAN_SENDKEY", "").strip():
         return send_serverchan_notification(config, title, message)
     return send_ntfy_notification(

@@ -214,8 +214,9 @@ Configure a ServerChan delivery channel, then send a lock-free test message:
 ```
 
 Set a different `NOTIFY_HOST_LABEL` on each machine (for example `226`, `L40`,
-and `225`) even when they share one SendKey. The label is included in test,
-queue-drained, completion, and task-error notifications.
+and `225`) even when they share one SendKey. Every notification title starts
+with this label; the label is also included in the message body. When the
+setting is empty, the operating-system hostname is used.
 
 The running scheduler reloads this configuration on every polling cycle.
 When notifications are first enabled, it records the current queue state as a

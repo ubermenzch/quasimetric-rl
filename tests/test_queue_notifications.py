@@ -8,6 +8,7 @@ from unittest import mock
 from tools.run_qrl_queue import Task
 from tools.run_qrl_queue import notify_queue_events
 from tools.run_qrl_queue import send_ntfy_notification
+from tools.run_qrl_queue import send_phone_notification
 from tools.run_qrl_queue import send_serverchan_notification
 from tools.run_qrl_queue import write_status
 
@@ -291,6 +292,54 @@ class QueueNotificationsTest(unittest.TestCase):
         self.assertEqual(form["title"], ["QRL complete"])
         self.assertEqual(form["desp"], ["Pending: 0"])
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 10.0)
+
+    def test_phone_notification_adds_host_label_to_serverchan_title(self):
+        config = {
+            "SERVERCHAN_SENDKEY": "SCT-test-key",
+            "NOTIFY_HOST_LABEL": "L40",
+        }
+        with mock.patch(
+            "tools.run_qrl_queue.send_serverchan_notification", return_value=True
+        ) as send:
+            sent = send_phone_notification(
+                config,
+                "QRL complete",
+                "Pending: 0",
+            )
+
+        self.assertTrue(sent)
+        send.assert_called_once_with(
+            config,
+            "[L40] QRL complete",
+            "Pending: 0",
+        )
+
+    def test_phone_notification_uses_system_hostname_by_default(self):
+        config = {"NTFY_TOPIC_URL": "https://ntfy.sh/private-topic"}
+        with (
+            mock.patch(
+                "tools.run_qrl_queue.socket.gethostname", return_value="worker-07"
+            ),
+            mock.patch(
+                "tools.run_qrl_queue.send_ntfy_notification", return_value=True
+            ) as send,
+        ):
+            sent = send_phone_notification(
+                config,
+                "QRL complete",
+                "Pending: 0",
+                priority="high",
+                tags="warning",
+            )
+
+        self.assertTrue(sent)
+        send.assert_called_once_with(
+            config,
+            "[worker-07] QRL complete",
+            "Pending: 0",
+            priority="high",
+            tags="warning",
+        )
 
 
 if __name__ == "__main__":
