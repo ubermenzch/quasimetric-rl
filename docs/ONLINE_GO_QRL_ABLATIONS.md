@@ -27,7 +27,7 @@ The assignment keeps every five-seed environment/variant group on one server:
 
 | Partition | Baseline workload | Ablation groups | Ablation tasks |
 | --- | --- | --- | ---: |
-| `local` | GCBC-M (35) | FetchPush all 5; reacher_hard all 5; Inner0 on FetchReach, FetchSlide, FetchPickAndPlace | 65 |
+| `local` | GCSL-M (35) | FetchPush all 5; reacher_hard all 5; Inner0 on FetchReach, FetchSlide, FetchPickAndPlace | 65 |
 | `server_crl` | CRL-M (35) | Reacher-v4 Inner0, Min1, Min8 | 15 |
 | `server_c_learning` | C-Learning-M (35) | Reacher-v4 Max1, Max8; reacher_easy Inner0 | 15 |
 

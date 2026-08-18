@@ -1,0 +1,5 @@
+# TD-InfoNCE-L: preserve the official four-layer topology at the L budget.
+model_size: TD-InfoNCE-L
+baselines:
+  td_infonce:
+    hidden_sizes: [1192, 1192, 1192, 1192]

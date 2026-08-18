@@ -285,6 +285,13 @@ class MinDistLoss(ActorLossBase):
         goal_latent, initial_non_goal_latent = critic.encoder.split_latent(
             initial_goal_latent.detach()
         )
+        if initial_non_goal_latent.dtype in (torch.float16, torch.bfloat16):
+            # The inner optimization repeatedly differentiates with respect to
+            # this latent. Retain FP32 search state while allowing the large
+            # projector and dynamics MLPs to run under autocast.
+            goal_latent = goal_latent.float()
+            initial_non_goal_latent = initial_non_goal_latent.float()
+            predicted_latent = predicted_latent.float()
         residual_search = self.latent_goal_search in (
             'residual', 'bounded_residual'
         )

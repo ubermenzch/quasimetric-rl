@@ -5,6 +5,9 @@ from pathlib import Path
 
 from tools.generate_go_qrl_hybrid_scale_tasks import (
     ENVIRONMENTS,
+    GPU_OPTIMIZATION_ARGS,
+    GPU_OPTIMIZATION_TAG,
+    GPU_OPTIMIZED_LEVELS,
     MODEL_SCALES,
     PARTITION_GROUPS,
     TRAINING_SEEDS,
@@ -57,6 +60,17 @@ class GOQRLHybridScaleTaskGeneratorTest(unittest.TestCase):
                 'projector_activation',
                 args,
             )
+            scale = task_scale(task)
+            if scale in GPU_OPTIMIZED_LEVELS:
+                self.assertIn(f'_{GPU_OPTIMIZATION_TAG}_', task.task_id)
+                for optimization_arg in GPU_OPTIMIZATION_ARGS:
+                    key, value = optimization_arg.split('=', 1)
+                    self.assertEqual(args[key], value)
+            else:
+                self.assertNotIn(f'_{GPU_OPTIMIZATION_TAG}_', task.task_id)
+                for optimization_arg in GPU_OPTIMIZATION_ARGS:
+                    key = optimization_arg.split('=', 1)[0]
+                    self.assertNotIn(key, args)
 
     def test_partitions_are_disjoint_complete_and_keep_seed_groups(self):
         validate_partitions(self.tasks)

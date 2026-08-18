@@ -63,6 +63,9 @@ class AdamWSpec:
         grad_clip_norm: Optional[float] = attrs.field(
             default=None, validator=attrs.validators.optional(attrs.validators.gt(0))
         )
+        # None preserves PyTorch's legacy/default optimizer selection. Scale
+        # tasks opt into the fused CUDA implementation explicitly.
+        fused: Optional[bool] = None
         cosine_lr_decay_final_mul: float = attrs.field(default=1, validator=attrs.validators.and_(
             attrs.validators.ge(0),
             attrs.validators.le(1),
@@ -76,6 +79,7 @@ class AdamWSpec:
     betas: Tuple[float, float]
     weight_decay: float
     grad_clip_norm: Optional[float]
+    fused: Optional[bool]
     cosine_lr_decay_final_mul: float
 
     def __attrs_post_init__(self):
@@ -86,7 +90,13 @@ class AdamWSpec:
         if len(params) == 0:
             params = [dict(params=[])]  # dummy param group so pytorch doesn't complain
         return OptimWrapper(
-            torch.optim.AdamW(params, lr=self.lr, betas=self.betas, weight_decay=self.weight_decay),
+            torch.optim.AdamW(
+                params,
+                lr=self.lr,
+                betas=self.betas,
+                weight_decay=self.weight_decay,
+                fused=self.fused,
+            ),
             grad_clip_norm=self.grad_clip_norm,
         )
 

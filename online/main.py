@@ -9,6 +9,7 @@ import json
 import re
 import signal
 import time
+from pathlib import Path
 
 import hydra
 import hydra.types
@@ -28,7 +29,7 @@ from quasimetric_rl.base_conf import BaseConf
 from quasimetric_rl.data.base import GOAL_SET_DIMS_REGISTRY
 from quasimetric_rl.model_size import register_model_size_presets
 
-from .trainer import Trainer, InteractionConf
+from .trainer import Trainer, InteractionConf, TrainingOptimizationsConf
 
 
 class TrainingInterrupted(Exception):
@@ -37,6 +38,8 @@ class TrainingInterrupted(Exception):
 
 ONLINE_CHECKPOINT_KIND_COMMITTED = 'online_committed'
 ONLINE_CHECKPOINT_KIND_INTERRUPTED = 'online_interrupted'
+ONLINE_CHECKPOINT_KIND_AGENT = 'online_agent'
+SELECTED_BEST_AGENT_FILENAME = 'selected_best_agent.pth'
 _ONLINE_CHECKPOINT_RE = re.compile(
     r'^checkpoint_env(\d+)_opt(\d+)(?:_[^.]+)?\.pth$'
 )
@@ -204,6 +207,7 @@ class Conf(BaseConf):
 
     batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
     interaction: InteractionConf = InteractionConf()
+    training_optimizations: TrainingOptimizationsConf = TrainingOptimizationsConf()
 
     log_steps: int = attrs.field(default=250, validator=attrs.validators.gt(0))
     eval_steps: Optional[int] = attrs.field(
@@ -211,6 +215,7 @@ class Conf(BaseConf):
     )
     save_steps: int = attrs.field(default=20000, validator=attrs.validators.gt(0))
     keep_only_latest_checkpoint: bool = True
+    keep_only_best_and_final_checkpoints: bool = False
     save_replay_buffer: bool = True
     save_final_replay_buffer: bool = True
     timing: utils.TimingConf = utils.TimingConf()
@@ -272,6 +277,16 @@ def validation_sort_key(summary: Mapping[str, Any]) -> tuple:
     )
 
 
+def validation_improves(
+        candidate: Mapping[str, Any],
+        incumbent: Optional[Mapping[str, Any]]) -> bool:
+    """Return whether candidate should replace the currently deployed best."""
+    return (
+        incumbent is None
+        or validation_sort_key(candidate) > validation_sort_key(incumbent)
+    )
+
+
 def select_best_validation(summaries: Sequence[Mapping[str, Any]]) -> dict:
     candidates = [
         summary for summary in summaries
@@ -282,6 +297,228 @@ def select_best_validation(summaries: Sequence[Mapping[str, Any]]) -> dict:
     if not candidates:
         raise RuntimeError('No checkpoint-bound validation results are available')
     return dict(max(candidates, key=validation_sort_key))
+
+
+def deployment_agent_checkpoint_state(
+        agent_state_dict: Mapping[str, Any],
+        validation_summary: Mapping[str, Any]) -> dict:
+    """Build the model-only state needed to reconstruct an evaluation agent."""
+    return {
+        'checkpoint_kind': ONLINE_CHECKPOINT_KIND_AGENT,
+        'env_steps': int(validation_summary['env_steps']),
+        'optim_steps': int(validation_summary['optim_steps']),
+        'agent': agent_state_dict,
+        'validation_summary': dict(validation_summary),
+    }
+
+
+def selected_best_validation_summary(
+        validation_summary: Mapping[str, Any]) -> dict:
+    """Point validation provenance at the single rolling deployment file."""
+    selected = dict(validation_summary)
+    source = selected.get('agent_checkpoint')
+    if source and source != SELECTED_BEST_AGENT_FILENAME:
+        selected.setdefault('source_agent_checkpoint', source)
+    selected['agent_checkpoint'] = SELECTED_BEST_AGENT_FILENAME
+    return selected
+
+
+def validation_summaries_match(
+        actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    """Compare checkpoint identity while allowing provenance-path upgrades."""
+    try:
+        if validation_sort_key(actual) != validation_sort_key(expected):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    for key in (
+            'split', 'seed', 'seed_end', 'num_episodes', 'succ_rate',
+            'checkpoint'):
+        if key in expected and actual.get(key) != expected[key]:
+            return False
+    return True
+
+
+def selected_best_agent_checkpoint_issue(
+        state_dicts: Mapping[str, Any],
+        expected_validation_summary: Mapping[str, Any]) -> Optional[str]:
+    """Return why a rolling best-agent checkpoint is unusable or stale."""
+    if state_dicts.get('checkpoint_kind') != ONLINE_CHECKPOINT_KIND_AGENT:
+        return f"checkpoint_kind={state_dicts.get('checkpoint_kind')!r}"
+    if not isinstance(state_dicts.get('agent'), Mapping):
+        return 'missing agent state'
+    validation_summary = state_dicts.get('validation_summary')
+    if not isinstance(validation_summary, Mapping):
+        return 'missing validation_summary'
+    if not validation_summaries_match(
+            validation_summary, expected_validation_summary):
+        return 'validation_summary does not match the committed best'
+    return None
+
+
+def publish_selected_best_agent_checkpoint(
+        output_dir: str, *, agent_state_dict: Mapping[str, Any],
+        validation_summary: Mapping[str, Any]) -> Tuple[dict, str]:
+    """Atomically publish the one model-only checkpoint used for deployment."""
+    selected = selected_best_validation_summary(validation_summary)
+    utils.mkdir(output_dir)
+    selected_path = os.path.join(output_dir, SELECTED_BEST_AGENT_FILENAME)
+    utils.atomic_torch_save(
+        deployment_agent_checkpoint_state(agent_state_dict, selected),
+        selected_path,
+    )
+    return selected, selected_path
+
+
+def maintain_selected_best_agent_checkpoint(
+        output_dir: str, *, agent_state_dict: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        incumbent: Optional[Mapping[str, Any]],
+) -> Tuple[dict, str, bool]:
+    """Keep one best-agent file, replacing it only on an improvement."""
+    selected_path = os.path.join(output_dir, SELECTED_BEST_AGENT_FILENAME)
+    if not validation_improves(candidate, incumbent):
+        assert incumbent is not None
+        return selected_best_validation_summary(incumbent), selected_path, False
+    selected, selected_path = publish_selected_best_agent_checkpoint(
+        output_dir,
+        agent_state_dict=agent_state_dict,
+        validation_summary=candidate,
+    )
+    return selected, selected_path, True
+
+
+def ensure_selected_best_agent_checkpoint(
+        output_dir: str, *, validation_summary: Mapping[str, Any],
+        committed_state: Optional[Mapping[str, Any]] = None,
+) -> Tuple[dict, str, bool]:
+    """Validate the rolling best file and repair it from committed state."""
+    expected = selected_best_validation_summary(validation_summary)
+    selected_path = os.path.join(output_dir, SELECTED_BEST_AGENT_FILENAME)
+    selected_state = None
+    try:
+        selected_state = torch.load(
+            selected_path, map_location='cpu', weights_only=False,
+        )
+    except FileNotFoundError:
+        issue = 'file is missing'
+    except Exception as exc:
+        issue = f'file is unreadable: {exc}'
+    else:
+        if not isinstance(selected_state, Mapping):
+            issue = 'payload is not a mapping'
+        else:
+            issue = selected_best_agent_checkpoint_issue(
+                selected_state, expected,
+            )
+            if issue is None:
+                return expected, selected_path, False
+
+    logging.warning('Repairing %s: %s', selected_path, issue)
+    source_agent_state = None
+
+    # A legacy selected file can contain the right agent plus extra test data.
+    if isinstance(selected_state, Mapping):
+        saved_summary = selected_state.get('validation_summary')
+        if (isinstance(selected_state.get('agent'), Mapping)
+                and isinstance(saved_summary, Mapping)
+                and validation_summaries_match(saved_summary, expected)):
+            source_agent_state = selected_state['agent']
+
+    # A crash between committing the full checkpoint and publishing best is
+    # repaired directly from that full checkpoint's current agent.
+    if source_agent_state is None and isinstance(committed_state, Mapping):
+        saved_summary = committed_state.get('validation_summary')
+        if (isinstance(committed_state.get('agent'), Mapping)
+                and isinstance(saved_summary, Mapping)
+                and validation_summaries_match(saved_summary, expected)):
+            source_agent_state = committed_state['agent']
+
+    # This also supports enabling compact retention while resuming an older run
+    # that still has per-validation agent or full checkpoints on disk.
+    if source_agent_state is None:
+        source_names = [
+            expected.get('source_agent_checkpoint'),
+            expected.get('agent_checkpoint'),
+            expected.get('checkpoint'),
+        ]
+        for source_name in source_names:
+            if (not source_name
+                    or source_name == SELECTED_BEST_AGENT_FILENAME
+                    or os.path.basename(source_name) != source_name):
+                continue
+            source_path = os.path.join(output_dir, source_name)
+            try:
+                source_state = torch.load(
+                    source_path, map_location='cpu', weights_only=False,
+                )
+            except Exception:
+                continue
+            if not isinstance(source_state, Mapping):
+                continue
+            saved_summary = source_state.get('validation_summary')
+            if (isinstance(source_state.get('agent'), Mapping)
+                    and isinstance(saved_summary, Mapping)
+                    and validation_summaries_match(saved_summary, expected)):
+                source_agent_state = source_state['agent']
+                break
+
+    if source_agent_state is None:
+        raise RuntimeError(
+            f'Cannot reconstruct {SELECTED_BEST_AGENT_FILENAME} for validation '
+            f"checkpoint {expected.get('checkpoint')!r}"
+        )
+    selected, selected_path = publish_selected_best_agent_checkpoint(
+        output_dir,
+        agent_state_dict=source_agent_state,
+        validation_summary=expected,
+    )
+    logging.info('Repaired rolling best-agent checkpoint %s', selected_path)
+    return selected, selected_path, True
+
+
+def retain_only_online_best_and_final_checkpoints(
+        output_dir: str, *, best_agent_checkpoint: str,
+        final_checkpoint: str) -> List[str]:
+    """Remove online checkpoint artifacts other than deployment best and final."""
+    root = Path(output_dir).resolve()
+    best_path = Path(best_agent_checkpoint).resolve()
+    final_path = Path(final_checkpoint).resolve()
+    for label, path in (
+            ('best agent checkpoint', best_path),
+            ('final checkpoint', final_path)):
+        if path.parent != root:
+            raise ValueError(f'{label} must be directly inside {root}, got {path}')
+        if not path.is_file():
+            raise FileNotFoundError(f'{label} does not exist: {path}')
+    resumable_suffix = final_path.name.endswith((
+        '_final.pth', '_finalizing.pth',
+    ))
+    if online_checkpoint_key(str(final_path)) is None or not resumable_suffix:
+        raise ValueError(
+            'final checkpoint must be an online *_final.pth or '
+            f'*_finalizing.pth file, got {final_path}'
+        )
+
+    keep = {best_path, final_path}
+    candidates = set()
+    for pattern in (
+            'checkpoint_*.pth',
+            'agent_checkpoint_*.pth',
+            SELECTED_BEST_AGENT_FILENAME):
+        candidates.update(root.glob(pattern))
+
+    removed = []
+    for checkpoint in sorted(candidates):
+        if checkpoint.resolve() in keep:
+            continue
+        try:
+            checkpoint.unlink()
+            removed.append(checkpoint.name)
+            logging.info('Removed completed-run checkpoint %s', checkpoint)
+        except FileNotFoundError:
+            pass
+    return removed
 
 
 @pdb_if_DEBUG
@@ -313,6 +550,7 @@ def train(dict_cfg: DictConfig):
             replay=replay_buffer,
             batch_size=cfg.batch_size,
             interaction_conf=cfg.interaction,
+            training_optimizations=cfg.training_optimizations,
             profiler=profiler,
             candidate_seed=cfg.seed,
         )
@@ -358,7 +596,13 @@ def train(dict_cfg: DictConfig):
                 target_total_env_steps=requested_total_env_steps,
                 **(extra or {}),
             )
-            include_replay = cfg.save_replay_buffer and (suffix != 'final' or cfg.save_final_replay_buffer)
+            include_replay = (
+                cfg.keep_only_best_and_final_checkpoints
+                and suffix in ('final', 'finalizing')
+            ) or (
+                cfg.save_replay_buffer
+                and (suffix != 'final' or cfg.save_final_replay_buffer)
+            )
             if include_replay:
                 state_dicts['replay'] = trainer.replay.state_dict()
             utils.atomic_torch_save(state_dicts, fullpath)
@@ -419,6 +663,17 @@ def train(dict_cfg: DictConfig):
             replay_env_steps_offset = int(loop_state.get('replay_env_steps_offset', 0))
             cycle_env_steps = int(loop_state.get('cycle_env_steps', start_env_steps))
         logging.info(f'Fast forward to env_steps={start_env_steps} optim_steps={start_optim_steps}')
+        if cfg.keep_only_best_and_final_checkpoints and val_summaries:
+            committed_best = select_best_validation(val_summaries)
+            selected_best, _, _ = ensure_selected_best_agent_checkpoint(
+                cfg.output_dir,
+                validation_summary=committed_best,
+                committed_state=loaded_state_dicts,
+            )
+            for index, summary in enumerate(val_summaries):
+                if dict(summary) == committed_best:
+                    val_summaries[index] = selected_best
+                    break
     else:
         start_env_steps, start_optim_steps = 0, 0
 
@@ -514,8 +769,16 @@ def train(dict_cfg: DictConfig):
         desc = checkpoint_desc(env_steps, optim_steps)
         summary_extra = {
             'checkpoint': f'checkpoint_{desc}.pth',
-            'agent_checkpoint': f'agent_checkpoint_{desc}.pth',
+            'agent_checkpoint': (
+                SELECTED_BEST_AGENT_FILENAME
+                if cfg.keep_only_best_and_final_checkpoints
+                else f'agent_checkpoint_{desc}.pth'
+            ),
         }
+        previous_best = (
+            select_best_validation(val_summaries)
+            if val_summaries else None
+        )
         result, summary = eval(
             env_steps,
             optim_steps,
@@ -524,26 +787,53 @@ def train(dict_cfg: DictConfig):
             num_episodes=trainer.num_eval_episodes,
             summary_extra=summary_extra,
         )
+        if cfg.keep_only_best_and_final_checkpoints:
+            summary = selected_best_validation_summary(summary)
         val_summaries.append(summary)
-        utils.atomic_torch_save(
-            {
-                'env_steps': env_steps,
-                'optim_steps': optim_steps,
-                'agent': trainer.agent.state_dict(),
-                'validation_result': attrs.asdict(result),
-                'validation_summary': summary,
-            },
-            os.path.join(cfg.output_dir, summary['agent_checkpoint']),
-        )
-        return save(
+        if not cfg.keep_only_best_and_final_checkpoints:
+            utils.atomic_torch_save(
+                {
+                    'env_steps': env_steps,
+                    'optim_steps': optim_steps,
+                    'agent': trainer.agent.state_dict(),
+                    'validation_result': attrs.asdict(result),
+                    'validation_summary': summary,
+                },
+                os.path.join(cfg.output_dir, summary['agent_checkpoint']),
+            )
+        checkpoint_path = save(
             env_steps,
             optim_steps,
             extra={'validation_summary': summary},
         )
+        if cfg.keep_only_best_and_final_checkpoints:
+            _, selected_path, updated = maintain_selected_best_agent_checkpoint(
+                cfg.output_dir,
+                agent_state_dict=trainer.agent.state_dict(),
+                candidate=summary,
+                incumbent=previous_best,
+            )
+            if updated:
+                logging.info(
+                    'Updated rolling best-agent checkpoint %s at env_steps=%d '
+                    'optim_steps=%d',
+                    selected_path, env_steps, optim_steps,
+                )
+            else:
+                logging.info(
+                    'Retained rolling best-agent checkpoint %s after '
+                    'validation at env_steps=%d optim_steps=%d',
+                    selected_path, env_steps, optim_steps,
+                )
+        return checkpoint_path
 
-    def evaluate_selected_best(final_env_steps, final_optim_steps):
-        best = select_best_validation(val_summaries)
-        agent_path = os.path.join(cfg.output_dir, best['agent_checkpoint'])
+    def evaluate_selected_best(
+            final_env_steps, final_optim_steps, *, best=None,
+            agent_path=None, save_selected=True):
+        if best is None:
+            best = select_best_validation(val_summaries)
+        if agent_path is None:
+            agent_path = os.path.join(cfg.output_dir, best['agent_checkpoint'])
         state = torch.load(agent_path, map_location='cpu', weights_only=False)
         trainer.agent.load_state_dict(state['agent'])
         test_summary_extra = {
@@ -560,16 +850,19 @@ def train(dict_cfg: DictConfig):
             num_episodes=trainer.num_test_episodes,
             summary_extra=test_summary_extra,
         )
-        selected_path = os.path.join(cfg.output_dir, 'selected_best_agent.pth')
-        utils.atomic_torch_save(
-            {
-                'agent': trainer.agent.state_dict(),
-                'validation_summary': best,
-                'test_result': attrs.asdict(test_result),
-                'test_summary': test_summary,
-            },
-            selected_path,
+        selected_path = os.path.join(
+            cfg.output_dir, SELECTED_BEST_AGENT_FILENAME,
         )
+        if save_selected:
+            utils.atomic_torch_save(
+                {
+                    'agent': trainer.agent.state_dict(),
+                    'validation_summary': best,
+                    'test_result': attrs.asdict(test_result),
+                    'test_summary': test_summary,
+                },
+                selected_path,
+            )
         selection = {
             'selection_order': [
                 'success_count:max',
@@ -662,8 +955,56 @@ def train(dict_cfg: DictConfig):
         )
         if not final_is_validated:
             validate_and_save(final_env_steps, optim_steps)
-        evaluate_selected_best(final_env_steps, optim_steps)
+        final_checkpoint = None
+        staged_final_checkpoint = None
+        if cfg.keep_only_best_and_final_checkpoints:
+            final_validation_summary = next(
+                summary for summary in val_summaries
+                if summary.get('env_steps') == final_env_steps
+                and summary.get('optim_steps') == optim_steps
+                and summary.get('checkpoint')
+            )
+            best, selected_path, _ = ensure_selected_best_agent_checkpoint(
+                cfg.output_dir,
+                validation_summary=select_best_validation(val_summaries),
+                committed_state={
+                    'agent': trainer.agent.state_dict(),
+                    'validation_summary': final_validation_summary,
+                },
+            )
+            staged_final_checkpoint = save(
+                final_env_steps,
+                optim_steps,
+                suffix='finalizing',
+                extra={'validation_summary': final_validation_summary},
+            )
+            evaluate_selected_best(
+                final_env_steps,
+                optim_steps,
+                best=best,
+                agent_path=selected_path,
+                save_selected=False,
+            )
+            final_desc = checkpoint_desc(
+                final_env_steps, optim_steps, 'final',
+            )
+            final_checkpoint = os.path.join(
+                cfg.output_dir,
+                f'checkpoint_{final_desc}.pth',
+            )
+        else:
+            evaluate_selected_best(final_env_steps, optim_steps)
         profiler.log(writer=writer, step=final_env_steps, step_name='env_steps', extra=dict(optim_steps=optim_steps))
+        if cfg.keep_only_best_and_final_checkpoints:
+            assert final_checkpoint is not None
+            assert staged_final_checkpoint is not None
+            retain_only_online_best_and_final_checkpoints(
+                cfg.output_dir,
+                best_agent_checkpoint=selected_path,
+                final_checkpoint=staged_final_checkpoint,
+            )
+            os.replace(staged_final_checkpoint, final_checkpoint)
+            logging.info('Published final resumable checkpoint %s', final_checkpoint)
         open(cfg.completion_file, 'a').close()
     except TrainingInterrupted as exc:
         env_steps = current_env_steps()

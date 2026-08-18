@@ -91,7 +91,14 @@ class Actor(nn.Module):
             actor_input = self.observation_encoding(og).flatten(-2, -1)
         else:
             actor_input = torch.cat([o, g], dim=-1)
-        return self.action_output(self.backbone(actor_input))
+        features = self.backbone(actor_input)
+        if features.dtype in (torch.float16, torch.bfloat16):
+            # Distribution construction uses special functions such as
+            # log_ndtr, which are not consistently implemented or stable in
+            # low precision. The backbone contains the expensive matmuls; keep
+            # only the small distribution head in FP32.
+            features = features.float()
+        return self.action_output(features)
 
     # for type hint
     def __call__(self, o: torch.Tensor, g: torch.Tensor) -> torch.distributions.Distribution:

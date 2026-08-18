@@ -1,0 +1,5 @@
+# C-Learning-L: four layers avoid excessively wide actor and critic MLPs.
+model_size: C-Learning-L
+baselines:
+  c_learning:
+    hidden_sizes: [1544, 1544, 1544, 1544]

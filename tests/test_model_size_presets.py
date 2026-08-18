@@ -8,11 +8,13 @@ from omegaconf import OmegaConf, SCMode
 from quasimetric_rl.data import BatchData
 from quasimetric_rl.data.env_spec import EnvSpec
 from quasimetric_rl.model_size import (
-    MODEL_SIZE_LEVELS,
+    QRL_MODEL_SIZE_LEVELS,
+    SCALING_CRL_MODEL_SIZE_LEVELS,
     go_qrl_agent_parameter_count,
     load_model_size_preset,
     match_go_qrl_split_encoder,
     qrl_agent_parameter_count,
+    scaling_crl_agent_parameter_count,
     select_qrl_model_size,
 )
 from quasimetric_rl.modules import QRLConf
@@ -33,11 +35,6 @@ class QRLModelSizePresetTest(unittest.TestCase):
             qrl_name='QRL-M', go_name='GO-QRL-M', latent=256, width=768,
             qrl_params=4_150_533, go_params=4_439_301,
             goal_arch=(518, 609), non_goal_arch=(596, 543),
-        ),
-        'l': dict(
-            qrl_name='QRL-L', go_name='GO-QRL-L', latent=512, width=1024,
-            qrl_params=7_368_709, go_params=8_146_949,
-            goal_arch=(768, 768), non_goal_arch=(768, 768),
         ),
     }
 
@@ -60,7 +57,8 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 -1, 1, shape=(2,), dtype=np.float32,
             ),
         )
-        for level in MODEL_SIZE_LEVELS:
+        # S/M retain their original two-layer plain MLPs.
+        for level in ('s', 'm'):
             with self.subTest(level=level):
                 expected = self.EXPECTED[level]
                 conf = self.make_conf('qrl', level)
@@ -81,6 +79,124 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     qrl_agent_parameter_count(4, 2, level),
                     expected['qrl_params'],
                 )
+
+    def test_qrl_l_is_plain_and_larger_tiers_follow_the_residual_scale(self):
+        expected = {
+            'xl': ('QRL-XL', 8, 4096, 128, 39_980_037),
+            'xxl': ('QRL-XXL', 16, 8192, 256, 77_831_173),
+            'xxxl': ('QRL-XXXL', 32, 16384, 512, 153_533_445),
+        }
+        self.assertEqual(
+            QRL_MODEL_SIZE_LEVELS,
+            ('s', 'm', 'l', 'xl', 'xxl', 'xxxl'),
+        )
+
+        conf = self.make_conf('qrl', 'l')
+        encoder = conf.quasimetric_critic.model.encoder
+        quasimetric = conf.quasimetric_critic.model.quasimetric_model
+        dynamics = conf.quasimetric_critic.model.latent_dynamics
+        actor = conf.actor.model
+        self.assertEqual(conf.model_size, 'QRL-L')
+        self.assertEqual(encoder.kind, 'standard')
+        self.assertEqual(actor.input_mode, 'raw')
+        self.assertEqual(encoder.latent_size, 512)
+        self.assertEqual(tuple(encoder.arch), (1184,) * 4)
+        self.assertEqual(tuple(quasimetric.projector_arch), (1184,) * 4)
+        self.assertEqual(tuple(dynamics.arch), (1184,) * 4)
+        self.assertEqual(tuple(actor.arch), (1184,) * 4)
+        self.assertEqual(encoder.mlp_kind, 'plain')
+        self.assertEqual(quasimetric.projector_mlp_kind, 'plain')
+        self.assertEqual(dynamics.mlp_kind, 'plain')
+        self.assertEqual(actor.mlp_kind, 'plain')
+        self.assertEqual(quasimetric.projector_activation, 'relu')
+        self.assertEqual(
+            quasimetric.quasimetric_head_spec,
+            'iqe(dim=2048,components=64)',
+        )
+        self.assertEqual(qrl_agent_parameter_count(4, 2, 'l'), 21_715_269)
+
+        for level, (
+                label, depth, head_dim, components, parameter_count,
+        ) in expected.items():
+            with self.subTest(level=level):
+                conf = self.make_conf('qrl', level)
+                encoder = conf.quasimetric_critic.model.encoder
+                quasimetric = conf.quasimetric_critic.model.quasimetric_model
+                dynamics = conf.quasimetric_critic.model.latent_dynamics
+                actor = conf.actor.model
+
+                self.assertEqual(conf.model_size, label)
+                self.assertEqual(encoder.kind, 'standard')
+                self.assertEqual(actor.input_mode, 'raw')
+                self.assertEqual(encoder.latent_size, 512)
+                self.assertEqual(tuple(encoder.arch), (1024,) * depth)
+                self.assertEqual(tuple(quasimetric.projector_arch), (1024,) * depth)
+                self.assertEqual(tuple(dynamics.arch), (1024,) * depth)
+                self.assertEqual(tuple(actor.arch), (1024,) * depth)
+                self.assertEqual(encoder.mlp_kind, 'residual')
+                self.assertEqual(quasimetric.projector_mlp_kind, 'residual')
+                self.assertEqual(dynamics.mlp_kind, 'residual')
+                self.assertEqual(actor.mlp_kind, 'residual')
+                self.assertEqual(quasimetric.projector_activation, 'silu')
+                self.assertEqual(
+                    quasimetric.quasimetric_head_spec,
+                    f'iqe(dim={head_dim},components={components})',
+                )
+                self.assertEqual(head_dim // components, 32)
+                self.assertEqual(
+                    qrl_agent_parameter_count(4, 2, level),
+                    parameter_count,
+                )
+
+    def test_qrl_l_actual_model_trains_and_matches_parameter_count(self):
+        conf = self.make_conf('qrl', 'l')
+        env_spec = EnvSpec(
+            observation_space=gym.spaces.Box(
+                -np.inf, np.inf, shape=(4,), dtype=np.float32,
+            ),
+            observation_space_is_dict=True,
+            action_space=gym.spaces.Box(-1, 1, shape=(2,), dtype=np.float32),
+        )
+        agent, losses = conf.make(env_spec=env_spec, total_optim_steps=1)
+        actual = sum(
+            parameter.numel()
+            for parameter in agent.parameters()
+            if parameter.requires_grad
+        )
+        self.assertEqual(actual, qrl_agent_parameter_count(4, 2, 'l'))
+
+        batch_size = 4
+        data = BatchData(
+            observations=torch.randn(batch_size, 4),
+            actions=torch.empty(batch_size, 2).uniform_(-0.8, 0.8),
+            next_observations=torch.randn(batch_size, 4),
+            future_observations=torch.randn(batch_size, 4),
+            rewards=torch.zeros(batch_size),
+            terminals=torch.zeros(batch_size, dtype=torch.bool),
+            timeouts=torch.zeros(batch_size, dtype=torch.bool),
+        )
+        result = losses(agent, data, optimize=True)
+        self.assertTrue(torch.isfinite(result.loss))
+        qrl_modules = (
+            agent.critics[0].encoder,
+            agent.critics[0].quasimetric_model.projector,
+            agent.critics[0].latent_dynamics,
+            agent.actor,
+        )
+        self.assertFalse(any(
+            isinstance(
+                child, (ResidualBlock, torch.nn.LayerNorm, torch.nn.SiLU),
+            )
+            for module in qrl_modules
+            for child in module.modules()
+        ))
+        for module in qrl_modules:
+            gradients = [parameter.grad for parameter in module.parameters()]
+            self.assertTrue(any(gradient is not None for gradient in gradients))
+            self.assertTrue(all(
+                gradient is None or torch.isfinite(gradient).all()
+                for gradient in gradients
+            ))
 
     def test_go_qrl_presets_match_qrl_encoder_budget(self):
         env_spec = EnvSpec(
@@ -121,13 +237,51 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     expected['go_params'],
                 )
 
-    def test_go_qrl_deep_presets_follow_the_residual_depth_scale(self):
+    def test_go_qrl_l_is_plain_and_larger_tiers_follow_the_residual_scale(self):
         expected = {
-            'l': ('GO-QRL-L', 4, 2048, 64, 21_830_093, 737, 735),
             'xl': ('GO-QRL-XL', 8, 4096, 128, 40_756_153, 731, 729),
             'xxl': ('GO-QRL-XXL', 16, 8192, 256, 78_613_803, 727, 727),
             'xxxl': ('GO-QRL-XXXL', 32, 16384, 512, 154_331_932, 725, 726),
         }
+
+        conf = self.make_conf('go_qrl', 'l')
+        encoder = conf.quasimetric_critic.model.encoder
+        quasimetric = conf.quasimetric_critic.model.quasimetric_model
+        dynamics = conf.quasimetric_critic.model.latent_dynamics
+        actor = conf.actor.model
+        self.assertEqual(conf.model_size, 'GO-QRL-L')
+        self.assertEqual(encoder.kind, 'split')
+        self.assertEqual(actor.input_mode, 'split_latent')
+        self.assertEqual(encoder.latent_size, 512)
+        self.assertEqual(tuple(encoder.arch), (1160,) * 4)
+        self.assertEqual(tuple(quasimetric.projector_arch), (1160,) * 4)
+        self.assertEqual(tuple(dynamics.arch), (1160,) * 4)
+        self.assertEqual(tuple(actor.arch), (1160,) * 4)
+        self.assertEqual(encoder.mlp_kind, 'plain')
+        self.assertEqual(quasimetric.projector_mlp_kind, 'plain')
+        self.assertEqual(dynamics.mlp_kind, 'plain')
+        self.assertEqual(actor.mlp_kind, 'plain')
+        self.assertEqual(quasimetric.projector_activation, 'relu')
+        self.assertEqual(
+            quasimetric.quasimetric_head_spec,
+            'iqe(dim=2048,components=64)',
+        )
+        plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
+        self.assertEqual(tuple(encoder.goal_arch), (837,) * 4)
+        self.assertEqual(tuple(encoder.non_goal_arch), (837,) * 4)
+        self.assertLessEqual(
+            abs(
+                plan.goal_encoder_parameters
+                + plan.non_goal_encoder_parameters
+                - plan.qrl_encoder_parameters
+            ) / plan.qrl_encoder_parameters,
+            0.001,
+        )
+        self.assertEqual(
+            go_qrl_agent_parameter_count(4, 2, 2, 'l'),
+            21_824_679,
+        )
+
         for level, (
                 label, depth, head_dim, components, parameter_count,
                 goal_width, non_goal_width,
@@ -217,18 +371,66 @@ class QRLModelSizePresetTest(unittest.TestCase):
         )
         result = losses(agent, data, optimize=True)
         self.assertTrue(torch.isfinite(result.loss))
-        for module in (
-                agent.critics[0].encoder,
-                agent.critics[0].quasimetric_model.projector,
-                agent.critics[0].latent_dynamics,
-                agent.actor,
-        ):
+        go_qrl_modules = (
+            agent.critics[0].encoder,
+            agent.critics[0].quasimetric_model.projector,
+            agent.critics[0].latent_dynamics,
+            agent.actor,
+        )
+        self.assertFalse(any(
+            isinstance(
+                child, (ResidualBlock, torch.nn.LayerNorm, torch.nn.SiLU),
+            )
+            for module in go_qrl_modules
+            for child in module.modules()
+        ))
+        for module in go_qrl_modules:
             gradients = [parameter.grad for parameter in module.parameters()]
             self.assertTrue(any(gradient is not None for gradient in gradients))
             self.assertTrue(all(
                 gradient is None or torch.isfinite(gradient).all()
                 for gradient in gradients
             ))
+
+    def test_go_qrl_l_residual_backup_preserves_original_preset(self):
+        conf = self.make_conf('go_qrl', 'l_residual')
+        encoder = conf.quasimetric_critic.model.encoder
+        quasimetric = conf.quasimetric_critic.model.quasimetric_model
+        dynamics = conf.quasimetric_critic.model.latent_dynamics
+        actor = conf.actor.model
+
+        self.assertEqual(conf.model_size, 'GO-QRL-L-Residual')
+        self.assertEqual(encoder.kind, 'split')
+        self.assertEqual(actor.input_mode, 'split_latent')
+        self.assertEqual(encoder.latent_size, 512)
+        for arch in (
+                encoder.arch,
+                quasimetric.projector_arch,
+                dynamics.arch,
+                actor.arch,
+        ):
+            self.assertEqual(tuple(arch), (1024,) * 4)
+        self.assertEqual(encoder.mlp_kind, 'residual')
+        self.assertEqual(quasimetric.projector_mlp_kind, 'residual')
+        self.assertEqual(dynamics.mlp_kind, 'residual')
+        self.assertEqual(actor.mlp_kind, 'residual')
+        self.assertEqual(quasimetric.projector_activation, 'silu')
+
+        plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
+        self.assertEqual(tuple(encoder.goal_arch), (737,) * 4)
+        self.assertEqual(tuple(encoder.non_goal_arch), (735,) * 4)
+        self.assertLessEqual(
+            abs(
+                plan.goal_encoder_parameters
+                + plan.non_goal_encoder_parameters
+                - plan.qrl_encoder_parameters
+            ) / plan.qrl_encoder_parameters,
+            0.001,
+        )
+        self.assertEqual(
+            go_qrl_agent_parameter_count(4, 2, 2, 'l_residual'),
+            21_830_093,
+        )
 
     def test_go_qrl_goal_branch_respects_parameter_floor(self):
         for level, latent, width in (
@@ -370,47 +572,142 @@ class QRLModelSizePresetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'No QRL model-size level'):
             select_qrl_model_size(256)
 
-    def test_reward_free_baseline_m_presets_merge_into_structured_config(self):
+    def test_reward_free_baseline_presets_merge_into_structured_config(self):
         expected = {
-            'td_infonce': ('TD-InfoNCE-M', (512, 512, 512, 512), 16),
-            'crl': ('CRL-M', (1152, 1152), 64),
-            'gcbc': ('GCBC-M', (2304, 1728), None),
-            'c_learning': ('C-Learning-M', (1184, 1184), None),
+            'td_infonce': {
+                'm': ('TD-InfoNCE-M', (512, 512, 512, 512), 16),
+                'l': ('TD-InfoNCE-L', (1192, 1192, 1192, 1192), 16),
+            },
+            'crl': {
+                'm': ('CRL-M', (1152, 1152), 64),
+                'l': ('CRL-L', (1544, 1544, 1544, 1544), 64),
+            },
+            'gcsl': {
+                'm': ('GCSL-M', (2304, 1728), None),
+                'l': ('GCSL-L', (2680, 2680, 2680, 2680), None),
+                'l_pusher': (
+                    'GCSL-L-Pusher', (2336, 2344, 2344, 2344), None,
+                ),
+                'l_antnavigate': (
+                    'GCSL-L-AntNavigate', (1808, 1808, 1800, 1800), None,
+                ),
+            },
+            'c_learning': {
+                'm': ('C-Learning-M', (1184, 1184), None),
+                'l': ('C-Learning-L', (1544, 1544, 1544, 1544), None),
+            },
         }
-        for family, (label, hidden_sizes, representation_dim) in expected.items():
-            with self.subTest(family=family):
-                merged = OmegaConf.merge(
-                    OmegaConf.structured(QRLConf()),
-                    load_model_size_preset(family, 'm'),
-                )
-                conf = OmegaConf.to_container(
-                    merged, structured_config_mode=SCMode.INSTANTIATE,
-                )
-                baseline = getattr(conf.baselines, family)
-                self.assertEqual(conf.model_size, label)
-                self.assertEqual(tuple(baseline.hidden_sizes), hidden_sizes)
-                if representation_dim is not None:
-                    self.assertEqual(
-                        baseline.representation_dim, representation_dim,
+        for family, levels in expected.items():
+            for level, (
+                    label, hidden_sizes, representation_dim,
+            ) in levels.items():
+                with self.subTest(family=family, level=level):
+                    merged = OmegaConf.merge(
+                        OmegaConf.structured(QRLConf()),
+                        load_model_size_preset(family, level),
                     )
+                    conf = OmegaConf.to_container(
+                        merged, structured_config_mode=SCMode.INSTANTIATE,
+                    )
+                    config_name = 'gcbc' if family == 'gcsl' else family
+                    baseline = getattr(conf.baselines, config_name)
+                    self.assertEqual(conf.model_size, label)
+                    self.assertEqual(tuple(baseline.hidden_sizes), hidden_sizes)
+                    if representation_dim is not None:
+                        self.assertEqual(
+                            baseline.representation_dim, representation_dim,
+                        )
 
-    def test_reward_free_m_presets_only_record_capacity_fields(self):
+    def test_reward_free_presets_only_record_capacity_fields(self):
         allowed = {
             'td_infonce': {'hidden_sizes'},
             'crl': {'hidden_sizes'},
-            'gcbc': {'hidden_sizes'},
+            'gcsl': {'hidden_sizes'},
             'c_learning': {'hidden_sizes'},
         }
         for family, expected_fields in allowed.items():
-            with self.subTest(family=family):
+            levels = ('m', 'l')
+            if family == 'gcsl':
+                levels += ('l_pusher', 'l_antnavigate')
+            for level in levels:
+                with self.subTest(family=family, level=level):
+                    raw = OmegaConf.to_container(
+                        load_model_size_preset(family, level), resolve=True,
+                    )
+                    self.assertEqual(set(raw), {'model_size', 'baselines'})
+                    config_name = 'gcbc' if family == 'gcsl' else family
+                    self.assertEqual(set(raw['baselines']), {config_name})
+                    self.assertEqual(
+                        set(raw['baselines'][config_name]), expected_fields,
+                    )
+
+    def test_scaling_crl_presets_preserve_method_and_match_scale_budgets(self):
+        expected = {
+            'm': ('Scaling-CRL-M', 4, 595),
+            'l': ('Scaling-CRL-L', 8, 944),
+            'xl': ('Scaling-CRL-XL', 16, 916),
+            'xxl': ('Scaling-CRL-XXL', 32, 901),
+            'xxxl': ('Scaling-CRL-XXXL', 64, 894),
+        }
+        task_shapes = (
+            (40, 5, 2),
+            (25, 4, 3),
+            (17, 5, 2),
+            (20, 7, 3),
+            (29, 8, 2),
+        )
+        nominal_targets = {
+            'm': (4_397_835, 4_385_545, 4_381_707, 4_394_767, 4_396_305),
+            'l': (21_670_317, 21_659_941, 21_651_644, 21_678_996, 21_668_891),
+            'xl': (40_601_395, 40_580_499, 40_584_521, 40_600_566, 40_599_980),
+            'xxl': (78_412_811, 78_449_907, 78_442_318, 78_459_798, 78_442_847),
+            'xxxl': (154_100_303, 154_150_324, 154_116_725, 154_136_233, 154_098_910),
+        }
+        for level in SCALING_CRL_MODEL_SIZE_LEVELS:
+            label, depth, width = expected[level]
+            with self.subTest(level=level):
                 raw = OmegaConf.to_container(
-                    load_model_size_preset(family, 'm'), resolve=True,
+                    load_model_size_preset('scaling_crl', level), resolve=True,
                 )
                 self.assertEqual(set(raw), {'model_size', 'baselines'})
-                self.assertEqual(set(raw['baselines']), {family})
+                self.assertEqual(raw['model_size'], label)
+                self.assertEqual(set(raw['baselines']), {'scaling_crl'})
                 self.assertEqual(
-                    set(raw['baselines'][family]), expected_fields,
+                    set(raw['baselines']['scaling_crl']), {'hidden_sizes'},
                 )
+                hidden = tuple(raw['baselines']['scaling_crl']['hidden_sizes'])
+                self.assertEqual(hidden, (width,) * depth)
+
+                for shape, target in zip(task_shapes, nominal_targets[level]):
+                    actual = scaling_crl_agent_parameter_count(*shape, level)
+                    self.assertLessEqual(abs(actual - target) / target, 0.003)
+
+    def test_scaling_crl_parameter_formula_matches_instantiated_model(self):
+        conf = self.make_conf('scaling_crl', 'm')
+        conf.algorithm = 'scaling_crl'
+        env_spec = EnvSpec(
+            observation_space=gym.spaces.Box(
+                -np.inf, np.inf, shape=(25,), dtype=np.float32,
+            ),
+            observation_space_is_dict=True,
+            action_space=gym.spaces.Box(
+                -1, 1, shape=(4,), dtype=np.float32,
+            ),
+        )
+        agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=1,
+            baseline_goal_dims=(3, 4, 5),
+        )
+        actual = sum(
+            parameter.numel()
+            for module in (agent, losses)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        )
+        self.assertEqual(
+            actual, scaling_crl_agent_parameter_count(25, 4, 3, 'm'),
+        )
 
 
 if __name__ == '__main__':

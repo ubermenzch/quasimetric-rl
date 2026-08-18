@@ -10,6 +10,11 @@ from quasimetric_rl.data import BatchData, EnvSpec
 from quasimetric_rl.data.online import ReplayBuffer
 from quasimetric_rl.data.online.utils import get_empty_episodes
 from quasimetric_rl.modules import QRLConf
+from quasimetric_rl.modules.gcrl_baselines import (
+    ScalingCRLCritic,
+    resolve_baseline_goal_dims,
+)
+from quasimetric_rl.modules.utils import ResidualMLP
 from online.trainer import InteractionConf, Trainer
 
 
@@ -45,10 +50,13 @@ def small_baseline_conf(algorithm):
     conf.baselines.td_infonce.representation_dim = 8
     conf.baselines.crl.hidden_sizes = (16, 16)
     conf.baselines.crl.representation_dim = 8
+    conf.baselines.scaling_crl.hidden_sizes = (16, 16, 16, 16)
+    conf.baselines.scaling_crl.representation_dim = 8
     conf.baselines.gcbc.hidden_sizes = (16, 16)
     conf.baselines.c_learning.hidden_sizes = (16, 16)
     conf.baselines.td_infonce.batch_size = 8
     conf.baselines.crl.batch_size = 8
+    conf.baselines.scaling_crl.batch_size = 8
     conf.baselines.gcbc.batch_size = 8
     conf.baselines.c_learning.batch_size = 8
     return conf
@@ -71,14 +79,23 @@ class GCRLBaselineShapeTest(unittest.TestCase):
         for environment, (state_dim, action_dim, goal_dims) in ENVIRONMENT_SHAPES.items():
             env_spec = make_env_spec(state_dim, action_dim)
             batch = make_batch(state_dim, action_dim)
-            for algorithm in ('td_infonce', 'crl', 'gcbc', 'c_learning'):
+            for algorithm in (
+                    'td_infonce', 'crl', 'scaling_crl', 'gcsl', 'c_learning'):
                 with self.subTest(environment=environment, algorithm=algorithm):
                     conf = small_baseline_conf(algorithm)
+                    baseline_goal_dims = resolve_baseline_goal_dims(
+                        algorithm,
+                        env_kind=environment[0],
+                        env_name=environment[1],
+                        state_dim=state_dim,
+                        success_goal_dims=goal_dims,
+                    )
                     agent, losses = conf.make(
                         env_spec=env_spec,
                         total_optim_steps=2,
-                        goal_set_dims=goal_dims,
+                        baseline_goal_dims=baseline_goal_dims,
                     )
+                    self.assertEqual(agent.goal_dims, baseline_goal_dims)
                     action = agent.act(
                         batch.observations, batch.future_observations,
                     ).mean
@@ -86,6 +103,82 @@ class GCRLBaselineShapeTest(unittest.TestCase):
                     self.assertTrue(torch.isfinite(action).all())
                     result = losses(agent, batch, optimize=False)
                     self.assertTrue(torch.isfinite(result.loss))
+
+    def test_fetch_manipulation_goal_representation_is_algorithm_specific(self):
+        for environment in ('FetchPush', 'FetchSlide', 'FetchPickAndPlace'):
+            for algorithm, expected in (
+                    ('td_infonce', tuple(range(25))),
+                    ('crl', tuple(range(25))),
+                    ('scaling_crl', (3, 4, 5)),
+                    ('gcbc', tuple(range(6))),
+                    ('gcsl', tuple(range(6))),
+                    ('c_learning', tuple(range(25)))):
+                with self.subTest(environment=environment, algorithm=algorithm):
+                    actual = resolve_baseline_goal_dims(
+                        algorithm,
+                        env_kind='gcrl',
+                        env_name=environment,
+                        state_dim=25,
+                        success_goal_dims=(3, 4, 5),
+                    )
+                    self.assertEqual(actual, expected)
+
+    def test_original_crl_uses_complete_state_outside_fetch_manipulation(self):
+        self.assertEqual(
+            resolve_baseline_goal_dims(
+                'crl',
+                env_kind='dmc',
+                env_name='reacher_hard',
+                state_dim=6,
+                success_goal_dims=(0, 1),
+            ),
+            tuple(range(6)),
+        )
+        self.assertEqual(
+            resolve_baseline_goal_dims(
+                'gcsl',
+                env_kind='dmc',
+                env_name='reacher_hard',
+                state_dim=6,
+                success_goal_dims=(0, 1),
+            ),
+            (0, 1),
+        )
+
+    def test_online_trainer_does_not_use_fetch_success_projection_for_baselines(self):
+        expected_by_algorithm = {
+            'td_infonce': tuple(range(25)),
+            'crl': tuple(range(25)),
+            'scaling_crl': (3, 4, 5),
+            'gcsl': tuple(range(6)),
+            'c_learning': tuple(range(25)),
+        }
+        for algorithm, expected in expected_by_algorithm.items():
+            with self.subTest(algorithm=algorithm):
+                replay = SimpleNamespace(
+                    kind='gcrl',
+                    name='FetchPush',
+                    episode_length=50,
+                    num_episodes_realized=0,
+                    transition_history_length=0,
+                    future_observation_discount=0.99,
+                    goal_set_dims=(3, 4, 5),
+                    env_spec=make_env_spec(25, 4),
+                )
+                trainer = Trainer(
+                    agent_conf=small_baseline_conf(algorithm),
+                    device=torch.device('cpu'),
+                    replay=replay,
+                    batch_size=8,
+                    interaction_conf=InteractionConf(
+                        total_env_steps=50_000,
+                        num_eval_episodes=1,
+                        num_test_episodes=1,
+                        validation_seed=1000,
+                        test_seed=2000,
+                    ),
+                )
+                self.assertEqual(trainer.agent.goal_dims, expected)
 
     def test_td_target_networks_are_frozen(self):
         env_spec = make_env_spec(10, 4)
@@ -108,7 +201,8 @@ class GCRLBaselineCheckpointTest(unittest.TestCase):
     def test_agent_and_optimizer_state_round_trip(self):
         env_spec = make_env_spec(10, 4)
         batch = make_batch(10, 4)
-        for algorithm in ('td_infonce', 'crl', 'gcbc', 'c_learning'):
+        for algorithm in (
+                'td_infonce', 'crl', 'scaling_crl', 'gcsl', 'c_learning'):
             with self.subTest(algorithm=algorithm):
                 conf = small_baseline_conf(algorithm)
                 agent, losses = conf.make(
@@ -199,7 +293,7 @@ class GCSLReplaySamplingTest(unittest.TestCase):
 
     def test_default_action_discretization_matches_official_wrapper(self):
         env_spec = make_env_spec(10, 4)
-        conf = small_baseline_conf('gcbc')
+        conf = small_baseline_conf('gcsl')
         agent, _ = conf.make(
             env_spec=env_spec,
             total_optim_steps=2,
@@ -253,6 +347,35 @@ class CRLReplaySamplingTest(unittest.TestCase):
         )
         self.assertEqual(replay.future_observation_discount, 0.8)
 
+    def test_scaling_crl_discount_controls_geometric_future_sampling(self):
+        replay = SimpleNamespace(
+            episode_length=50,
+            num_episodes_realized=0,
+            transition_history_length=0,
+            future_observation_discount=0.99,
+            goal_set_dims=(0, 1, 2),
+            env_spec=make_env_spec(10, 4),
+        )
+        conf = small_baseline_conf('scaling_crl')
+        conf.baselines.scaling_crl.discount = 0.8
+        Trainer(
+            agent_conf=conf,
+            device=torch.device('cpu'),
+            replay=replay,
+            batch_size=8,
+            interaction_conf=InteractionConf(
+                total_env_steps=50,
+                num_prefill_episodes=0,
+                num_samples_per_cycle=1,
+                num_rollouts_per_cycle=1,
+                num_eval_episodes=1,
+                num_test_episodes=1,
+                validation_seed=1000,
+                test_seed=2000,
+            ),
+        )
+        self.assertEqual(replay.future_observation_discount, 0.8)
+
 
 class ReferenceDefaultConfigTest(unittest.TestCase):
     def test_learning_defaults_match_reference_repositories(self):
@@ -275,25 +398,48 @@ class ReferenceDefaultConfigTest(unittest.TestCase):
 
         self.assertEqual(
             conf.crl.reference_revision,
-            '7c53a0743a41423029abd17eb365c4822bf13687',
+            'ec7c3d346277b737bc2decffcd1b533d4b7ec105',
         )
         self.assertEqual(conf.crl.hidden_sizes, (256, 256))
         self.assertEqual(conf.crl.representation_dim, 64)
         self.assertEqual(conf.crl.actor_lr, 3e-4)
         self.assertEqual(conf.crl.critic_lr, 3e-4)
-        self.assertEqual(conf.crl.alpha_lr, 3e-4)
         self.assertEqual(conf.crl.discount, 0.99)
-        self.assertEqual(conf.crl.contrastive_loss, 'fwd_infonce')
-        self.assertEqual(conf.crl.energy, 'norm')
-        self.assertEqual(conf.crl.logsumexp_penalty, 0.1)
-        self.assertIsNone(conf.crl.entropy_coefficient)
-        self.assertEqual(conf.crl.min_replay_size, 1_000)
-        self.assertEqual(conf.crl.max_replay_size, 10_000)
+        self.assertEqual(conf.crl.contrastive_loss, 'binary_nce')
+        self.assertEqual(conf.crl.energy, 'dot')
+        self.assertEqual(conf.crl.logsumexp_penalty, 0.0)
+        self.assertEqual(conf.crl.activation, 'relu')
+        self.assertFalse(conf.crl.representation_norm)
+        self.assertEqual(conf.crl.entropy_coefficient, 0.0)
+        self.assertEqual(conf.crl.random_goal_fraction, 0.5)
+        self.assertEqual(conf.crl.adam_eps, 1e-7)
+        self.assertEqual(conf.crl.min_replay_size, 10_000)
+        self.assertEqual(conf.crl.max_replay_size, 1_000_000)
         self.assertEqual(conf.crl.batch_size, 256)
+        self.assertEqual(conf.crl.updates_per_env_step, 1.0)
+
         self.assertEqual(
-            conf.crl.updates_per_env_step,
-            1001 / (256 * 62),
+            conf.scaling_crl.reference_revision,
+            '17acb519ddc4325c8662b1f8c68ed6a5f31857fc',
         )
+        self.assertEqual(conf.scaling_crl.hidden_sizes, (256,) * 4)
+        self.assertEqual(conf.scaling_crl.representation_dim, 64)
+        self.assertEqual(conf.scaling_crl.actor_lr, 3e-4)
+        self.assertEqual(conf.scaling_crl.critic_lr, 3e-4)
+        self.assertEqual(conf.scaling_crl.alpha_lr, 3e-4)
+        self.assertEqual(conf.scaling_crl.discount, 0.99)
+        self.assertEqual(conf.scaling_crl.logsumexp_penalty, 0.1)
+        self.assertEqual(conf.scaling_crl.target_entropy_per_action, -0.5)
+        self.assertEqual(conf.scaling_crl.batch_size, 512)
+        self.assertEqual(
+            conf.scaling_crl.updates_per_env_step, 800 / (512 * 62),
+        )
+        self.assertEqual(conf.scaling_crl.min_replay_size, 1_000)
+        self.assertEqual(conf.scaling_crl.max_replay_size, 10_000)
+        self.assertEqual(conf.scaling_crl.residual_block_size, 4)
+        self.assertEqual(conf.scaling_crl.additive_exploration_std_fraction, 0)
+        self.assertEqual(conf.scaling_crl.log_std_min, -5)
+        self.assertEqual(conf.scaling_crl.log_std_max, 2)
 
         self.assertEqual(
             conf.gcbc.reference_revision,
@@ -329,9 +475,10 @@ class ReferenceDefaultConfigTest(unittest.TestCase):
     def test_trainer_uses_algorithm_specific_collection_defaults(self):
         cases = (
             ('td_infonce', 50, 200, 500, 10, 10_000),
-            ('crl', 50, 20, 32, 10, 0),
-            ('gcbc', 50, 21, 50, 1, 10_000),
-            ('gcbc', 1000, 2, 1000, 1, 10_000),
+            ('crl', 50, 200, 500, 10, 10_000),
+            ('scaling_crl', 50, 20, 13, 10, 0),
+            ('gcsl', 50, 21, 50, 1, 10_000),
+            ('gcsl', 1000, 2, 1000, 1, 10_000),
             ('c_learning', 50, 200, 500, 10, 10_000),
         )
         for (
@@ -366,6 +513,8 @@ class ReferenceDefaultConfigTest(unittest.TestCase):
                 self.assertEqual(
                     trainer.random_policy_env_steps, random_policy_env_steps,
                 )
+                if algorithm == 'scaling_crl':
+                    self.assertEqual(trainer.exploration_eps, 0)
 
     def test_reference_batch_size_cannot_be_overridden_by_shared_trainer(self):
         replay = SimpleNamespace(
@@ -391,8 +540,114 @@ class ReferenceDefaultConfigTest(unittest.TestCase):
                 ),
             )
 
+        with self.assertRaisesRegex(ValueError, 'requires batch_size=512'):
+            Trainer(
+                agent_conf=QRLConf(algorithm='scaling_crl'),
+                device=torch.device('cpu'),
+                replay=replay,
+                batch_size=256,
+                interaction_conf=InteractionConf(
+                    total_env_steps=50_000,
+                    num_eval_episodes=1,
+                    num_test_episodes=1,
+                    validation_seed=1000,
+                    test_seed=2000,
+                ),
+            )
+
 
 class ReferenceObjectiveTest(unittest.TestCase):
+    def test_scaling_crl_uses_official_residual_actor_and_dual_encoder(self):
+        env_spec = make_env_spec(10, 4)
+        conf = small_baseline_conf('scaling_crl')
+        agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=2,
+            goal_set_dims=(0, 1, 2),
+        )
+        self.assertIsInstance(agent.actor.backbone, ResidualMLP)
+        self.assertIsInstance(agent.critic, ScalingCRLCritic)
+        self.assertIsInstance(agent.critic.sa_encoder, ResidualMLP)
+        self.assertIsInstance(agent.critic.goal_encoder, ResidualMLP)
+        self.assertEqual(agent.actor.backbone.depth, 4)
+        self.assertEqual(agent.critic.sa_encoder.depth, 4)
+        self.assertEqual(agent.critic.goal_encoder.depth, 4)
+        self.assertEqual(len(agent.actor.backbone.blocks), 1)
+        self.assertTrue(any(
+            isinstance(module, torch.nn.LayerNorm)
+            for module in agent.actor.backbone.modules()
+        ))
+        self.assertTrue(any(
+            isinstance(module, torch.nn.SiLU)
+            for module in agent.actor.backbone.modules()
+        ))
+        self.assertIsNotNone(losses.log_alpha)
+        self.assertIsNotNone(losses.alpha_optim)
+
+    def test_scaling_crl_l2_energy_and_objective_match_reference(self):
+        env_spec = make_env_spec(10, 4)
+        conf = small_baseline_conf('scaling_crl')
+        agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=2,
+            goal_set_dims=(0, 1, 2),
+        )
+        batch = make_batch(10, 4)
+        left = torch.randn(3, 8)
+        right = torch.randn(3, 8)
+        torch.testing.assert_close(
+            agent.critic._energy(left, right),
+            -torch.sqrt((left - right).square().sum(dim=-1)),
+        )
+
+        future_goal = agent.extract_goal(batch.future_observations)
+        logits = agent.critic.pairwise(
+            batch.observations, batch.actions, future_goal,
+        )
+        labels = torch.arange(batch.num_transitions)
+        expected_critic = (
+            torch.nn.functional.cross_entropy(logits, labels)
+            + 0.1 * torch.logsumexp(logits + 1e-6, dim=1).square().mean()
+        )
+        torch.manual_seed(31)
+        actual_critic, actor_loss, alpha_loss, info = (
+            losses._scaling_crl_losses(agent, batch)
+        )
+        torch.testing.assert_close(actual_critic, expected_critic)
+        self.assertTrue(torch.isfinite(actor_loss))
+        self.assertTrue(torch.isfinite(alpha_loss))
+        torch.testing.assert_close(info['alpha'], torch.ones(()))
+
+    def test_scaling_crl_log_prob_uses_reference_epsilon_jacobian(self):
+        env_spec = make_env_spec(10, 4)
+        conf = small_baseline_conf('scaling_crl')
+        agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=2,
+            goal_set_dims=(0, 1, 2),
+        )
+        batch = make_batch(10, 4)
+        for parameter in agent.actor.backbone.parameters():
+            parameter.data.zero_()
+        agent.actor.backbone.output_layer.bias.data[:4] = 8.0
+        future_goal = agent.extract_goal(batch.future_observations)
+        distribution = agent.actor(batch.observations, future_goal)
+
+        torch.manual_seed(37)
+        pre_tanh = distribution._pre_tanh_distn.rsample()
+        unit_action = torch.tanh(pre_tanh)
+        expected_log_prob = (
+            distribution._pre_tanh_distn.log_prob(pre_tanh)
+            - torch.log(1 - unit_action.square() + 1e-6)
+            - distribution._affine_scale.abs().log()
+        ).sum(dim=-1)
+
+        torch.manual_seed(37)
+        _critic, _actor, _alpha, info = losses._scaling_crl_losses(
+            agent, batch,
+        )
+        torch.testing.assert_close(-info['entropy'], expected_log_prob.mean())
+
     def test_td_infonce_uses_reference_minimum_policy_std(self):
         env_spec = make_env_spec(10, 4)
         conf = small_baseline_conf('td_infonce')
@@ -414,7 +669,7 @@ class ReferenceObjectiveTest(unittest.TestCase):
             distribution._pre_tanh_distn.scale, expected_std,
         )
 
-    def test_crl_uses_jaxgcrl_bounded_log_standard_deviation(self):
+    def test_crl_uses_original_minimum_policy_std(self):
         env_spec = make_env_spec(10, 4)
         conf = small_baseline_conf('crl')
         agent, _ = conf.make(
@@ -428,7 +683,9 @@ class ReferenceObjectiveTest(unittest.TestCase):
         distribution = agent.actor(
             torch.zeros(3, 10), torch.zeros(3, 3),
         )
-        expected_std = torch.full((3, 4), float(np.exp(-1.5)))
+        expected_std = torch.full(
+            (3, 4), float(np.log(2) + 1e-6),
+        )
         torch.testing.assert_close(
             distribution._pre_tanh_distn.scale, expected_std,
         )
@@ -468,7 +725,7 @@ class ReferenceObjectiveTest(unittest.TestCase):
         torch.testing.assert_close(action, expected_action)
         torch.testing.assert_close(log_prob, expected_log_prob)
 
-    def test_crl_norm_energy_keeps_reference_epsilon_inside_sqrt(self):
+    def test_crl_uses_dot_product_energy(self):
         env_spec = make_env_spec(10, 4)
         conf = small_baseline_conf('crl')
         agent, _ = conf.make(
@@ -476,11 +733,14 @@ class ReferenceObjectiveTest(unittest.TestCase):
             total_optim_steps=2,
             goal_set_dims=(0, 1, 2),
         )
-        zeros = torch.zeros(3, 8)
-        expected = torch.full((3,), -1e-3)
-        torch.testing.assert_close(agent.critic._energy(zeros, zeros), expected)
+        left = torch.randn(3, 8)
+        right = torch.randn(3, 8)
+        torch.testing.assert_close(
+            agent.critic._energy(left, right),
+            (left * right).sum(dim=-1),
+        )
 
-    def test_jaxgcrl_binary_nce_matches_reference_definition(self):
+    def test_crl_sigmoid_nce_matches_original_reference_definition(self):
         env_spec = make_env_spec(10, 4)
         conf = small_baseline_conf('crl')
         conf.baselines.crl.contrastive_loss = 'binary_nce'
@@ -495,10 +755,57 @@ class ReferenceObjectiveTest(unittest.TestCase):
         logits = agent.critic.pairwise(
             batch.observations, batch.actions, future_goal,
         )
-        expected = -torch.sigmoid(logits).mean()
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, torch.eye(logits.shape[0]),
+        )
 
         actual, _, _, _ = losses._crl_losses(agent, batch)
         torch.testing.assert_close(actual, expected)
+
+    def test_crl_actor_uses_equal_future_and_shuffled_goal_mixture(self):
+        env_spec = make_env_spec(10, 4)
+        conf = small_baseline_conf('crl')
+        agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=2,
+            goal_set_dims=(0, 1, 2),
+        )
+        batch = make_batch(10, 4)
+        actor_inputs = []
+
+        def record_actor_inputs(_module, inputs):
+            actor_inputs.append(tuple(value.detach().clone() for value in inputs))
+
+        handle = agent.actor.register_forward_pre_hook(record_actor_inputs)
+        try:
+            losses._crl_losses(agent, batch)
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(actor_inputs), 1)
+        observation, goal = actor_inputs[0]
+        future_goal = agent.extract_goal(batch.future_observations)
+        torch.testing.assert_close(
+            observation,
+            torch.cat([batch.observations, batch.observations], dim=0),
+        )
+        torch.testing.assert_close(
+            goal,
+            torch.cat([future_goal, torch.roll(future_goal, 1, 0)], dim=0),
+        )
+
+    def test_crl_uses_original_optimizer_epsilon_and_fixed_zero_entropy(self):
+        env_spec = make_env_spec(10, 4)
+        conf = small_baseline_conf('crl')
+        _agent, losses = conf.make(
+            env_spec=env_spec,
+            total_optim_steps=2,
+            goal_set_dims=(0, 1, 2),
+        )
+        self.assertEqual(losses.actor_optim.defaults['eps'], 1e-7)
+        self.assertEqual(losses.critic_optim.defaults['eps'], 1e-7)
+        self.assertIsNone(losses.log_alpha)
+        self.assertIsNone(losses.alpha_optim)
 
     def test_c_learning_applies_reference_twin_critic_weight(self):
         env_spec = make_env_spec(10, 4)

@@ -8,6 +8,7 @@ from omegaconf import OmegaConf, SCMode
 from quasimetric_rl.data.env_spec import EnvSpec
 from quasimetric_rl.model_size import load_model_size_preset
 from quasimetric_rl.modules import QRLConf
+from quasimetric_rl.modules.gcrl_baselines import resolve_baseline_goal_dims
 from tools.generate_online_baseline_tasks import (
     ALGORITHMS,
     ENVIRONMENTS,
@@ -63,14 +64,73 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
             )
             self.assertIn('-M_', task.task_id)
 
+    def test_changed_baselines_do_not_reuse_legacy_checkpoint_ids(self):
+        fetch_manipulation = {
+            'FetchPush', 'FetchSlide', 'FetchPickAndPlace',
+        }
+        for task in generate_tasks():
+            algorithm = next(
+                value.split('=', 1)[1]
+                for value in task.extra_args.split()
+                if value.startswith('agent.algorithm=')
+            )
+            if algorithm == 'crl':
+                self.assertIn('_originalcrl2022_', task.task_id)
+                self.assertNotIn('_goalreprv2_', task.task_id)
+            elif task.env_name in fetch_manipulation:
+                self.assertIn('_goalreprv2_', task.task_id)
+            else:
+                self.assertNotIn('_goalreprv2_', task.task_id)
+                self.assertNotIn('_originalcrl2022_', task.task_id)
+
     def test_parameter_counts_are_in_m_budget_for_every_task_shape(self):
         for _, algorithm in ALGORITHMS:
-            for _, _, _, state_dim, action_dim, goal_dim in ENVIRONMENTS:
+            for kind, name, _, state_dim, action_dim, goal_dim in ENVIRONMENTS:
+                conditioning_goal_dim = len(resolve_baseline_goal_dims(
+                    algorithm,
+                    env_kind=kind,
+                    env_name=name,
+                    state_dim=state_dim,
+                    success_goal_dims=tuple(range(goal_dim)),
+                ))
                 count = baseline_parameter_count(
-                    algorithm, state_dim, action_dim, goal_dim,
+                    algorithm, state_dim, action_dim, conditioning_goal_dim,
                 )
                 self.assertGreaterEqual(count, 3_990_000)
                 self.assertLessEqual(count, 4_500_000)
+
+    def test_parameter_counts_are_in_l_budget_for_every_task_shape(self):
+        for _, algorithm in ALGORITHMS:
+            for kind, name, _, state_dim, action_dim, goal_dim in ENVIRONMENTS:
+                conditioning_goal_dim = len(resolve_baseline_goal_dims(
+                    algorithm,
+                    env_kind=kind,
+                    env_name=name,
+                    state_dim=state_dim,
+                    success_goal_dims=tuple(range(goal_dim)),
+                ))
+                count = baseline_parameter_count(
+                    algorithm, state_dim, action_dim, conditioning_goal_dim,
+                    model_size_level='l',
+                )
+                self.assertGreaterEqual(count, 21_450_000)
+                self.assertLessEqual(count, 21_920_000)
+
+    def test_high_action_gcsl_l_presets_match_per_environment_budgets(self):
+        cases = (
+            ('Pusher-v4', (20, 7, 3), 'l_pusher', 21_655_867, 21_648_801),
+            (
+                'AntNavigate-v4', (29, 8, 2), 'l_antnavigate',
+                21_642_889, 21_643_255,
+            ),
+        )
+        for name, shape, level, expected, target in cases:
+            with self.subTest(environment=name):
+                count = baseline_parameter_count(
+                    'gcsl', *shape, model_size_level=level,
+                )
+                self.assertEqual(count, expected)
+                self.assertLessEqual(abs(count - target) / target, 0.001)
 
     def test_can_generate_one_algorithm_for_server_assignment(self):
         tasks = generate_tasks(('crl',))
@@ -78,7 +138,7 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
         self.assertTrue(all('agent.algorithm=crl' in task.extra_args for task in tasks))
 
     def test_count_formula_matches_instantiated_trainable_modules(self):
-        _kind, _name, _slug, state_dim, action_dim, goal_dim = ENVIRONMENTS[0]
+        kind, name, _slug, state_dim, action_dim, goal_dim = ENVIRONMENTS[1]
         env_spec = EnvSpec(
             observation_space=gym.spaces.Box(
                 -np.inf, np.inf, shape=(state_dim,), dtype=np.float32,
@@ -90,6 +150,13 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
         )
         for _display_name, algorithm in ALGORITHMS:
             with self.subTest(algorithm=algorithm):
+                baseline_goal_dims = resolve_baseline_goal_dims(
+                    algorithm,
+                    env_kind=kind,
+                    env_name=name,
+                    state_dim=state_dim,
+                    success_goal_dims=tuple(range(goal_dim)),
+                )
                 merged = OmegaConf.merge(
                     OmegaConf.structured(QRLConf()),
                     load_model_size_preset(algorithm, 'm'),
@@ -101,7 +168,7 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
                 agent, losses = conf.make(
                     env_spec=env_spec,
                     total_optim_steps=1,
-                    goal_set_dims=tuple(range(goal_dim)),
+                    baseline_goal_dims=baseline_goal_dims,
                 )
                 actual = sum(
                     parameter.numel()
@@ -112,7 +179,8 @@ class OnlineBaselineTaskGeneratorTest(unittest.TestCase):
                 self.assertEqual(
                     actual,
                     baseline_parameter_count(
-                        algorithm, state_dim, action_dim, goal_dim,
+                        algorithm, state_dim, action_dim,
+                        len(baseline_goal_dims),
                     ),
                 )
 

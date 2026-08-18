@@ -5,7 +5,7 @@ observations with same-shaped `observation`, `achieved_goal`, and
 `desired_goal` tensors. The environments below provide that interface and can
 be used by both QRL and vector-observation GO-QRL agents.
 
-| Kind | Name | Horizon | Goal dimensions | Backend |
+| Kind | Name | Horizon | Success dimensions | Backend |
 | --- | --- | ---: | --- | --- |
 | `gcrl` | `FetchReach` | 50 | `[0,1,2]` | Gym Fetch robotics |
 | `gcrl` | `FetchPush` | 50 | `[3,4,5]` | Gym Fetch robotics |
@@ -23,6 +23,13 @@ be used by both QRL and vector-observation GO-QRL agents.
 | `dmc` | `manipulator_bring_peg` | 1000 | `[0,1,2,3]` | dm_control |
 | `online_maze` | `maze2d-medium` | 600 | `[0,1]` | D4RL Maze2D v1 |
 | `online_maze` | `maze2d-large` | 800 | `[0,1]` | D4RL Maze2D v1 |
+
+These dimensions define task success and GO-QRL's task-goal branch. They are
+not a universal conditioning projection for the reference baselines. In the
+three Fetch object-manipulation tasks, TD-InfoNCE and C-Learning condition on the
+full state, and GCSL conditions on gripper plus object position. Original
+2022 CRL conditions on the full state in every validated environment; see
+[`GCRL_BASELINES.md`](GCRL_BASELINES.md).
 
 `AntNavigate-v4` is deliberately a separate name. It samples a reachable XY
 navigation goal and does not optimize the standard Ant forward-velocity
@@ -102,6 +109,29 @@ evaluated on the independent test seed. The run writes checkpoint summaries to
 `eval.log`, the final test summary to `test.log`, and the complete selection
 record to `best_checkpoint.json`.
 
+Set `keep_only_best_and_final_checkpoints=true` to apply compact checkpoint
+retention throughout training. Each checkpoint-bound validation is compared
+with the incumbent using the documented selection order. The fixed
+`selected_best_agent.pth` file is created for the first validation and is
+atomically replaced only when a later checkpoint is better; per-validation
+`agent_checkpoint_*.pth` files are not created. Validation metrics for every
+checkpoint remain in `eval.log`, TensorBoard, and resumable checkpoint metadata.
+After validation selection and final testing complete, the run keeps only:
+
+- `selected_best_agent.pth`, an inference/deployment checkpoint containing the
+  selected agent weights and their validation provenance;
+- `checkpoint_*_final.pth`, a full resumable checkpoint containing the final
+  training weights, optimizer/loss state, RNG state, loop cursor, and replay
+  buffer.
+
+The final replay buffer is included whenever this flag is enabled, even if
+`save_final_replay_buffer=false`. Logs, configuration, TensorBoard events, and
+`best_checkpoint.json` are not removed. Cleanup runs before `COMPLETE` is
+written, so interrupted runs retain a resumable final checkpoint. Use
+`keep_only_latest_checkpoint=true` as well to retain only the latest resumable
+checkpoint during training; otherwise compact retention still keeps all
+periodic full checkpoints until successful final cleanup.
+
 Set any of `interaction.num_prefill_episodes`,
 `interaction.num_rollouts_per_cycle`, `interaction.num_samples_per_cycle`, or
 `interaction.num_eval_episodes` to override the corresponding derived value.
@@ -116,7 +146,7 @@ the active queue by `tools/generate_online_goal_env_tasks.py`. The schemes are
 Base, GO-QRL+Max4, GO-QRL+Min4, GO-QRL+Max4+LN+RMSG, and
 GO-QRL+Min4+LN+RMSG.
 
-TD-InfoNCE, CRL, GCSL/GCBC, and C-Learning use the same online collection,
+TD-InfoNCE, CRL, GCSL, and C-Learning use the same online collection,
 checkpoint validation, and best-checkpoint test protocol. Their implementation
 and seven-environment task matrix are documented in
 [`GCRL_BASELINES.md`](GCRL_BASELINES.md).

@@ -14,6 +14,7 @@ import torch.utils.data
 
 from quasimetric_rl import utils
 from quasimetric_rl.modules import QRLConf, QRLAgent, QRLLosses, InfoT
+from quasimetric_rl.modules.gcrl_baselines import resolve_baseline_goal_dims
 from quasimetric_rl.data import BatchData, EpisodeData, MultiEpisodeData
 from quasimetric_rl.data.online import ReplayBuffer, FixedLengthEnvWrapper
 from quasimetric_rl.utils import TimingProfiler, tqdm
@@ -77,6 +78,75 @@ class InteractionConf:
     )
 
     exploration_eps: float = attrs.field(default=0.3, validator=attrs.validators.ge(0))
+
+
+@attrs.define(kw_only=True)
+class TrainingOptimizationsConf:
+    """GPU execution optimizations which do not change the training schedule."""
+
+    tf32: bool = False
+    amp_dtype: Optional[str] = attrs.field(
+        default=None,
+        validator=attrs.validators.optional(attrs.validators.in_((
+            'bfloat16',
+        ))),
+    )
+    fused_adamw: bool = False
+    compile_heavy_modules: bool = False
+    compile_mode: str = attrs.field(
+        default='default',
+        validator=attrs.validators.in_((
+            'default', 'reduce-overhead', 'max-autotune',
+        )),
+    )
+    compile_fullgraph: bool = False
+    compile_dynamic: bool = False
+    compile_suppress_errors: bool = True
+
+    @property
+    def enabled(self) -> bool:
+        return bool(
+            self.tf32
+            or self.amp_dtype is not None
+            or self.fused_adamw
+            or self.compile_heavy_modules
+        )
+
+    @property
+    def torch_amp_dtype(self) -> Optional[torch.dtype]:
+        if self.amp_dtype is None:
+            return None
+        if self.amp_dtype == 'bfloat16':
+            return torch.bfloat16
+        raise AssertionError(self.amp_dtype)
+
+    def configure_backend(self, device: torch.device) -> None:
+        if not self.enabled:
+            return
+        if device.type != 'cuda':
+            raise RuntimeError(
+                'GPU training optimizations require a CUDA device, got '
+                f'{device}'
+            )
+        if self.tf32:
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        if self.amp_dtype == 'bfloat16':
+            with torch.cuda.device(device):
+                if not torch.cuda.is_bf16_supported():
+                    raise RuntimeError(
+                        f'BF16 AMP is not supported by CUDA device {device}'
+                    )
+        logging.info(
+            'Training optimizations: tf32=%s amp_dtype=%s fused_adamw=%s '
+            'compile_heavy_modules=%s compile_mode=%s',
+            self.tf32,
+            self.amp_dtype,
+            self.fused_adamw,
+            self.compile_heavy_modules,
+            self.compile_mode,
+        )
 
 
 @attrs.frozen
@@ -211,10 +281,18 @@ class Trainer(object):
                  replay: ReplayBuffer,
                  batch_size: int,
                  interaction_conf: InteractionConf,
+                 training_optimizations: Optional[TrainingOptimizationsConf] = None,
                  profiler: Optional[TimingProfiler] = None,
                  eval_seed: int = 416923159,
                  candidate_seed: int = 0):
 
+        self.training_optimizations = (
+            TrainingOptimizationsConf()
+            if training_optimizations is None
+            else training_optimizations
+        )
+        self.training_optimizations.configure_backend(device)
+        self.amp_dtype = self.training_optimizations.torch_amp_dtype
         self.device = device
         self.replay = replay
         self.eval_seed = eval_seed
@@ -233,14 +311,24 @@ class Trainer(object):
         elif self.algorithm == 'crl':
             baseline_conf = agent_conf.baselines.crl
             default_prefill_env_steps = baseline_conf.min_replay_size
+            default_random_policy_env_steps = default_prefill_env_steps
+            self.replay_sample_max_transitions = baseline_conf.max_replay_size
+            self.replay_sample_max_episodes = None
+        elif self.algorithm == 'scaling_crl':
+            baseline_conf = agent_conf.baselines.scaling_crl
+            default_prefill_env_steps = baseline_conf.min_replay_size
+            # The official prefill samples its initialized stochastic actor.
             default_random_policy_env_steps = 0
+            self.exploration_eps = (
+                baseline_conf.additive_exploration_std_fraction
+            )
             self.replay_sample_max_transitions = baseline_conf.max_replay_size
             self.replay_sample_max_episodes = None
         elif self.algorithm in ('gcbc', 'gcsl'):
             baseline_conf = agent_conf.baselines.gcbc
             default_prefill_env_steps = baseline_conf.start_policy_timesteps
             default_random_policy_env_steps = baseline_conf.explore_timesteps
-            self.gcbc_validation_fraction = baseline_conf.validation_fraction
+            self.gcsl_validation_fraction = baseline_conf.validation_fraction
             self.replay_sample_max_transitions = None
             self.replay_sample_max_episodes = baseline_conf.replay_capacity_trajectories
         elif self.algorithm == 'c_learning':
@@ -256,7 +344,7 @@ class Trainer(object):
             self.replay_sample_max_transitions = None
             self.replay_sample_max_episodes = None
         if self.algorithm not in ('gcbc', 'gcsl'):
-            self.gcbc_validation_fraction = 0.0
+            self.gcsl_validation_fraction = 0.0
 
         if baseline_conf is not None and batch_size != baseline_conf.batch_size:
             raise ValueError(
@@ -330,33 +418,58 @@ class Trainer(object):
             if agent_conf.algorithm in ('gcbc', 'gcsl')
             else 'geometric_future'
         )
-        if agent_conf.algorithm == 'crl':
-            self.replay.future_observation_discount = (
-                agent_conf.baselines.crl.discount
-            )
+        if agent_conf.algorithm in ('crl', 'scaling_crl'):
+            self.replay.future_observation_discount = getattr(
+                agent_conf.baselines, agent_conf.algorithm,
+            ).discount
         self.replay.transition_history_length = max(
             self.replay.transition_history_length,
             agent_conf.required_transition_history_length,
         )
 
         total_optim_steps = self.get_total_optim_steps(interaction_conf.total_env_steps)
+        if self.training_optimizations.fused_adamw:
+            if agent_conf.algorithm != 'qrl':
+                raise RuntimeError(
+                    'fused_adamw is currently implemented only for QRL agents'
+                )
+            if agent_conf.actor is not None:
+                actor_losses_conf = agent_conf.actor.losses
+                actor_losses_conf.actor_optim.fused = True
+                actor_losses_conf.entropy_weight_optim.fused = True
+            critic_losses_conf = agent_conf.quasimetric_critic.losses
+            critic_losses_conf.critic_optim.fused = True
+            critic_losses_conf.latent_dynamics_optim.fused = True
+            critic_losses_conf.lagrange_mult_optim.fused = True
+            agent_conf.goal_set_distance.losses.optim.fused = True
+        baseline_goal_dims = (
+            resolve_baseline_goal_dims(
+                agent_conf.algorithm,
+                env_kind=getattr(replay, 'kind', None),
+                env_name=getattr(replay, 'name', None),
+                state_dim=replay.env_spec.observation_shape.numel(),
+                success_goal_dims=replay.goal_set_dims,
+            )
+            if agent_conf.algorithm != 'qrl'
+            else None
+        )
         self.agent, self.losses = agent_conf.make(
             env_spec=replay.env_spec,
             total_optim_steps=total_optim_steps,
             profiler=profiler,
+            baseline_goal_dims=baseline_goal_dims,
             goal_set_dims=(
                 replay.goal_set_dims
-                if agent_conf.algorithm != 'qrl'
-                else (
-                    replay.goal_set_dims
-                    if agent_conf.goal_set_distance.enabled
-                    and agent_conf.goal_set_distance.losses.goal_dims is None
-                    else None
-                )
+                if agent_conf.algorithm == 'qrl'
+                and agent_conf.goal_set_distance.enabled
+                and agent_conf.goal_set_distance.losses.goal_dims is None
+                else None
             ),
         )
         self.agent.to(device)
         self.losses.to(device)
+        if self.training_optimizations.compile_heavy_modules:
+            self._compile_heavy_modules()
         self.scheduler_horizon = total_optim_steps
         if getattr(self.losses, 'goal_set_distance_loss', None) is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
@@ -367,6 +480,66 @@ class Trainer(object):
 
         logging.info('Agent:\n\t' + str(self.agent).replace('\n', '\n\t') + '\n\n')
         logging.info('Losses:\n\t' + str(self.losses).replace('\n', '\n\t') + '\n\n')
+
+    def _autocast(self):
+        if self.amp_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype,
+        )
+
+    def _compile_heavy_modules(self) -> None:
+        conf = self.training_optimizations
+        if conf.compile_suppress_errors:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+
+        targets = []
+        if self.agent.actor is not None:
+            targets.append(('actor.backbone', self.agent.actor.backbone))
+        for critic_idx, critic in enumerate(self.agent.critics):
+            encoder = critic.encoder
+            if hasattr(encoder, 'goal_encoder'):
+                targets.extend((
+                    (f'critic_{critic_idx:02d}.encoder.goal', encoder.goal_encoder),
+                    (f'critic_{critic_idx:02d}.encoder.non_goal', encoder.non_goal_encoder),
+                ))
+            elif hasattr(encoder, 'encoder'):
+                targets.append((
+                    f'critic_{critic_idx:02d}.encoder', encoder.encoder,
+                ))
+            targets.append((
+                f'critic_{critic_idx:02d}.projector',
+                critic.quasimetric_model.projector,
+            ))
+            dynamics_backbone = getattr(critic.latent_dynamics, 'backbone', None)
+            if dynamics_backbone is not None:
+                targets.append((
+                    f'critic_{critic_idx:02d}.latent_dynamics',
+                    dynamics_backbone,
+                ))
+
+        compiled_ids = set()
+        for name, module in targets:
+            if id(module) in compiled_ids:
+                continue
+            compiled_ids.add(id(module))
+            try:
+                module.compile(
+                    mode=conf.compile_mode,
+                    fullgraph=conf.compile_fullgraph,
+                    dynamic=conf.compile_dynamic,
+                )
+            except Exception:
+                if not conf.compile_suppress_errors:
+                    raise
+                logging.exception(
+                    'Failed to register torch.compile for %s; using eager mode',
+                    name,
+                )
+                continue
+            logging.info('Registered torch.compile for %s', name)
 
     def make_collect_env(self) -> FixedLengthEnvWrapper:
         return self.replay.create_env()
@@ -402,7 +575,7 @@ class Trainer(object):
     def _store_rollout(self, rollout: EpisodeData) -> None:
         training = not (
             self.algorithm in ('gcbc', 'gcsl')
-            and np.random.rand() < self.gcbc_validation_fraction
+            and np.random.rand() < self.gcsl_validation_fraction
         )
         self.replay.add_rollout(rollout, training=training)
 
@@ -432,10 +605,11 @@ class Trainer(object):
                 obs = obs[None].to(self.device)
                 goal = goal[None].to(self.device)
             with self._record('env/actor_forward'):
-                adistn = self.agent.act(obs, goal)
+                with self._autocast():
+                    adistn = self.agent.act(obs, goal)
             if eval or self.algorithm in ('gcbc', 'gcsl'):
                 with self._record('env/action_to_cpu'):
-                    a = adistn.mean.cpu().numpy()[0]
+                    a = adistn.mean.float().cpu().numpy()[0]
             else:
                 with self._record('env/action_sample'):
                     a_t = adistn.sample()
@@ -443,7 +617,7 @@ class Trainer(object):
                         a_t, space, self.exploration_eps,
                     )
                 with self._record('env/action_to_cpu'):
-                    a = a_t.cpu().numpy()[0]
+                    a = a_t.float().cpu().numpy()[0]
             return a
 
         with torch.no_grad(), self.agent.mode(False), \
@@ -534,7 +708,7 @@ class Trainer(object):
                 for _ in tqdm(
                         range(self.replay.num_episodes_realized, num_prefill_episodes),
                         desc='prefill'):
-                    if self.algorithm == 'crl':
+                    if self.algorithm == 'scaling_crl':
                         self.collect_rollout(env=env)
                     else:
                         self.collect_random_rollout(env=env)
@@ -566,4 +740,7 @@ class Trainer(object):
 
     def train_step(self, data: BatchData, *, optimize: bool = True, phase: str = 'all') -> InfoT:
         with self._record('train/losses_total'):
-            return self.losses(self.agent, data, optimize=optimize, phase=phase).info
+            with self._autocast():
+                return self.losses(
+                    self.agent, data, optimize=optimize, phase=phase,
+                ).info

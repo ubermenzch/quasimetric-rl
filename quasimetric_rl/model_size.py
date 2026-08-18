@@ -11,7 +11,11 @@ from omegaconf import DictConfig, OmegaConf
 
 
 MODEL_SIZE_ROOT = Path(__file__).resolve().parents[1] / 'configs' / 'model_size'
+# S/M/L remain the automatic latent-capacity choices. Larger levels are explicit
+# scaling tiers because they deliberately keep the L latent size.
 MODEL_SIZE_LEVELS: Tuple[str, ...] = ('s', 'm', 'l')
+QRL_MODEL_SIZE_LEVELS: Tuple[str, ...] = ('s', 'm', 'l', 'xl', 'xxl', 'xxxl')
+SCALING_CRL_MODEL_SIZE_LEVELS: Tuple[str, ...] = ('m', 'l', 'xl', 'xxl', 'xxxl')
 # Backward-compatible import for scripts created before Base was renamed QRL.
 BASE_MODEL_SIZE_LEVELS = MODEL_SIZE_LEVELS
 
@@ -203,6 +207,30 @@ def qrl_agent_parameter_count(state_dim: int, action_dim: int, level: str) -> in
 base_agent_parameter_count = qrl_agent_parameter_count
 
 
+def scaling_crl_agent_parameter_count(
+        state_dim: int, action_dim: int, goal_dim: int, level: str) -> int:
+    """Count actor, both encoders, and entropy scalar for Scaling-CRL."""
+    if min(state_dim, action_dim, goal_dim) <= 0:
+        raise ValueError(
+            'state_dim, action_dim, and goal_dim must be positive, got '
+            f'{state_dim}, {action_dim}, {goal_dim}'
+        )
+    preset = load_model_size_preset('scaling_crl', level)
+    baseline = preset.baselines.scaling_crl
+    hidden_sizes = tuple(map(int, baseline.hidden_sizes))
+    representation_dim = 64
+    actor_count = _residual_mlp_parameter_count(
+        state_dim + goal_dim, hidden_sizes, 2 * action_dim,
+    )
+    sa_encoder_count = _residual_mlp_parameter_count(
+        state_dim + action_dim, hidden_sizes, representation_dim,
+    )
+    goal_encoder_count = _residual_mlp_parameter_count(
+        goal_dim, hidden_sizes, representation_dim,
+    )
+    return actor_count + sa_encoder_count + goal_encoder_count + 1
+
+
 def _branch_parameter_weights(
         goal_dim: int, non_goal_dim: int, min_goal_ratio: float,
 ) -> Tuple[int, int, bool]:
@@ -254,8 +282,9 @@ def match_go_qrl_split_encoder(
 ) -> GOQRLBranchPlan:
     """Match two split MLPs to a QRL encoder's parameter budget.
 
-    Plain MLPs are matched exactly. Residual MLP branches must remain
-    constant-width, so their nearest realizable total may differ slightly.
+    Two-layer plain MLPs are matched exactly. Deeper plain and residual MLP
+    branches remain constant-width, so their nearest realizable total may
+    differ slightly.
     """
     reference_arch = tuple(map(int, reference_arch))
     if state_dim <= 1 or not 0 < goal_dim < state_dim:
@@ -291,10 +320,12 @@ def match_go_qrl_split_encoder(
     )
     target_goal_parameters = qrl_parameters * goal_share
 
-    if mlp_kind == 'residual':
+    if mlp_kind == 'residual' or (
+            mlp_kind == 'plain' and len(reference_arch) > 2):
         if len(set(reference_arch)) != 1:
             raise ValueError(
-                'Residual GO-QRL matching requires a constant reference width, '
+                'Deep plain and residual GO-QRL matching require a constant '
+                'reference width, '
                 f'got {reference_arch}'
             )
         reference_width = reference_arch[0]
@@ -304,8 +335,12 @@ def match_go_qrl_split_encoder(
             candidates = []
             for width in range(1, 2 * reference_width + 1):
                 arch = (width,) * depth
-                count = _residual_mlp_parameter_count(
-                    input_size, arch, output_size, residual_block_size,
+                count = _configured_mlp_parameter_count(
+                    input_size,
+                    arch,
+                    output_size,
+                    kind=mlp_kind,
+                    residual_block_size=residual_block_size,
                 )
                 candidates.append((abs(count - target), width, count))
             return sorted(candidates)[:32]
@@ -319,6 +354,9 @@ def match_go_qrl_split_encoder(
             qrl_parameters - target_goal_parameters,
         )
         feasible = []
+        goal_budget_tolerance = max_relative_budget_error
+        if mlp_kind == 'plain':
+            goal_budget_tolerance = max(goal_budget_tolerance, 0.003)
         for _goal_error, goal_width, goal_parameters in goal_candidates:
             for _non_goal_error, non_goal_width, non_goal_parameters in non_goal_candidates:
                 if goal_parameters / non_goal_parameters < min_goal_ratio:
@@ -329,7 +367,7 @@ def match_go_qrl_split_encoder(
                 goal_error = abs(
                     goal_parameters - target_goal_parameters
                 ) / target_goal_parameters
-                if goal_error > max_relative_budget_error:
+                if goal_error > goal_budget_tolerance:
                     continue
                 feasible.append((
                     total_error,
@@ -343,7 +381,7 @@ def match_go_qrl_split_encoder(
                 ))
         if not feasible:
             raise ValueError(
-                'Could not construct residual GO-QRL encoder branches for '
+                f'Could not construct {mlp_kind} GO-QRL encoder branches for '
                 f'state_dim={state_dim}, goal_dim={goal_dim}'
             )
         (
@@ -491,7 +529,9 @@ __all__ = [
     'BASE_MODEL_SIZE_LEVELS',
     'GOQRLBranchPlan',
     'MODEL_SIZE_LEVELS',
+    'QRL_MODEL_SIZE_LEVELS',
     'MODEL_SIZE_ROOT',
+    'SCALING_CRL_MODEL_SIZE_LEVELS',
     'base_agent_parameter_count',
     'go_qrl_agent_parameter_count',
     'load_model_size_preset',
@@ -499,6 +539,7 @@ __all__ = [
     'model_size_path',
     'qrl_agent_parameter_count',
     'register_model_size_presets',
+    'scaling_crl_agent_parameter_count',
     'select_base_model_size',
     'select_qrl_model_size',
 ]

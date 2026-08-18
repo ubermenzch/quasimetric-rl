@@ -14,6 +14,7 @@ from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
 from tools.run_qrl_queue import kill_illegal_user_gpu_jobs
 from tools.run_qrl_queue import mark_finished
+from tools.run_qrl_queue import output_finished
 from tools.run_qrl_queue import output_started
 from tools.run_qrl_queue import read_status
 from tools.run_qrl_queue import reconcile_running_statuses
@@ -47,6 +48,21 @@ class QueueTaskClassificationTest(unittest.TestCase):
 
             (output_dir / "checkpoint.pth").write_text("checkpoint")
             self.assertTrue(output_started(output_dir))
+
+    def test_finalizing_checkpoint_does_not_mark_output_finished(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            finalizing = output_dir / (
+                "checkpoint_env00200000_opt00190000_finalizing.pth"
+            )
+            finalizing.touch()
+
+            self.assertFalse(output_finished(output_dir))
+
+            finalizing.rename(output_dir / (
+                "checkpoint_env00200000_opt00190000_final.pth"
+            ))
+            self.assertTrue(output_finished(output_dir))
 
     def test_command_env_limits_all_cpu_thread_pools(self):
         env = command_env({"CPU_THREADS_PER_TASK": "4"}, "2")
@@ -274,8 +290,8 @@ class QueueTaskClassificationTest(unittest.TestCase):
         expected = {
             "td_infonce": "TD-InfoNCE",
             "crl": "CRL",
-            "gcbc": "GCBC",
-            "gcsl": "GCSL/GCBC",
+            "gcbc": "GCSL",
+            "gcsl": "GCSL",
             "c_learning": "C-Learning",
         }
         for algorithm, label in expected.items():

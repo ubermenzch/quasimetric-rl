@@ -14,7 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quasimetric_rl.model_size import load_model_size_preset
-from quasimetric_rl.modules.gcrl_baselines import GCRLBaselinesConf
+from quasimetric_rl.modules.gcrl_baselines import (
+    FETCH_MANIPULATION_ENVIRONMENTS,
+    GCRLBaselinesConf,
+    resolve_baseline_goal_dims,
+)
 from tools.run_qrl_queue import Task, read_tasks
 
 
@@ -35,14 +39,14 @@ ENVIRONMENTS = (
 ALGORITHMS = (
     ('TD-InfoNCE', 'td_infonce'),
     ('CRL', 'crl'),
-    ('GCBC', 'gcbc'),
+    ('GCSL', 'gcsl'),
     ('C-Learning', 'c_learning'),
 )
 MODEL_SIZE_LEVEL = 'm'
 MODEL_SIZE_FAMILIES = {
     'td_infonce': 'td_infonce',
     'crl': 'crl',
-    'gcbc': 'gcbc',
+    'gcsl': 'gcsl',
     'c_learning': 'c_learning',
 }
 
@@ -77,13 +81,14 @@ def _mlp_parameters(input_dim: int, hidden_sizes, output_dim: int) -> int:
 
 def baseline_parameter_count(
         algorithm: str, state_dim: int, action_dim: int,
-        goal_dim: int) -> int:
+        goal_dim: int, *, model_size_level: str = MODEL_SIZE_LEVEL) -> int:
     family = MODEL_SIZE_FAMILIES.get(algorithm)
     if family is None:
         raise ValueError(f'Unknown algorithm: {algorithm!r}')
-    preset = load_model_size_preset(family, MODEL_SIZE_LEVEL)
-    conf = getattr(preset.baselines, algorithm)
-    source_conf = getattr(GCRLBaselinesConf(), algorithm)
+    preset = load_model_size_preset(family, model_size_level)
+    config_name = 'gcbc' if algorithm == 'gcsl' else algorithm
+    conf = getattr(preset.baselines, config_name)
+    source_conf = getattr(GCRLBaselinesConf(), config_name)
     hidden = tuple(map(int, conf.hidden_sizes))
     action_output_dim = 2 * action_dim
     if algorithm == 'td_infonce':
@@ -101,9 +106,8 @@ def baseline_parameter_count(
             _mlp_parameters(state_dim + goal_dim, hidden, action_output_dim)
             + _mlp_parameters(state_dim + action_dim, hidden, representation_dim)
             + _mlp_parameters(goal_dim, hidden, representation_dim)
-            + 1  # adaptive log-alpha
         )
-    if algorithm == 'gcbc':
+    if algorithm == 'gcsl':
         action_output_dim = 3 ** action_dim
         return _mlp_parameters(
             state_dim + goal_dim, hidden, action_output_dim,
@@ -137,14 +141,27 @@ def generate_tasks(algorithms: Iterable[str] | None = None) -> list[Task]:
         for display_name, algorithm in ALGORITHMS:
             if algorithm not in selected:
                 continue
+            if algorithm == 'crl':
+                task_version_tag = 'originalcrl2022_'
+            elif (env_kind, env_name) in FETCH_MANIPULATION_ENVIRONMENTS:
+                task_version_tag = 'goalreprv2_'
+            else:
+                task_version_tag = ''
+            conditioning_goal_dim = len(resolve_baseline_goal_dims(
+                algorithm,
+                env_kind=env_kind,
+                env_name=env_name,
+                state_dim=state_dim,
+                success_goal_dims=tuple(range(goal_dim)),
+            ))
             parameter_count = baseline_parameter_count(
-                algorithm, state_dim, action_dim, goal_dim,
+                algorithm, state_dim, action_dim, conditioning_goal_dim,
             )
             for seed in TRAINING_SEEDS:
                 task_id = (
                     f'reference_{display_name}-M_200k_20kckpt_'
                     f'val{evaluation_episodes}_test{evaluation_episodes}_'
-                    f'{env_slug}_online_s{seed}'
+                    f'{task_version_tag}{env_slug}_online_s{seed}'
                 )
                 extra_args = ' '.join((
                     f'env.kind={env_kind}',

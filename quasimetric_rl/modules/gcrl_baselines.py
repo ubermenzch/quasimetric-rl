@@ -10,14 +10,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..data import BatchData, EnvSpec
-from .utils import InfoT, LossResult, MLP, Module
+from .utils import InfoT, LossResult, MLP, Module, ResidualMLP
 
 
-BASELINE_ALGORITHMS = ('td_infonce', 'crl', 'gcbc', 'gcsl', 'c_learning')
+BASELINE_ALGORITHMS = (
+    'td_infonce', 'crl', 'scaling_crl', 'gcbc', 'gcsl', 'c_learning',
+)
+FETCH_MANIPULATION_ENVIRONMENTS = frozenset({
+    ('gcrl', 'FetchPush'),
+    ('gcrl', 'FetchSlide'),
+    ('gcrl', 'FetchPickAndPlace'),
+})
 TD_INFONCE_REFERENCE_REVISION = '18f4e7e5872da9c3653f57661d01b4fbce85b50e'
-CRL_REFERENCE_REVISION = '7c53a0743a41423029abd17eb365c4822bf13687'
+CRL_REFERENCE_REVISION = 'ec7c3d346277b737bc2decffcd1b533d4b7ec105'
+SCALING_CRL_REFERENCE_REVISION = '17acb519ddc4325c8662b1f8c68ed6a5f31857fc'
 GCSL_REFERENCE_REVISION = 'cfae5609cee79e5a2228fb7653451023c41a64cb'
 C_LEARNING_REFERENCE_REVISION = 'ec7c3d346277b737bc2decffcd1b533d4b7ec105'
+
+
+def resolve_baseline_goal_dims(
+        algorithm: str, *, env_kind: Optional[str], env_name: Optional[str],
+        state_dim: int,
+        success_goal_dims: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Resolve the hindsight-goal representation independently of success."""
+    if algorithm not in BASELINE_ALGORITHMS:
+        raise ValueError(f'Unknown GCRL baseline: {algorithm!r}')
+    success_goal_dims = tuple(int(dim) for dim in success_goal_dims)
+    _validate_goal_dims(success_goal_dims, state_dim)
+
+    # The original 2022 CRL configuration defaults to start_index=0 and
+    # end_index=-1, including the complete future state in every environment.
+    if algorithm == 'crl':
+        return tuple(range(state_dim))
+    if algorithm == 'scaling_crl':
+        return success_goal_dims
+    if (env_kind, env_name) not in FETCH_MANIPULATION_ENVIRONMENTS:
+        return success_goal_dims
+    if state_dim < 6:
+        raise ValueError(
+            f'{env_kind}/{env_name} requires at least 6 state dimensions, '
+            f'got {state_dim}'
+        )
+    if algorithm in ('td_infonce', 'c_learning'):
+        return tuple(range(state_dim))
+    return tuple(range(6))
 
 
 def _positive_tuple(value):
@@ -65,49 +101,104 @@ class CRLConf:
     representation_dim: int = attrs.field(default=64, validator=attrs.validators.gt(0))
     actor_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
     critic_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
-    alpha_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
     discount: float = attrs.field(
         default=0.99,
         validator=attrs.validators.and_(attrs.validators.ge(0), attrs.validators.le(1)),
     )
     contrastive_loss: str = attrs.field(
-        default='fwd_infonce',
+        default='binary_nce',
         validator=attrs.validators.in_((
             'fwd_infonce', 'bwd_infonce', 'sym_infonce', 'binary_nce',
         )),
     )
     energy: str = attrs.field(
-        default='norm',
+        default='dot',
         validator=attrs.validators.in_(('norm', 'l2', 'dot', 'cosine')),
     )
-    logsumexp_penalty: float = attrs.field(default=0.1, validator=attrs.validators.ge(0))
+    logsumexp_penalty: float = attrs.field(default=0.0, validator=attrs.validators.ge(0))
     activation: str = attrs.field(
-        default='silu', validator=attrs.validators.in_(('relu', 'silu')),
+        default='relu', validator=attrs.validators.in_(('relu', 'silu')),
     )
     representation_norm: bool = False
-    # None enables the JaxGCRL adaptive entropy coefficient. Set 0 for the
-    # original vector-observation CRL configuration.
-    entropy_coefficient: Optional[float] = attrs.field(
-        default=None, validator=attrs.validators.optional(attrs.validators.ge(0)),
-    )
-    target_entropy_per_action: float = -0.5
-    # JaxGCRL uses only achieved future goals for the actor. The original CRL
-    # implementation uses an equal mixture of future and shuffled goals.
+    entropy_coefficient: float = attrs.field(default=0.0, validator=attrs.validators.ge(0))
     random_goal_fraction: float = attrs.field(
-        default=0.0, validator=attrs.validators.in_((0.0, 0.5, 1.0)),
+        default=0.5, validator=attrs.validators.in_((0.0, 0.5, 1.0)),
     )
+    adam_eps: float = attrs.field(default=1e-7, validator=attrs.validators.gt(0))
     batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
-    # JaxGCRL computes this from its default 1001-step episode, 256 batch,
-    # and 62 updates per unroll (approximately 1:16).
     updates_per_env_step: float = attrs.field(
-        default=1001 / (256 * 62), validator=attrs.validators.gt(0),
+        default=1.0, validator=attrs.validators.gt(0),
     )
-    min_replay_size: int = attrs.field(default=1_000, validator=attrs.validators.gt(0))
-    max_replay_size: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    min_replay_size: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    max_replay_size: int = attrs.field(default=1_000_000, validator=attrs.validators.gt(0))
+
+
+def _scaling_crl_arch(value):
+    value = _positive_tuple(value)
+    if len(set(value)) != 1:
+        raise ValueError(
+            'Scaling-CRL requires a constant width for residual shortcuts, '
+            f'got {value!r}'
+        )
+    if len(value) % 4:
+        raise ValueError(
+            'Scaling-CRL depth must be divisible by its four-layer residual '
+            f'block size, got depth={len(value)}'
+        )
+    return value
 
 
 @attrs.define(kw_only=True)
-class GCBCConf:
+class ScalingCRLConf:
+    """Defaults from Wang et al. (2025), separate from the 2022 CRL port."""
+
+    reference_revision: str = SCALING_CRL_REFERENCE_REVISION
+    hidden_sizes: Tuple[int, ...] = attrs.field(
+        default=(256, 256, 256, 256), converter=_scaling_crl_arch,
+    )
+    representation_dim: int = attrs.field(default=64, validator=attrs.validators.gt(0))
+    actor_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
+    critic_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
+    alpha_lr: float = attrs.field(default=3e-4, validator=attrs.validators.gt(0))
+    discount: float = attrs.field(
+        default=0.99,
+        validator=attrs.validators.and_(attrs.validators.ge(0), attrs.validators.le(1)),
+    )
+    logsumexp_penalty: float = attrs.field(
+        default=0.1, validator=attrs.validators.ge(0),
+    )
+    target_entropy_per_action: float = attrs.field(
+        default=-0.5, validator=attrs.validators.lt(0),
+    )
+    batch_size: int = attrs.field(default=512, validator=attrs.validators.gt(0))
+    # Official code: 800 SGD batches per 512 x 62 vectorized environment steps.
+    updates_per_env_step: float = attrs.field(
+        default=800 / (512 * 62), validator=attrs.validators.gt(0),
+    )
+    min_replay_size: int = attrs.field(default=1_000, validator=attrs.validators.gt(0))
+    max_replay_size: int = attrs.field(default=10_000, validator=attrs.validators.gt(0))
+    residual_block_size: int = attrs.field(default=4, validator=attrs.validators.gt(0))
+    additive_exploration_std_fraction: float = attrs.field(
+        default=0.0, validator=attrs.validators.ge(0),
+    )
+    log_std_min: float = -5.0
+    log_std_max: float = 2.0
+
+    def __attrs_post_init__(self) -> None:
+        if self.residual_block_size != 4:
+            raise ValueError(
+                'The official Scaling-CRL architecture uses four-layer '
+                f'residual blocks, got {self.residual_block_size}'
+            )
+        if self.log_std_min >= self.log_std_max:
+            raise ValueError(
+                f'Expected log_std_min < log_std_max, got '
+                f'{self.log_std_min} >= {self.log_std_max}'
+            )
+
+
+@attrs.define(kw_only=True)
+class GCSLConf:
     reference_revision: str = GCSL_REFERENCE_REVISION
     hidden_sizes: Tuple[int, ...] = attrs.field(
         default=(400, 300), converter=_positive_tuple,
@@ -183,7 +274,9 @@ class CLearningConf:
 class GCRLBaselinesConf:
     td_infonce: TDInfoNCEConf = TDInfoNCEConf()
     crl: CRLConf = CRLConf()
-    gcbc: GCBCConf = GCBCConf()
+    scaling_crl: ScalingCRLConf = ScalingCRLConf()
+    # Serialized as ``gcbc`` for compatibility with existing checkpoints.
+    gcbc: GCSLConf = GCSLConf()
     c_learning: CLearningConf = CLearningConf()
 
     def make(
@@ -233,8 +326,8 @@ class GCRLBaselinesConf:
             conf = self.crl
             actor_hidden_sizes = conf.hidden_sizes
             actor_activation = conf.activation
-            actor_init_scheme = 'crl'
-            actor_log_std_bounds = (-5.0, 2.0)
+            actor_init_scheme = 'original_crl_actor'
+            actor_min_std = 1e-6
             critic = ContrastiveCritic(
                 state_dim=state_dim,
                 action_dim=action_dim,
@@ -244,6 +337,21 @@ class GCRLBaselinesConf:
                 energy=conf.energy,
                 representation_norm=conf.representation_norm,
                 activation=conf.activation,
+            )
+            target_critic = None
+        elif algorithm == 'scaling_crl':
+            conf = self.scaling_crl
+            actor_hidden_sizes = conf.hidden_sizes
+            actor_activation = 'silu'
+            actor_init_scheme = None
+            actor_log_std_bounds = (conf.log_std_min, conf.log_std_max)
+            critic = ScalingCRLCritic(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                goal_dim=len(goal_dims),
+                hidden_sizes=conf.hidden_sizes,
+                representation_dim=conf.representation_dim,
+                residual_block_size=conf.residual_block_size,
             )
             target_critic = None
         elif algorithm in ('gcbc', 'gcsl'):
@@ -283,6 +391,10 @@ class GCRLBaselinesConf:
             log_std_bounds=actor_log_std_bounds,
             min_std=actor_min_std,
             action_granularity=actor_action_granularity,
+            residual_block_size=(
+                self.scaling_crl.residual_block_size
+                if algorithm == 'scaling_crl' else None
+            ),
         )
         agent = GCRLBaselineAgent(
             algorithm=algorithm,
@@ -296,7 +408,8 @@ class GCRLBaselinesConf:
             agent=agent,
             td_infonce_conf=self.td_infonce,
             crl_conf=self.crl,
-            gcbc_conf=self.gcbc,
+            scaling_crl_conf=self.scaling_crl,
+            gcsl_conf=self.gcbc,
             c_learning_conf=self.c_learning,
             action_dim=action_dim,
         )
@@ -330,8 +443,24 @@ def _initialize_mlp(mlp: MLP, scheme: str) -> None:
             if scheme == 'td_infonce':
                 nn.init.uniform_(module.weight, -(3 / fan_in) ** 0.5, (3 / fan_in) ** 0.5)
                 nn.init.zeros_(module.bias)
-            elif scheme == 'crl':
-                nn.init.uniform_(module.weight, -fan_in ** -0.5, fan_in ** -0.5)
+            elif scheme == 'original_crl_actor':
+                if module is mlp.module[-1]:
+                    # Acme's distribution head is a separate Haiku Linear and
+                    # therefore uses Haiku's default truncated-normal init.
+                    std = fan_in ** -0.5
+                    nn.init.trunc_normal_(
+                        module.weight, std=std,
+                        a=-2 * std, b=2 * std,
+                    )
+                else:
+                    nn.init.uniform_(
+                        module.weight,
+                        -(3 / fan_in) ** 0.5,
+                        (3 / fan_in) ** 0.5,
+                    )
+                nn.init.zeros_(module.bias)
+            elif scheme == 'original_crl_critic':
+                nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
             elif scheme == 'torch_default':
                 module.reset_parameters()
@@ -378,10 +507,11 @@ class GoalConditionedPolicy(Module):
     def __init__(
             self, *, env_spec: EnvSpec, goal_dim: int,
             hidden_sizes: Tuple[int, ...], activation: str,
-            init_scheme: str,
+            init_scheme: Optional[str],
             log_std_bounds: Optional[Tuple[float, float]] = None,
             min_std: Optional[float] = None,
-            action_granularity: Optional[int] = None):
+            action_granularity: Optional[int] = None,
+            residual_block_size: Optional[int] = None):
         super().__init__()
         state_dim = env_spec.observation_shape.numel()
         self.action_output = env_spec.make_action_output_distn()
@@ -403,13 +533,23 @@ class GoalConditionedPolicy(Module):
                 [values.reshape(-1) for values in mesh], dim=-1,
             ).reshape(-1, *env_spec.action_shape)
             output_size = action_granularity ** env_spec.action_shape.numel()
-        self.backbone = MLP(
-            state_dim + goal_dim,
-            output_size,
-            hidden_sizes=hidden_sizes,
-            activation_fn=_activation_type(activation),
-        )
-        _initialize_mlp(self.backbone, init_scheme)
+        if residual_block_size is None:
+            self.backbone = MLP(
+                state_dim + goal_dim,
+                output_size,
+                hidden_sizes=hidden_sizes,
+                activation_fn=_activation_type(activation),
+            )
+        else:
+            self.backbone = ResidualMLP(
+                state_dim + goal_dim,
+                output_size,
+                hidden_sizes=hidden_sizes,
+                residual_block_size=residual_block_size,
+                activation_fn=_activation_type(activation),
+            )
+        if init_scheme is not None:
+            _initialize_mlp(self.backbone, init_scheme)
         self.register_buffer('action_table', action_table)
         if (log_std_bounds is not None or min_std is not None) and not hasattr(
                 self.action_output, 'from_mean_and_std'):
@@ -471,8 +611,8 @@ class ContrastiveCritic(Module):
             hidden_sizes=hidden_sizes,
             activation_fn=activation_fn,
         )
-        _initialize_mlp(self.sa_encoder, 'crl')
-        _initialize_mlp(self.goal_encoder, 'crl')
+        _initialize_mlp(self.sa_encoder, 'original_crl_critic')
+        _initialize_mlp(self.goal_encoder, 'original_crl_critic')
         self.energy = energy
         self.representation_norm = representation_norm
 
@@ -503,6 +643,54 @@ class ContrastiveCritic(Module):
                 )
             )
         raise RuntimeError(f'Unknown energy: {self.energy!r}')
+
+    def pairwise(
+            self, observation: torch.Tensor, action: torch.Tensor,
+            goals: torch.Tensor) -> torch.Tensor:
+        sa_repr, goal_repr = self.representations(observation, action, goals)
+        return self._energy(sa_repr[:, None, :], goal_repr[None, :, :])
+
+    def paired(
+            self, observation: torch.Tensor, action: torch.Tensor,
+            goal: torch.Tensor) -> torch.Tensor:
+        sa_repr, goal_repr = self.representations(observation, action, goal)
+        return self._energy(sa_repr, goal_repr)
+
+
+class ScalingCRLCritic(Module):
+    """Residual L2 critic from the official Scaling-CRL implementation."""
+
+    def __init__(
+            self, *, state_dim: int, action_dim: int, goal_dim: int,
+            hidden_sizes: Tuple[int, ...], representation_dim: int,
+            residual_block_size: int):
+        super().__init__()
+        self.sa_encoder = ResidualMLP(
+            state_dim + action_dim,
+            representation_dim,
+            hidden_sizes=hidden_sizes,
+            residual_block_size=residual_block_size,
+            activation_fn=nn.SiLU,
+        )
+        self.goal_encoder = ResidualMLP(
+            goal_dim,
+            representation_dim,
+            hidden_sizes=hidden_sizes,
+            residual_block_size=residual_block_size,
+            activation_fn=nn.SiLU,
+        )
+
+    def representations(
+            self, observation: torch.Tensor, action: torch.Tensor,
+            goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.sa_encoder(torch.cat([observation, action], dim=-1)),
+            self.goal_encoder(goal),
+        )
+
+    @staticmethod
+    def _energy(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        return -torch.sqrt((left - right).square().sum(dim=-1))
 
     def pairwise(
             self, observation: torch.Tensor, action: torch.Tensor,
@@ -619,13 +807,15 @@ class GCRLBaselineLosses(Module):
     def __init__(
             self, *, algorithm: str, agent: GCRLBaselineAgent,
             td_infonce_conf: TDInfoNCEConf, crl_conf: CRLConf,
-            gcbc_conf: GCBCConf, c_learning_conf: CLearningConf,
+            scaling_crl_conf: ScalingCRLConf,
+            gcsl_conf: GCSLConf, c_learning_conf: CLearningConf,
             action_dim: int):
         super().__init__()
         self.algorithm = algorithm
         self.td_infonce_conf = td_infonce_conf
         self.crl_conf = crl_conf
-        self.gcbc_conf = gcbc_conf
+        self.scaling_crl_conf = scaling_crl_conf
+        self.gcsl_conf = gcsl_conf
         self.c_learning_conf = c_learning_conf
         self.action_dim = action_dim
 
@@ -635,24 +825,33 @@ class GCRLBaselineLosses(Module):
         elif algorithm == 'crl':
             actor_lr = crl_conf.actor_lr
             critic_lr = crl_conf.critic_lr
+        elif algorithm == 'scaling_crl':
+            actor_lr = scaling_crl_conf.actor_lr
+            critic_lr = scaling_crl_conf.critic_lr
         elif algorithm in ('gcbc', 'gcsl'):
-            actor_lr = gcbc_conf.actor_lr
+            actor_lr = gcsl_conf.actor_lr
             critic_lr = None
         else:
             actor_lr = c_learning_conf.actor_lr
             critic_lr = c_learning_conf.critic_lr
 
-        self.actor_optim = torch.optim.Adam(agent.actor.parameters(), lr=actor_lr)
+        adam_eps = crl_conf.adam_eps if algorithm == 'crl' else 1e-8
+        self.actor_optim = torch.optim.Adam(
+            agent.actor.parameters(), lr=actor_lr, eps=adam_eps,
+        )
         self.critic_optim = (
             None if agent.critic is None
-            else torch.optim.Adam(agent.critic.parameters(), lr=critic_lr)
+            else torch.optim.Adam(
+                agent.critic.parameters(), lr=critic_lr, eps=adam_eps,
+            )
         )
-        if algorithm == 'crl' and crl_conf.entropy_coefficient is None:
+        self.register_parameter('log_alpha', None)
+        self.alpha_optim = None
+        if algorithm == 'scaling_crl':
             self.log_alpha = nn.Parameter(torch.zeros(()))
-            self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=crl_conf.alpha_lr)
-        else:
-            self.register_parameter('log_alpha', None)
-            self.alpha_optim = None
+            self.alpha_optim = torch.optim.Adam(
+                (self.log_alpha,), lr=scaling_crl_conf.alpha_lr,
+            )
 
     def set_scheduler_horizon(self, _total_optim_steps: int) -> None:
         # The reference implementations use constant learning rates.
@@ -753,8 +952,14 @@ class GCRLBaselineLosses(Module):
                 + F.cross_entropy(logits.transpose(0, 1), labels)
             )
         else:
-            critic_loss = -torch.sigmoid(logits).mean()
-        logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+            critic_loss = F.binary_cross_entropy_with_logits(
+                logits, torch.eye(
+                    data.num_transitions,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                ),
+            )
+        logsumexp = torch.logsumexp(logits, dim=1)
         critic_loss = critic_loss + conf.logsumexp_penalty * logsumexp.square().mean()
 
         if conf.random_goal_fraction == 0.0:
@@ -772,18 +977,86 @@ class GCRLBaselineLosses(Module):
         with _frozen(critic):
             actor_value = critic.paired(actor_observation, actor_action, actor_goal)
 
-        if self.log_alpha is None:
-            alpha = logits.new_tensor(conf.entropy_coefficient)
-            alpha_loss = None
-        else:
-            alpha = self.log_alpha.exp()
-            target_entropy = conf.target_entropy_per_action * self.action_dim
-            alpha_loss = alpha * (-log_prob.detach() - target_entropy).mean()
-        actor_loss = (alpha.detach() * log_prob - actor_value).mean()
+        alpha = logits.new_tensor(conf.entropy_coefficient)
+        alpha_loss = None
+        actor_loss = (alpha * log_prob - actor_value).mean()
         info = {
             'critic_loss': critic_loss,
             'actor_loss': actor_loss,
+            'binary_accuracy': (
+                (logits > 0) == torch.eye(
+                    data.num_transitions,
+                    device=logits.device,
+                    dtype=torch.bool,
+                )
+            ).to(torch.float32).mean(),
             'categorical_accuracy': (logits.argmax(1) == labels).to(torch.float32).mean(),
+            'positive_logit': logits.diagonal().mean(),
+            'negative_logit': (
+                (logits.sum() - logits.diagonal().sum())
+                / max(logits.numel() - data.num_transitions, 1)
+            ),
+            'logsumexp': logsumexp.square().mean(),
+            'entropy': -log_prob.mean(),
+            'alpha': alpha,
+        }
+        if alpha_loss is not None:
+            info['alpha_loss'] = alpha_loss
+        return critic_loss, actor_loss, alpha_loss, info
+
+    def _scaling_crl_losses(
+            self, agent: GCRLBaselineAgent,
+            data: BatchData) -> Tuple[
+                torch.Tensor, torch.Tensor, torch.Tensor, InfoT,
+            ]:
+        critic = agent.critic
+        assert isinstance(critic, ScalingCRLCritic)
+        assert self.log_alpha is not None
+        conf = self.scaling_crl_conf
+        future_goal = agent.extract_goal(data.future_observations)
+        logits = critic.pairwise(data.observations, data.actions, future_goal)
+        labels = torch.arange(data.num_transitions, device=data.device)
+
+        critic_loss = F.cross_entropy(logits, labels)
+        logsumexp = torch.logsumexp(logits + 1e-6, dim=1)
+        critic_loss = (
+            critic_loss
+            + conf.logsumexp_penalty * logsumexp.square().mean()
+        )
+
+        actor_dist = agent.actor(data.observations, future_goal)
+        # The reference computes the squashed-Gaussian Jacobian with an
+        # explicit 1e-6 inside the logarithm. Its environments use unit action
+        # bounds; retain the affine term so the common wrapper is also correct
+        # for other finite Box bounds.
+        pre_tanh_dist = actor_dist._pre_tanh_distn
+        pre_tanh_action = pre_tanh_dist.rsample()
+        unit_action = torch.tanh(pre_tanh_action)
+        actor_action = (
+            actor_dist._affine_loc
+            + actor_dist._affine_scale * unit_action
+        )
+        log_prob = (
+            pre_tanh_dist.log_prob(pre_tanh_action)
+            - torch.log(1 - unit_action.square() + 1e-6)
+            - actor_dist._affine_scale.abs().log()
+        ).sum(dim=-1)
+        with _frozen(critic):
+            actor_value = critic.paired(
+                data.observations, actor_action, future_goal,
+            )
+
+        alpha = self.log_alpha.exp()
+        target_entropy = conf.target_entropy_per_action * self.action_dim
+        actor_loss = (alpha.detach() * log_prob - actor_value).mean()
+        alpha_loss = alpha * (-log_prob.detach() - target_entropy).mean()
+        info = {
+            'critic_loss': critic_loss,
+            'actor_loss': actor_loss,
+            'alpha_loss': alpha_loss,
+            'categorical_accuracy': (
+                logits.argmax(dim=1) == labels
+            ).to(torch.float32).mean(),
             'positive_logit': logits.diagonal().mean(),
             'negative_logit': (
                 (logits.sum() - logits.diagonal().sum())
@@ -793,11 +1066,9 @@ class GCRLBaselineLosses(Module):
             'entropy': -log_prob.mean(),
             'alpha': alpha,
         }
-        if alpha_loss is not None:
-            info['alpha_loss'] = alpha_loss
         return critic_loss, actor_loss, alpha_loss, info
 
-    def _gcbc_loss(
+    def _gcsl_loss(
             self, agent: GCRLBaselineAgent,
             data: BatchData) -> Tuple[torch.Tensor, InfoT]:
         future_goal = agent.extract_goal(data.future_observations)
@@ -929,8 +1200,12 @@ class GCRLBaselineLosses(Module):
             alpha_loss = None
         elif self.algorithm == 'crl':
             critic_loss, actor_loss, alpha_loss, info = self._crl_losses(agent, data)
+        elif self.algorithm == 'scaling_crl':
+            critic_loss, actor_loss, alpha_loss, info = (
+                self._scaling_crl_losses(agent, data)
+            )
         elif self.algorithm in ('gcbc', 'gcsl'):
-            actor_loss, info = self._gcbc_loss(agent, data)
+            actor_loss, info = self._gcsl_loss(agent, data)
             critic_loss = actor_loss.new_zeros(())
             alpha_loss = None
         else:
@@ -999,7 +1274,11 @@ class GCRLBaselineLosses(Module):
 
 __all__ = [
     'BASELINE_ALGORITHMS',
+    'SCALING_CRL_REFERENCE_REVISION',
     'GCRLBaselinesConf',
     'GCRLBaselineAgent',
     'GCRLBaselineLosses',
+    'GCSLConf',
+    'ScalingCRLConf',
+    'ScalingCRLCritic',
 ]

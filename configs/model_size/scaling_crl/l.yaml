@@ -1,0 +1,5 @@
+# Scaling-CRL-L: official eight-layer residual architecture at nominal L capacity.
+model_size: Scaling-CRL-L
+baselines:
+  scaling_crl:
+    hidden_sizes: [944, 944, 944, 944, 944, 944, 944, 944]

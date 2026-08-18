@@ -31,12 +31,21 @@ from online.main import (
     Conf as OnlineConf,
     ONLINE_CHECKPOINT_KIND_COMMITTED,
     ONLINE_CHECKPOINT_KIND_INTERRUPTED,
+    SELECTED_BEST_AGENT_FILENAME,
     committed_online_checkpoint_issue,
+    deployment_agent_checkpoint_state,
+    ensure_selected_best_agent_checkpoint,
     load_latest_committed_online_checkpoint,
+    maintain_selected_best_agent_checkpoint,
+    publish_selected_best_agent_checkpoint,
+    retain_only_online_best_and_final_checkpoints,
     resolve_online_resume_plan,
     resolve_split_encoder_goal_dims,
+    selected_best_agent_checkpoint_issue,
+    selected_best_validation_summary,
     select_best_validation,
     summarize_evaluation,
+    validation_improves,
 )
 from online.trainer import (
     EvalEpisodeResult,
@@ -376,6 +385,47 @@ class OnlineInteractionScheduleTest(unittest.TestCase):
 
 
 class OnlineCheckpointSelectionTest(unittest.TestCase):
+    @staticmethod
+    def validation_summary(env_steps, success_count, *, hitting_time=10.0):
+        return {
+            'split': 'validation',
+            'seed': 1000,
+            'seed_end': 1999,
+            'num_episodes': 1000,
+            'env_steps': env_steps,
+            'optim_steps': env_steps - 1000,
+            'success_count': success_count,
+            'succ_rate': success_count / 1000,
+            'hitting_time': hitting_time,
+            'epi_return': float(success_count),
+            'checkpoint': f'checkpoint_env{env_steps:08d}_opt00000000.pth',
+            'agent_checkpoint': f'agent_checkpoint_env{env_steps:08d}.pth',
+        }
+
+    def test_deployment_checkpoint_contains_only_agent_and_provenance(self):
+        agent_state = {'actor.weight': torch.tensor([1.0])}
+        validation_summary = {
+            'env_steps': 200_000,
+            'optim_steps': 190_000,
+            'succ_rate': 0.8,
+        }
+
+        state = deployment_agent_checkpoint_state(
+            agent_state, validation_summary,
+        )
+
+        self.assertEqual(set(state), {
+            'checkpoint_kind',
+            'env_steps',
+            'optim_steps',
+            'agent',
+            'validation_summary',
+        })
+        self.assertIs(state['agent'], agent_state)
+        self.assertNotIn('losses', state)
+        self.assertNotIn('replay', state)
+        self.assertNotIn('rng', state)
+
     def test_summary_uses_censored_one_based_hitting_time(self):
         rewards = torch.tensor([
             [0.0, 1.0, 1.0, 1.0],
@@ -414,6 +464,196 @@ class OnlineCheckpointSelectionTest(unittest.TestCase):
         ]
         selected = select_best_validation(candidates)
         self.assertEqual(selected, candidates[-1])
+
+    def test_rolling_best_replaces_only_on_improvement(self):
+        incumbent = self.validation_summary(20_000, 700)
+        worse = self.validation_summary(40_000, 699, hitting_time=1.0)
+        better = self.validation_summary(60_000, 701, hitting_time=20.0)
+
+        self.assertFalse(validation_improves(worse, incumbent))
+        self.assertTrue(validation_improves(better, incumbent))
+        self.assertTrue(validation_improves(incumbent, None))
+
+    def test_rolling_best_file_is_unchanged_for_worse_validation(self):
+        with TemporaryDirectory() as directory:
+            incumbent = self.validation_summary(20_000, 700)
+            selected, path, updated = maintain_selected_best_agent_checkpoint(
+                directory,
+                agent_state_dict={'actor.weight': torch.tensor([1.0])},
+                candidate=incumbent,
+                incumbent=None,
+            )
+            self.assertTrue(updated)
+            original = Path(path).read_bytes()
+
+            worse = self.validation_summary(40_000, 699, hitting_time=1.0)
+            retained, retained_path, updated = (
+                maintain_selected_best_agent_checkpoint(
+                    directory,
+                    agent_state_dict={'actor.weight': torch.tensor([2.0])},
+                    candidate=worse,
+                    incumbent=selected,
+                )
+            )
+
+            self.assertFalse(updated)
+            self.assertEqual(retained, selected)
+            self.assertEqual(retained_path, path)
+            self.assertEqual(Path(path).read_bytes(), original)
+
+            better = self.validation_summary(60_000, 750)
+            replaced, _, updated = maintain_selected_best_agent_checkpoint(
+                directory,
+                agent_state_dict={'actor.weight': torch.tensor([3.0])},
+                candidate=better,
+                incumbent=selected,
+            )
+            self.assertTrue(updated)
+            self.assertEqual(replaced['env_steps'], 60_000)
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            torch.testing.assert_close(
+                state['agent']['actor.weight'], torch.tensor([3.0]),
+            )
+
+    def test_publish_selected_best_is_model_only_and_atomic_target(self):
+        with TemporaryDirectory() as directory:
+            summary = self.validation_summary(20_000, 700)
+            agent_state = {'actor.weight': torch.tensor([2.0])}
+
+            selected, path = publish_selected_best_agent_checkpoint(
+                directory,
+                agent_state_dict=agent_state,
+                validation_summary=summary,
+            )
+
+            self.assertEqual(
+                selected['agent_checkpoint'], SELECTED_BEST_AGENT_FILENAME,
+            )
+            self.assertEqual(
+                selected['source_agent_checkpoint'],
+                summary['agent_checkpoint'],
+            )
+            self.assertEqual(Path(path).name, SELECTED_BEST_AGENT_FILENAME)
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            self.assertIsNone(
+                selected_best_agent_checkpoint_issue(state, selected),
+            )
+            self.assertEqual(set(state), {
+                'checkpoint_kind', 'env_steps', 'optim_steps', 'agent',
+                'validation_summary',
+            })
+            self.assertFalse(Path(path + '.tmp').exists())
+
+    def test_resume_repairs_best_from_newly_committed_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            stale = selected_best_validation_summary(
+                self.validation_summary(20_000, 700),
+            )
+            publish_selected_best_agent_checkpoint(
+                directory,
+                agent_state_dict={'actor.weight': torch.tensor([1.0])},
+                validation_summary=stale,
+            )
+            committed_best = selected_best_validation_summary(
+                self.validation_summary(40_000, 750),
+            )
+
+            selected, path, repaired = ensure_selected_best_agent_checkpoint(
+                directory,
+                validation_summary=committed_best,
+                committed_state={
+                    'agent': {'actor.weight': torch.tensor([2.0])},
+                    'validation_summary': committed_best,
+                },
+            )
+
+            self.assertTrue(repaired)
+            self.assertEqual(selected, committed_best)
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            torch.testing.assert_close(
+                state['agent']['actor.weight'], torch.tensor([2.0]),
+            )
+            _, _, repaired_again = ensure_selected_best_agent_checkpoint(
+                directory,
+                validation_summary=committed_best,
+            )
+            self.assertFalse(repaired_again)
+
+    def test_resume_repairs_non_mapping_best_payload(self):
+        with TemporaryDirectory() as directory:
+            best_path = Path(directory) / SELECTED_BEST_AGENT_FILENAME
+            torch.save(torch.tensor([123.0]), best_path)
+            committed_best = selected_best_validation_summary(
+                self.validation_summary(40_000, 750),
+            )
+
+            _, path, repaired = ensure_selected_best_agent_checkpoint(
+                directory,
+                validation_summary=committed_best,
+                committed_state={
+                    'agent': {'actor.weight': torch.tensor([2.0])},
+                    'validation_summary': committed_best,
+                },
+            )
+
+            self.assertTrue(repaired)
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            self.assertIsNone(
+                selected_best_agent_checkpoint_issue(state, committed_best),
+            )
+
+    def test_best_and_final_retention_removes_other_online_checkpoints(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            selected = output_dir / SELECTED_BEST_AGENT_FILENAME
+            final = output_dir / (
+                'checkpoint_env00500000_opt00490000_finalizing.pth'
+            )
+            removed_names = {
+                'checkpoint_env00450000_opt00440000.pth',
+                'checkpoint_env00450000_opt00440000_final.pth',
+                'checkpoint_env00500000_opt00490000.pth',
+                'agent_checkpoint_env00450000_opt00440000.pth',
+                'agent_checkpoint_env00500000_opt00490000.pth',
+                'checkpoint_resume_latest.pth',
+            }
+            for name in removed_names:
+                (output_dir / name).touch()
+            selected.touch()
+            final.touch()
+            metadata = output_dir / 'best_checkpoint.json'
+            metadata.touch()
+
+            removed = retain_only_online_best_and_final_checkpoints(
+                str(output_dir),
+                best_agent_checkpoint=str(selected),
+                final_checkpoint=str(final),
+            )
+
+            self.assertEqual(set(removed), removed_names)
+            self.assertTrue(selected.exists())
+            self.assertTrue(final.exists())
+            self.assertTrue(metadata.exists())
+
+    def test_best_and_final_retention_validates_keep_files_before_cleanup(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            old = output_dir / 'checkpoint_env00100000_opt00090000.pth'
+            old.touch()
+            selected = output_dir / SELECTED_BEST_AGENT_FILENAME
+            selected.touch()
+
+            with self.assertRaises(FileNotFoundError):
+                retain_only_online_best_and_final_checkpoints(
+                    str(output_dir),
+                    best_agent_checkpoint=str(selected),
+                    final_checkpoint=str(
+                        output_dir /
+                        'checkpoint_env00200000_opt00190000_final.pth'
+                    ),
+                )
+
+            self.assertTrue(old.exists())
 
 
 class OnlineResumePlanTest(unittest.TestCase):
@@ -466,6 +706,27 @@ class OnlineResumePlanTest(unittest.TestCase):
             path, env_steps, optim_steps, _ = selected
             self.assertEqual(Path(path), committed)
             self.assertEqual((env_steps, optim_steps), (140_000, 130_500))
+
+    def test_finalizing_checkpoint_is_resumable_during_final_test(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            finalizing = output_dir / (
+                'checkpoint_env02000000_opt01990000_finalizing.pth'
+            )
+            torch.save(self.checkpoint_state(
+                2_000_000,
+                1_990_000,
+                kind=ONLINE_CHECKPOINT_KIND_COMMITTED,
+            ), finalizing)
+
+            selected = load_latest_committed_online_checkpoint(
+                str(output_dir), num_samples_per_cycle=500,
+            )
+
+            self.assertIsNotNone(selected)
+            path, env_steps, optim_steps, _ = selected
+            self.assertEqual(Path(path), finalizing)
+            self.assertEqual((env_steps, optim_steps), (2_000_000, 1_990_000))
 
     def test_legacy_validation_checkpoint_is_committed(self):
         state = self.checkpoint_state(120_000, 110_500)

@@ -1,0 +1,6 @@
+# GCSL-L: four layers avoid an excessively wide two-layer L policy.
+model_size: GCSL-L
+baselines:
+  # Kept as gcbc in serialized configs for checkpoint compatibility.
+  gcbc:
+    hidden_sizes: [2680, 2680, 2680, 2680]

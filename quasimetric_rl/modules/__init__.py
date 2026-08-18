@@ -236,10 +236,17 @@ class QRLConf:
         default=None,
         validator=attrs.validators.optional(
             attrs.validators.in_((
-                'QRL-S', 'QRL-M', 'QRL-L',
-                'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L', 'GO-QRL-XL',
+                'QRL-S', 'QRL-M', 'QRL-L', 'QRL-XL', 'QRL-XXL', 'QRL-XXXL',
+                'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L', 'GO-QRL-L-Residual',
+                'GO-QRL-XL',
                 'GO-QRL-XXL', 'GO-QRL-XXXL',
-                'TD-InfoNCE-M', 'CRL-M', 'GCBC-M', 'C-Learning-M',
+                'TD-InfoNCE-M', 'TD-InfoNCE-L',
+                'CRL-M', 'CRL-L',
+                'GCSL-M', 'GCSL-L', 'GCSL-L-Pusher',
+                'GCSL-L-AntNavigate', 'GCBC-M',
+                'C-Learning-M', 'C-Learning-L',
+                'Scaling-CRL-M', 'Scaling-CRL-L', 'Scaling-CRL-XL',
+                'Scaling-CRL-XXL', 'Scaling-CRL-XXXL',
             ))
         ),
     )
@@ -269,16 +276,22 @@ class QRLConf:
 
     def make(self, *, env_spec: EnvSpec, total_optim_steps: int,
              profiler: Optional[TimingProfiler] = None,
-             goal_set_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
+             goal_set_dims: Optional[Tuple[int, ...]] = None,
+             baseline_goal_dims: Optional[Tuple[int, ...]] = None) -> Tuple[QRLAgent, QRLLosses]:
         if self.algorithm != 'qrl':
-            if goal_set_dims is None:
+            # goal_set_dims is retained as a compatibility fallback for callers
+            # outside the online trainer.
+            baseline_goal_dims = (
+                goal_set_dims if baseline_goal_dims is None else baseline_goal_dims
+            )
+            if baseline_goal_dims is None:
                 raise ValueError(
-                    f'agent.algorithm={self.algorithm} requires registered goal dimensions'
+                    f'agent.algorithm={self.algorithm} requires conditioning goal dimensions'
                 )
             return self.baselines.make(
                 self.algorithm,
                 env_spec=env_spec,
-                goal_dims=goal_set_dims,
+                goal_dims=baseline_goal_dims,
             )
         encoder_conf = self.quasimetric_critic.model.encoder
         encoder_conf.resolve_split_parameterization(env_spec=env_spec)

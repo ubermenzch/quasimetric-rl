@@ -1,0 +1,5 @@
+# CRL-L: four layers avoid an excessively wide two-layer L model.
+model_size: CRL-L
+baselines:
+  crl:
+    hidden_sizes: [1544, 1544, 1544, 1544]

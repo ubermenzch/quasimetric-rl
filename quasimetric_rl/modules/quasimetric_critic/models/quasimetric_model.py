@@ -131,6 +131,15 @@ class QuasimetricModel(nn.Module):
         return self.projector(z)
 
     def forward_projected(self, px: torch.Tensor, py: torch.Tensor, *, bidirectional: bool = False) -> torch.Tensor:
+        low_precision = (torch.float16, torch.bfloat16)
+        if px.dtype in low_precision or py.dtype in low_precision:
+            # torchqmet reductions are numerically sensitive and may not have
+            # low-precision kernels. Keep the large projector under autocast,
+            # then evaluate only the compact quasimetric head in FP32.
+            with torch.autocast(device_type=px.device.type, enabled=False):
+                return self.forward_projected(
+                    px.float(), py.float(), bidirectional=bidirectional,
+                )
         if bidirectional:
             px, py = torch.broadcast_tensors(px, py)
             px, py = torch.stack([px, py], dim=-2), torch.stack([py, px], dim=-2)  # [B x 2 x D]

@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from quasimetric_rl.data.online import ReplayBuffer
 from quasimetric_rl.modules import QRLConf
+from quasimetric_rl.modules.gcrl_baselines import resolve_baseline_goal_dims
 
 
 ENVIRONMENTS = (
@@ -29,7 +30,7 @@ ENVIRONMENTS = (
     ('dmc', 'reacher_hard', 1000),
     ('gym_mujoco', 'Reacher-v4', 50),
 )
-ALGORITHMS = ('td_infonce', 'crl', 'gcbc', 'c_learning')
+ALGORITHMS = ('td_infonce', 'crl', 'scaling_crl', 'gcsl', 'c_learning')
 
 
 def small_conf(algorithm: str) -> QRLConf:
@@ -39,6 +40,8 @@ def small_conf(algorithm: str) -> QRLConf:
     conf.baselines.td_infonce.representation_dim = 8
     conf.baselines.crl.hidden_sizes = (16, 16)
     conf.baselines.crl.representation_dim = 8
+    conf.baselines.scaling_crl.hidden_sizes = (16, 16, 16, 16)
+    conf.baselines.scaling_crl.representation_dim = 8
     conf.baselines.gcbc.hidden_sizes = (16, 16)
     conf.baselines.c_learning.hidden_sizes = (16, 16)
     return conf
@@ -63,12 +66,19 @@ def smoke_environment(kind: str, name: str, horizon: int, batch_size: int) -> No
         for algorithm in ALGORITHMS:
             torch.manual_seed(12345)
             conf = small_conf(algorithm)
+            baseline_goal_dims = resolve_baseline_goal_dims(
+                algorithm,
+                env_kind=kind,
+                env_name=name,
+                state_dim=replay.env_spec.observation_shape.numel(),
+                success_goal_dims=replay.goal_set_dims,
+            )
             agent, losses = conf.make(
                 env_spec=replay.env_spec,
                 total_optim_steps=1,
-                goal_set_dims=replay.goal_set_dims,
+                baseline_goal_dims=baseline_goal_dims,
             )
-            if algorithm == 'gcbc':
+            if algorithm == 'gcsl':
                 batch = replay.sample_uniform_future_pairs(batch_size)
             else:
                 batch = replay.sample(batch_size)

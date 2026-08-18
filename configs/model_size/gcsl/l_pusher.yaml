@@ -1,0 +1,6 @@
+# GCSL-L matched to the Pusher-v4 action-logit output size.
+model_size: GCSL-L-Pusher
+baselines:
+  # Kept as gcbc in serialized configs for checkpoint compatibility.
+  gcbc:
+    hidden_sizes: [2336, 2344, 2344, 2344]

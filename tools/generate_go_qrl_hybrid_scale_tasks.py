@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import shlex
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -61,6 +63,19 @@ MODEL_SCALES = (
     ModelScale('xl', 'XL'),
     ModelScale('xxl', 'XXL'),
     ModelScale('xxxl', 'XXXL'),
+)
+
+GPU_OPTIMIZED_LEVELS = frozenset({'l', 'xl', 'xxl', 'xxxl'})
+GPU_OPTIMIZATION_TAG = 'gpuopt2v3'
+GPU_OPTIMIZATION_ARGS = (
+    'training_optimizations.tf32=true',
+    'training_optimizations.amp_dtype=null',
+    'training_optimizations.fused_adamw=false',
+    'training_optimizations.compile_heavy_modules=true',
+    'training_optimizations.compile_mode=default',
+    'training_optimizations.compile_fullgraph=false',
+    'training_optimizations.compile_dynamic=false',
+    'training_optimizations.compile_suppress_errors=true',
 )
 
 # Each tuple is one indivisible five-seed group. The 13/6/6 group split gives
@@ -173,13 +188,23 @@ def generate_all_tasks() -> list[Task]:
                 scale.level,
             ))
             for seed in TRAINING_SEEDS:
+                gpu_optimization_tag = (
+                    f'_{GPU_OPTIMIZATION_TAG}'
+                    if scale.level in GPU_OPTIMIZED_LEVELS else ''
+                )
                 task_id = (
-                    f'scale_GO-QRL+Max4-Hybrid-{scale.label}_500k_50kckpt_'
+                    f'scale_GO-QRL+Max4-Hybrid-{scale.label}_500k'
+                    f'{gpu_optimization_tag}_50kckpt_'
                     f'val500_test1000_{environment.slug}_online_s{seed}'
                 )
                 extra_args = ' '.join((
                     f'env.kind={environment.kind}',
                     f'+go_qrl_model_size={scale.level}',
+                    *(
+                        GPU_OPTIMIZATION_ARGS
+                        if scale.level in GPU_OPTIMIZED_LEVELS
+                        else ()
+                    ),
                     *COMMON_ARGS,
                 ))
                 tasks.append(Task(
@@ -261,6 +286,30 @@ def validate_tasks(tasks: list[Task]) -> None:
         )
         if (validation_end, test_end) != (1499, 2499):
             raise ValueError(f'Invalid evaluation seed ranges for {task.task_id}')
+        scale = task_scale(task)
+        if scale in GPU_OPTIMIZED_LEVELS:
+            for optimization_arg in GPU_OPTIMIZATION_ARGS:
+                key, value = optimization_arg.split('=', 1)
+                if args.get(key) != value:
+                    raise ValueError(
+                        f'{task.task_id} requires {optimization_arg}, '
+                        f'got {args.get(key)}'
+                    )
+            if f'_{GPU_OPTIMIZATION_TAG}_' not in task.task_id:
+                raise ValueError(
+                    f'Optimized task ID is missing {GPU_OPTIMIZATION_TAG}: '
+                    f'{task.task_id}'
+                )
+        else:
+            unexpected = [
+                arg.split('=', 1)[0]
+                for arg in GPU_OPTIMIZATION_ARGS
+                if arg.split('=', 1)[0] in args
+            ]
+            if unexpected:
+                raise ValueError(
+                    f'{task.task_id} unexpectedly enables {unexpected}'
+                )
 
 
 def validate_partitions(tasks: list[Task]) -> None:
@@ -296,6 +345,7 @@ def render_tasks(tasks: list[Task], partition: str) -> str:
         f'# GO-QRL Max4 Hybrid model-scale sweep; partition: {partition}.',
         '# 500k steps; validation every 50k on seeds 1000-1499 (500 episodes).',
         '# Best validation checkpoint is tested on seeds 1500-2499 (1000 episodes).',
+        '# L-XXXL use TF32 and compiled heavy MLPs; BF16/fused AdamW are off.',
     ]
     lines.extend(task_line(task) for task in tasks)
     return '\n'.join(lines) + '\n'
@@ -315,7 +365,22 @@ def append_tasks(path: Path, tasks: list[Task], partition: str) -> int:
         f'# GO-QRL Max4 Hybrid model-scale sweep: {partition} assignment.',
         *(task_line(task) for task in additions),
     ]) + '\n'
-    path.write_text(current + separator + block)
+    original_mode = path.stat().st_mode if path.exists() else None
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f'{path.name}.', suffix='.tmp', dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(current + separator + block)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if original_mode is not None:
+            os.chmod(temporary, original_mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return len(additions)
 
 

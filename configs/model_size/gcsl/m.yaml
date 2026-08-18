@@ -1,0 +1,5 @@
+# GCSL-M: preserve the official 400:300 width ratio and scale only capacity.
+model_size: GCSL-M
+baselines:
+  gcbc:
+    hidden_sizes: [2304, 1728]

@@ -814,8 +814,9 @@ def task_variant(task: Task) -> str:
     baseline_labels = {
         "td_infonce": "TD-InfoNCE",
         "crl": "CRL",
-        "gcbc": "GCBC",
-        "gcsl": "GCSL/GCBC",
+        "scaling_crl": "Scaling-CRL",
+        "gcbc": "GCSL",
+        "gcsl": "GCSL",
         "c_learning": "C-Learning",
     }
     if algorithm in baseline_labels:

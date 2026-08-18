@@ -1,4 +1,4 @@
-# QRL-L: eligible when state_dim < latent_size / 2 = 256.
+# QRL-L: four-layer plain MLP at the L parameter budget.
 model_size: QRL-L
 num_critics: 1
 training_schedule: joint
@@ -6,18 +6,18 @@ quasimetric_critic:
   model:
     encoder:
       kind: standard
-      arch: [1024, 1024]
+      arch: [1184, 1184, 1184, 1184]
       latent_size: 512
     quasimetric_model:
-      projector_arch: [1024]
+      projector_arch: [1184, 1184, 1184, 1184]
       quasimetric_head_spec: iqe(dim=2048,components=64)
     latent_dynamics:
       kind: mlp
-      arch: [1024, 1024]
+      arch: [1184, 1184, 1184, 1184]
       residual: true
 actor:
   model:
     input_mode: raw
-    arch: [1024, 1024]
+    arch: [1184, 1184, 1184, 1184]
 goal_set_distance:
   enabled: false
