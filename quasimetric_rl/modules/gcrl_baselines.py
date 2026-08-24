@@ -205,6 +205,10 @@ class GCSLConf:
     )
     actor_lr: float = attrs.field(default=5e-4, validator=attrs.validators.gt(0))
     action_granularity: int = attrs.field(default=3, validator=attrs.validators.gt(1))
+    action_discretization: str = attrs.field(
+        default='joint',
+        validator=attrs.validators.in_(('joint', 'factorized')),
+    )
     start_policy_timesteps: int = attrs.field(
         default=1_000, validator=attrs.validators.ge(0),
     )
@@ -295,6 +299,7 @@ class GCRLBaselinesConf:
         actor_log_std_bounds = None
         actor_min_std = None
         actor_action_granularity = None
+        actor_action_discretization = 'joint'
 
         if algorithm == 'td_infonce':
             conf = self.td_infonce
@@ -360,6 +365,7 @@ class GCRLBaselinesConf:
             actor_activation = 'relu'
             actor_init_scheme = 'torch_default'
             actor_action_granularity = conf.action_granularity
+            actor_action_discretization = conf.action_discretization
             critic = target_critic = None
         else:
             conf = self.c_learning
@@ -391,6 +397,7 @@ class GCRLBaselinesConf:
             log_std_bounds=actor_log_std_bounds,
             min_std=actor_min_std,
             action_granularity=actor_action_granularity,
+            action_discretization=actor_action_discretization,
             residual_block_size=(
                 self.scaling_crl.residual_block_size
                 if algorithm == 'scaling_crl' else None
@@ -503,6 +510,44 @@ class DiscretizedActionDistribution:
         return self._categorical.log_prob(distance.argmin(dim=-1))
 
 
+class FactorizedDiscretizedActionDistribution:
+    """Independent categorical bins for each continuous action coordinate."""
+
+    def __init__(
+            self, logits: torch.Tensor, action_bins: torch.Tensor,
+            action_shape: torch.Size):
+        self.logits = logits
+        self.action_bins = action_bins
+        self.action_shape = torch.Size(action_shape)
+        self._categorical = torch.distributions.Categorical(logits=logits)
+        self.batch_shape = logits.shape[:-2]
+        self.event_shape = self.action_shape
+
+    def _values_from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        values = torch.stack([
+            self.action_bins[axis][indices[..., axis]]
+            for axis in range(self.action_bins.shape[0])
+        ], dim=-1)
+        return values.reshape(*indices.shape[:-1], *self.action_shape)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self._values_from_indices(self.logits.argmax(dim=-1))
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return self.mean
+
+    def sample(self, sample_shape=torch.Size()) -> torch.Tensor:
+        return self._values_from_indices(self._categorical.sample(sample_shape))
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        flat_value = value.reshape(*value.shape[:-len(self.action_shape)], -1)
+        distance = (flat_value.unsqueeze(-1) - self.action_bins).square()
+        labels = distance.argmin(dim=-1)
+        return self._categorical.log_prob(labels).sum(dim=-1)
+
+
 class GoalConditionedPolicy(Module):
     def __init__(
             self, *, env_spec: EnvSpec, goal_dim: int,
@@ -511,6 +556,7 @@ class GoalConditionedPolicy(Module):
             log_std_bounds: Optional[Tuple[float, float]] = None,
             min_std: Optional[float] = None,
             action_granularity: Optional[int] = None,
+            action_discretization: str = 'joint',
             residual_block_size: Optional[int] = None):
         super().__init__()
         state_dim = env_spec.observation_shape.numel()
@@ -518,6 +564,7 @@ class GoalConditionedPolicy(Module):
         if action_granularity is None:
             output_size = self.action_output.input_size
             action_table = None
+            action_bins = None
         else:
             if not isinstance(env_spec.action_space, gym.spaces.Box):
                 raise TypeError('GCSL action discretization requires Box actions')
@@ -528,11 +575,22 @@ class GoalConditionedPolicy(Module):
                     env_spec.action_space.high.reshape(-1),
                 )
             ]
-            mesh = torch.meshgrid(*axes, indexing='xy')
-            action_table = torch.stack(
-                [values.reshape(-1) for values in mesh], dim=-1,
-            ).reshape(-1, *env_spec.action_shape)
-            output_size = action_granularity ** env_spec.action_shape.numel()
+            if action_discretization == 'joint':
+                mesh = torch.meshgrid(*axes, indexing='xy')
+                action_table = torch.stack(
+                    [values.reshape(-1) for values in mesh], dim=-1,
+                ).reshape(-1, *env_spec.action_shape)
+                action_bins = None
+                output_size = action_granularity ** env_spec.action_shape.numel()
+            elif action_discretization == 'factorized':
+                action_table = None
+                action_bins = torch.stack(axes)
+                output_size = action_granularity * env_spec.action_shape.numel()
+            else:
+                raise ValueError(
+                    'GCSL action_discretization must be "joint" or '
+                    f'"factorized", got {action_discretization!r}'
+                )
         if residual_block_size is None:
             self.backbone = MLP(
                 state_dim + goal_dim,
@@ -551,6 +609,8 @@ class GoalConditionedPolicy(Module):
         if init_scheme is not None:
             _initialize_mlp(self.backbone, init_scheme)
         self.register_buffer('action_table', action_table)
+        self.register_buffer('action_bins', action_bins)
+        self.action_shape = torch.Size(env_spec.action_shape)
         if (log_std_bounds is not None or min_std is not None) and not hasattr(
                 self.action_output, 'from_mean_and_std'):
             raise TypeError('Custom policy standard deviation requires Box actions')
@@ -560,12 +620,23 @@ class GoalConditionedPolicy(Module):
         self.min_std = min_std
 
     def sample_uniform_action(self) -> torch.Tensor:
-        if self.action_table is None:
+        if self.action_table is not None:
+            index = torch.randint(
+                self.action_table.shape[0], (), device=self.action_table.device,
+            )
+            return self.action_table[index]
+        if self.action_bins is not None:
+            indices = torch.randint(
+                self.action_bins.shape[1],
+                (self.action_bins.shape[0],),
+                device=self.action_bins.device,
+            )
+            return torch.stack([
+                self.action_bins[axis, indices[axis]]
+                for axis in range(self.action_bins.shape[0])
+            ]).reshape(self.action_shape)
+        else:
             raise RuntimeError('Uniform discrete actions are only defined for GCSL')
-        index = torch.randint(
-            self.action_table.shape[0], (), device=self.action_table.device,
-        )
-        return self.action_table[index]
 
     def forward(
             self, observation: torch.Tensor,
@@ -573,6 +644,14 @@ class GoalConditionedPolicy(Module):
         features = self.backbone(torch.cat([observation, goal], dim=-1))
         if self.action_table is not None:
             return DiscretizedActionDistribution(features, self.action_table)
+        if self.action_bins is not None:
+            logits = features.reshape(
+                *features.shape[:-1], self.action_bins.shape[0],
+                self.action_bins.shape[1],
+            )
+            return FactorizedDiscretizedActionDistribution(
+                logits, self.action_bins, self.action_shape,
+            )
         if self.log_std_bounds is None and self.min_std is None:
             return self.action_output(features)
 

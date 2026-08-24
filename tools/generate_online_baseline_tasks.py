@@ -81,7 +81,8 @@ def _mlp_parameters(input_dim: int, hidden_sizes, output_dim: int) -> int:
 
 def baseline_parameter_count(
         algorithm: str, state_dim: int, action_dim: int,
-        goal_dim: int, *, model_size_level: str = MODEL_SIZE_LEVEL) -> int:
+        goal_dim: int, *, model_size_level: str = MODEL_SIZE_LEVEL,
+        gcsl_action_discretization: str = 'joint') -> int:
     family = MODEL_SIZE_FAMILIES.get(algorithm)
     if family is None:
         raise ValueError(f'Unknown algorithm: {algorithm!r}')
@@ -108,7 +109,15 @@ def baseline_parameter_count(
             + _mlp_parameters(goal_dim, hidden, representation_dim)
         )
     if algorithm == 'gcsl':
-        action_output_dim = 3 ** action_dim
+        if gcsl_action_discretization == 'joint':
+            action_output_dim = source_conf.action_granularity ** action_dim
+        elif gcsl_action_discretization == 'factorized':
+            action_output_dim = source_conf.action_granularity * action_dim
+        else:
+            raise ValueError(
+                'gcsl_action_discretization must be "joint" or '
+                f'"factorized", got {gcsl_action_discretization!r}'
+            )
         return _mlp_parameters(
             state_dim + goal_dim, hidden, action_output_dim,
         )

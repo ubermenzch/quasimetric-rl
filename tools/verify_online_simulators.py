@@ -22,7 +22,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--suite',
-        choices=('all', 'dmc', 'gym-mujoco', 'online-maze'),
+        choices=(
+            'all', 'dmc', 'gym-mujoco', 'gymnasium-robotics',
+            'online-maze', 'panda-gym',
+        ),
         default='all',
         help='Limit verification to one simulator family.',
     )
@@ -139,6 +142,34 @@ def main() -> None:
                 'online_maze', name, create_maze_env,
                 expected_backend=spec['backend_id'],
             )
+
+    if args.suite in ('all', 'gymnasium-robotics'):
+        print(
+            f'gymnasium={package_version("gymnasium", "1.0.0")}, '
+            'gymnasium-robotics='
+            f'{package_version("gymnasium-robotics", "1.3.1")}, '
+            f'mujoco={package_version("mujoco", "2.3.6")}'
+        )
+        from quasimetric_rl.data.online.gymnasium_robotics import (
+            TASK_SPECS as robotics_tasks,
+            create_env_from_spec as create_robotics_env,
+        )
+        for name in robotics_tasks:
+            smoke_environment(
+                'gymnasium_robotics', name, create_robotics_env,
+            )
+
+    if args.suite in ('all', 'panda-gym'):
+        print(
+            f'gymnasium={package_version("gymnasium", "1.0.0")}, '
+            f'panda-gym={package_version("panda-gym", "3.0.7")}'
+        )
+        from quasimetric_rl.data.online.panda_gym import (
+            TASK_SPECS as panda_tasks,
+            create_env_from_spec as create_panda_env,
+        )
+        for name in panda_tasks:
+            smoke_environment('panda_gym', name, create_panda_env)
 
     print('Online simulator verification passed.')
 

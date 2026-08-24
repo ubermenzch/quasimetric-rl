@@ -240,6 +240,8 @@ class QRLConf:
                 'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L', 'GO-QRL-L-Residual',
                 'GO-QRL-XL',
                 'GO-QRL-XXL', 'GO-QRL-XXXL',
+                'CQRL-S', 'CQRL-M', 'CQRL-L', 'CQRL-L-Residual',
+                'CQRL-XL', 'CQRL-XXL', 'CQRL-XXXL',
                 'TD-InfoNCE-M', 'TD-InfoNCE-L',
                 'CRL-M', 'CRL-L',
                 'GCSL-M', 'GCSL-L', 'GCSL-L-Pusher',

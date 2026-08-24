@@ -448,14 +448,9 @@ install_online_simulators() {
         exit 1
     fi
     echo "Installing or repairing the pinned local online simulator stack."
-    # The source server uses Gym 0.18 legacy MuJoCo backends. Their dynamics
-    # differ from Gymnasium v4, so remove packages that would make the adapter
-    # silently select another backend.
-    if "${VENV_PYTHON}" -m pip show gymnasium >/dev/null 2>&1 || \
-            "${VENV_PYTHON}" -m pip show gymnasium-robotics >/dev/null 2>&1; then
-        echo "Removing Gymnasium packages to match the source server backends."
-        "${VENV_PYTHON}" -m pip uninstall --yes gymnasium gymnasium-robotics
-    fi
+    # Gym 0.18 and Gymnasium are separate packages and intentionally coexist.
+    # The legacy Reacher/Pusher/Ant adapter pins its Gym backend explicitly;
+    # Gymnasium is used only by the Robotics and Panda adapters.
     "${VENV_PYTHON}" -m pip install \
         --retries "${PIP_RETRIES}" --prefer-binary \
         -r "${requirements_file}"

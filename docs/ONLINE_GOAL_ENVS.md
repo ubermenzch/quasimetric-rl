@@ -1,9 +1,19 @@
 # Additional online goal environments
 
+The DMC, Shadow Hand, Gymnasium maze, and Panda-Gym extension is catalogued in
+[`EXTENDED_ONLINE_TASKS.md`](EXTENDED_ONLINE_TASKS.md). This document retains
+the original online protocol and its previously generated experiment matrices.
+
+For the extended DMC adapters, point-mass and dog fetch use fixed backend
+world-frame targets, and ball-in-cup uses a fixed zero goal in the moving cup
+frame. Stacker selects the box nearest the fixed episode target as its achieved
+goal and uses repository-defined `reward >= 0.95` success semantics because
+dm_control does not expose a native binary success signal for that task.
+
 The online replay collector requires fixed-length episodes and dictionary
 observations with same-shaped `observation`, `achieved_goal`, and
 `desired_goal` tensors. The environments below provide that interface and can
-be used by both QRL and vector-observation GO-QRL agents.
+be used by both QRL and vector-observation CQRL agents.
 
 | Kind | Name | Horizon | Success dimensions | Backend |
 | --- | --- | ---: | --- | --- |

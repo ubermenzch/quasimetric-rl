@@ -5,9 +5,16 @@ from tools.generate_online_go_qrl_ablation_tasks import (
     COMMON_ARGS,
     ENVIRONMENTS,
     PARTITION_GROUPS,
+    TABLE_ENVIRONMENTS,
+    TABLE_REMOTE_GROUPS,
     TRAINING_SEEDS,
+    VARIANTS,
     generate_all_tasks,
+    generate_table_tasks,
+    partition_table_tasks,
     partition_tasks,
+    table_task_group,
+    table_task_variant,
     task_variant,
 )
 
@@ -59,6 +66,94 @@ class OnlineGOQRLAblationTaskGeneratorTest(unittest.TestCase):
             )
             self.assertIn(
                 'agent.actor.losses.min_dist.latent_goal_mode=min', args,
+            )
+
+    def test_table_matrix_covers_all_eight_columns_for_every_variant(self):
+        tasks = generate_table_tasks()
+        self.assertEqual(
+            len(tasks), len(VARIANTS) * len(TABLE_ENVIRONMENTS) * len(TRAINING_SEEDS),
+        )
+        self.assertEqual(len({task.task_id for task in tasks}), len(tasks))
+        for variant, mode, inner_steps in VARIANTS:
+            variant_tasks = [
+                task for task in tasks if table_task_variant(task) == variant
+            ]
+            self.assertEqual(
+                len(variant_tasks), len(TABLE_ENVIRONMENTS) * len(TRAINING_SEEDS),
+            )
+            for environment in TABLE_ENVIRONMENTS:
+                group = [
+                    task for task in variant_tasks
+                    if task.env_name == environment.name
+                    and task.steps == str(environment.total_steps)
+                    and environment.slug in task.task_id
+                ]
+                self.assertEqual(len(group), len(TRAINING_SEEDS))
+                for task in group:
+                    args = task.extra_args.split()
+                    self.assertIn(
+                        f'+go_qrl_model_size={environment.model_size}', args,
+                    )
+                    self.assertIn(
+                        'agent.actor.losses.min_dist.latent_goal_mode='
+                        f'{mode}', args,
+                    )
+                    self.assertIn(
+                        'agent.actor.losses.min_dist.latent_goal_steps='
+                        f'{inner_steps}', args,
+                    )
+
+    def test_table_keeps_distinct_reacher_budgets_and_model_scales(self):
+        tasks = generate_table_tasks()
+        reacher = [task for task in tasks if task.env_name == 'reacher_hard']
+        self.assertEqual(len(reacher), len(VARIANTS) * 2 * len(TRAINING_SEEDS))
+        self.assertEqual(
+            {task.steps for task in reacher}, {'100000', '200000'},
+        )
+        self.assertTrue(any(
+            '+go_qrl_model_size=l' in task.extra_args
+            for task in tasks if task.env_name == 'FetchSlide'
+        ))
+        self.assertTrue(any(
+            '+go_qrl_model_size=l' in task.extra_args
+            for task in tasks if task.env_name == 'Pusher-v4'
+        ))
+        self.assertTrue(any(
+            '+go_qrl_model_size=l' in task.extra_args
+            for task in tasks if task.env_name == 'AntNavigate-v4'
+        ))
+
+    def test_table_partitions_are_disjoint_balanced_and_complete(self):
+        all_tasks = generate_table_tasks()
+        local = partition_table_tasks(all_tasks, 'local_2x')
+        remote = partition_table_tasks(all_tasks, 'remote_1x')
+        self.assertEqual((len(local), len(remote)), (135, 65))
+        local_ids = {task.task_id for task in local}
+        remote_ids = {task.task_id for task in remote}
+        self.assertFalse(local_ids & remote_ids)
+        self.assertEqual(
+            local_ids | remote_ids,
+            {task.task_id for task in all_tasks},
+        )
+        self.assertEqual(
+            {table_task_group(task) for task in remote},
+            TABLE_REMOTE_GROUPS,
+        )
+        self.assertEqual(
+            sum(int(task.steps) for task in local), 38_000_000,
+        )
+        self.assertEqual(
+            sum(int(task.steps) for task in remote), 19_500_000,
+        )
+        for tasks in (local, remote):
+            self.assertEqual(
+                {table_task_variant(task) for task in tasks},
+                {variant for variant, _mode, _steps in VARIANTS},
+            )
+            self.assertEqual(
+                {(task.env_name, task.steps) for task in tasks},
+                {(environment.name, str(environment.total_steps))
+                 for environment in TABLE_ENVIRONMENTS},
             )
 
 

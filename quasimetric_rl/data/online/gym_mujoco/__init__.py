@@ -36,20 +36,20 @@ def _make_backend(name: str):
         )
         legacy_kwargs = modern_kwargs
 
+    # Existing experiments were run with these pinned Gym 0.18 backends. Keep
+    # that protocol even when Gymnasium is installed for other environment
+    # families, and use the modern implementation only as a fallback.
     try:
-        import gymnasium
-    except ImportError:
-        gymnasium = None
-    if gymnasium is not None:
+        return gym.make(spec['legacy_id'], **legacy_kwargs), spec['legacy_id']
+    except Exception as legacy_exc:
         try:
+            import gymnasium
             return gymnasium.make(modern_id, **modern_kwargs), modern_id
-        except Exception as exc:
-            logging.warning(
-                'Could not create Gymnasium %s (%s); falling back to Gym %s',
-                modern_id, exc, spec['legacy_id'],
-            )
-
-    return gym.make(spec['legacy_id'], **legacy_kwargs), spec['legacy_id']
+        except Exception as modern_exc:
+            raise RuntimeError(
+                f'Could not create legacy {spec["legacy_id"]!r} '
+                f'({legacy_exc}) or modern {modern_id!r} ({modern_exc})'
+            ) from modern_exc
 
 
 class GymMujocoGoalEnv(gym.Env):

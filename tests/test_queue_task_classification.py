@@ -333,6 +333,7 @@ class QueueTaskClassificationTest(unittest.TestCase):
             steps="200000",
         )
         for group in (
+            "+cqrl_model_size=m",
             "+go_qrl_model_size=m",
             "+qrl_model_size=m",
             "+base_model_size=m",
@@ -352,6 +353,62 @@ class QueueTaskClassificationTest(unittest.TestCase):
         )
 
         self.assertEqual(task_critic_count(task), "2")
+
+    def test_cqrl_model_sizes_and_inner_steps_have_public_monitor_labels(self):
+        common = dict(
+            mode="online",
+            env_name="point_mass_easy",
+            seed="1000",
+        )
+        for size in ("m", "l"):
+            for inner_steps in (0, 1, 4, 8):
+                with self.subTest(size=size, inner_steps=inner_steps):
+                    task = WatcherTask(
+                        task_id=(
+                            f"extended_v1_CQRL-Inner{inner_steps}-"
+                            f"{size.upper()}_point_mass_easy_online_s1000"
+                        ),
+                        steps="200000" if size == "m" else "500000",
+                        extra_args=(
+                            f"+cqrl_model_size={size} "
+                            "agent.actor.losses.min_dist.latent_goal_mode=max "
+                            "agent.actor.losses.min_dist.latent_goal_steps="
+                            f"{inner_steps}"
+                        ),
+                        **common,
+                    )
+                    self.assertEqual(
+                        task_variant(task), f"CQRL+Inner{inner_steps}"
+                    )
+                    self.assertEqual(task_critic_count(task), "1")
+
+    def test_cqrl_task_id_is_recognized_without_expanded_preset_arguments(self):
+        task = WatcherTask(
+            task_id=(
+                "extended_v1_CQRL-Inner4-M_point_mass_easy_online_s1000"
+            ),
+            mode="online",
+            env_name="point_mass_easy",
+            seed="1000",
+            steps="200000",
+            extra_args="+cqrl_model_size=m",
+        )
+
+        self.assertEqual(task_variant(task), "CQRL+Inner4")
+        self.assertEqual(task_critic_count(task), "1")
+
+    def test_plain_qrl_model_size_is_not_classified_as_cqrl(self):
+        task = WatcherTask(
+            task_id="extended_v1_QRL-M_point_mass_easy_online_s1000",
+            mode="online",
+            env_name="point_mass_easy",
+            seed="1000",
+            steps="200000",
+            extra_args="+qrl_model_size=m",
+        )
+
+        self.assertEqual(task_variant(task), "Base")
+        self.assertEqual(task_critic_count(task), "1")
 
     def test_explicit_critic_count_overrides_model_size_preset(self):
         task = WatcherTask(

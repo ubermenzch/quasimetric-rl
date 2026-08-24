@@ -102,7 +102,7 @@ class QueueNotificationsTest(unittest.TestCase):
 
             self.assertEqual(send.call_count, 2)
 
-    def test_pending_backlog_drain_notifies_once_and_rearms(self):
+    def test_running_tasks_do_not_trigger_default_completion_notification(self):
         with TemporaryDirectory() as directory:
             status_dir = Path(directory)
             config = {"NTFY_TOPIC_URL": "https://ntfy.sh/private-topic"}
@@ -121,25 +121,21 @@ class QueueNotificationsTest(unittest.TestCase):
                 notify_queue_events(
                     config, [self.task], status_dir, queue_terminal=False
                 )
-                write_status(status_dir, self.task, "PENDING")
+                write_status(status_dir, self.task, "DONE")
                 notify_queue_events(
-                    config, [self.task], status_dir, queue_terminal=False
-                )
-                write_status(status_dir, self.task, "RUNNING")
-                notify_queue_events(
-                    config, [self.task], status_dir, queue_terminal=False
+                    config, [self.task], status_dir, queue_terminal=True
                 )
 
-            self.assertEqual(send.call_count, 2)
-            for call in send.call_args_list:
-                self.assertEqual(call.args[1], "QRL no schedulable tasks")
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[1], "QRL queue completed")
 
-    def test_same_cycle_pending_drain_is_observed(self):
+    def test_optional_pending_drain_notification_remains_available(self):
         with TemporaryDirectory() as directory:
             status_dir = Path(directory)
             config = {
                 "NTFY_TOPIC_URL": "https://ntfy.sh/private-topic",
                 "NOTIFY_HOST_LABEL": "L40",
+                "NOTIFY_NO_PENDING": "1",
             }
             write_status(status_dir, self.task, "RUNNING")
 
@@ -210,19 +206,26 @@ class QueueNotificationsTest(unittest.TestCase):
                     queue_terminal=True,
                 )
 
-            send.assert_called_once()
-            title = send.call_args.args[1]
-            message = send.call_args.args[2]
+            self.assertEqual(send.call_count, 2)
+            title = send.call_args_list[0].args[1]
+            message = send.call_args_list[0].args[2]
             self.assertEqual(title, "QRL task errors/issues (2)")
             self.assertIn("notification_task", message)
             self.assertIn("second_notification_task", message)
             self.assertIn("Exit code: 1", message)
             self.assertIn("CUDA failure detail", message)
+            self.assertEqual(
+                send.call_args_list[1].args[1],
+                "QRL queue finished with issues",
+            )
 
     def test_pending_drain_delivery_failure_remains_armed(self):
         with TemporaryDirectory() as directory:
             status_dir = Path(directory)
-            config = {"NTFY_TOPIC_URL": "https://ntfy.sh/private-topic"}
+            config = {
+                "NTFY_TOPIC_URL": "https://ntfy.sh/private-topic",
+                "NOTIFY_NO_PENDING": "1",
+            }
             write_status(status_dir, self.task, "PENDING")
             notify_queue_events(
                 config, [self.task], status_dir, queue_terminal=False

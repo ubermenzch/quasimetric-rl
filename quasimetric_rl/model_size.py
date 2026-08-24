@@ -38,17 +38,25 @@ def model_size_path(family: str, level: str) -> Path:
     family = family.lower().replace('-', '_')
     if family == 'base':
         family = 'qrl'
+    elif family == 'cqrl':
+        # CQRL is the public algorithm name. Keep the existing directory as a
+        # checkpoint/config compatibility detail.
+        family = 'go_qrl'
     return MODEL_SIZE_ROOT / family / f'{level.lower()}.yaml'
 
 
 def load_model_size_preset(family: str, level: str) -> DictConfig:
+    requested_family = family.lower().replace('-', '_')
     path = model_size_path(family, level)
     if not path.is_file():
         raise ValueError(
             f'Unknown {family!r} model-size level {level!r}; '
             f'expected a preset at {path}'
         )
-    return OmegaConf.load(path)
+    preset = OmegaConf.load(path)
+    if requested_family == 'cqrl' and preset.get('model_size') is not None:
+        preset.model_size = str(preset.model_size).replace('GO-QRL', 'CQRL')
+    return preset
 
 
 def register_model_size_presets(config_store) -> None:
@@ -57,9 +65,15 @@ def register_model_size_presets(config_store) -> None:
         groups = [f'{family_dir.name}_model_size']
         if family_dir.name == 'qrl':
             groups.append('base_model_size')
+        elif family_dir.name == 'go_qrl':
+            groups.append('cqrl_model_size')
         for path in sorted(family_dir.glob('*.yaml')):
-            node = OmegaConf.load(path)
             for group in groups:
+                node = OmegaConf.load(path)
+                if group == 'cqrl_model_size':
+                    node.model_size = str(node.model_size).replace(
+                        'GO-QRL', 'CQRL',
+                    )
                 config_store.store(
                     group=group,
                     name=path.stem,

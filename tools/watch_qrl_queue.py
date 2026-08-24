@@ -682,6 +682,7 @@ def task_critic_count(task: Task) -> str:
     if value:
         return value
     for group, family in (
+        ("+cqrl_model_size", "go_qrl"),
         ("+go_qrl_model_size", "go_qrl"),
         ("+qrl_model_size", "qrl"),
         ("+base_model_size", "base"),
@@ -872,12 +873,20 @@ def task_variant(task: Task) -> str:
         task.extra_args,
         "agent.quasimetric_critic.model.dynamics_output_normalization",
     )
+    cqrl_model_size = extra_arg_value(task.extra_args, "+cqrl_model_size")
+    named_cqrl_variant = re.search(
+        r"(?:^|_)CQRL(?:\+|-)Inner(\d+)(?:_|-|\+|$)",
+        task.task_id,
+        re.IGNORECASE,
+    )
+    is_cqrl = bool(cqrl_model_size or named_cqrl_variant)
     named_latent_variant = re.search(
         r"_(GO-QRL(?:\+|-)(?:Max|Min)\d+|SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|-|\+|$)",
         task.task_id,
     )
     if not encoder_kind and (
-        extra_arg_value(task.extra_args, "+go_qrl_model_size")
+        is_cqrl
+        or extra_arg_value(task.extra_args, "+go_qrl_model_size")
         or (
             named_latent_variant
             and named_latent_variant.group(1).startswith("GO-QRL")
@@ -889,12 +898,19 @@ def task_variant(task: Task) -> str:
             latent_goal_steps = extra_arg_value(
                 task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
             )
-            mode_label = (
-                "Inner0"
-                if latent_goal_steps == "0"
-                else f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
-            )
-            modules = ["GO-QRL", mode_label]
+            if is_cqrl:
+                if not latent_goal_steps and named_cqrl_variant:
+                    latent_goal_steps = named_cqrl_variant.group(1)
+                modules = ["CQRL"]
+                if latent_goal_steps:
+                    modules.append(f"Inner{latent_goal_steps}")
+            else:
+                mode_label = (
+                    "Inner0"
+                    if latent_goal_steps == "0"
+                    else f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
+                )
+                modules = ["GO-QRL", mode_label]
             if latent_goal_search == "residual":
                 modules.append("Res")
             if branch_normalization == "layernorm":
@@ -904,6 +920,10 @@ def task_variant(task: Task) -> str:
             if latent_goal_optim == "rmsg":
                 modules.append("RMSG")
             variant = "+".join(modules)
+        elif is_cqrl:
+            variant = "CQRL"
+            if named_cqrl_variant:
+                variant += f"+Inner{named_cqrl_variant.group(1)}"
         elif named_latent_variant and (
                 named_latent_variant.group(1).startswith("SplitLatent")
                 or named_latent_variant.group(1).startswith("GO-QRL")):

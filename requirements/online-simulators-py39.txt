@@ -3,3 +3,13 @@
 # metadata conflicts with the pinned binary Pillow wheel.
 
 -r offline-py39.txt
+
+# Gymnasium coexists with the pinned Gym 0.18 stack. The legacy Gym MuJoCo
+# adapter explicitly prefers its original backend, while the environments
+# below use the maintained Gymnasium API and MuJoCo bindings.
+Farama-Notifications==0.0.4
+Jinja2==3.1.6
+PettingZoo==1.24.3
+gymnasium==1.0.0
+gymnasium-robotics==1.3.1
+panda-gym==3.0.7

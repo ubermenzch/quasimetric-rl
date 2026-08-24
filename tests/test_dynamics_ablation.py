@@ -1,3 +1,4 @@
+import copy
 import unittest
 
 import gym
@@ -45,7 +46,9 @@ def batch_data(batch_size: int = 8) -> BatchData:
 
 
 def make_critic(projector_activation: str = 'relu') -> QuasimetricCritic:
-    conf = QuasimetricCritic.Conf()
+    # Nested attrs configuration defaults are shared objects. Keep this helper
+    # from leaking activation changes into model-size tests in the same process.
+    conf = copy.deepcopy(QuasimetricCritic.Conf())
     conf.encoder.arch = (8,)
     conf.encoder.latent_size = 4
     conf.quasimetric_model.projector_arch = (8,)

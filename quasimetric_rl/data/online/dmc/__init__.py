@@ -12,6 +12,14 @@ from ..memory import register_online_env
 TASK_SPECS = {
     'reacher_easy': dict(domain='reacher', task='easy', goal_dims=(0, 1)),
     'reacher_hard': dict(domain='reacher', task='hard', goal_dims=(0, 1)),
+    'point_mass_easy': dict(
+        domain='point_mass', task='easy', goal_dims=(0, 1),
+        state_dim=4, action_dim=2,
+    ),
+    'finger_turn_easy': dict(
+        domain='finger', task='turn_easy', goal_dims=(0, 1),
+        state_dim=9, action_dim=2,
+    ),
     'swimmer6': dict(domain='swimmer', task='swimmer6', goal_dims=(0, 1)),
     'swimmer15': dict(domain='swimmer', task='swimmer15', goal_dims=(0, 1)),
     'quadruped_fetch': dict(
@@ -22,6 +30,26 @@ TASK_SPECS = {
     ),
     'manipulator_bring_peg': dict(
         domain='manipulator', task='bring_peg', goal_dims=(0, 1, 2, 3),
+    ),
+    'manipulator_insert_ball': dict(
+        domain='manipulator', task='insert_ball', goal_dims=(0, 1),
+        state_dim=40, action_dim=5,
+    ),
+    'manipulator_insert_peg': dict(
+        domain='manipulator', task='insert_peg', goal_dims=(0, 1, 2, 3),
+        state_dim=40, action_dim=5,
+    ),
+    'dog_fetch': dict(
+        domain='dog', task='fetch', goal_dims=(0, 1, 2),
+        state_dim=210, action_dim=38,
+    ),
+    'stacker_stack_2': dict(
+        domain='stacker', task='stack_2', goal_dims=(0, 1), n_boxes=2,
+        state_dim=49, action_dim=5,
+    ),
+    'ball_in_cup_catch': dict(
+        domain='ball_in_cup', task='catch', goal_dims=(0, 1),
+        state_dim=8, action_dim=2,
     ),
 }
 
@@ -65,6 +93,20 @@ class DMCGoalEnv(gym.Env):
             self.action_space.seed(seed)
         timestep = self._env.reset()
         state, goal_values = self._state_and_goal(timestep.observation)
+        expected_state_dim = self.task_spec.get('state_dim')
+        expected_action_dim = self.task_spec.get('action_dim')
+        if expected_state_dim is not None and state.shape != (expected_state_dim,):
+            raise RuntimeError(
+                f'{self.name} state contract changed: expected '
+                f'{expected_state_dim}, got {state.shape}'
+            )
+        if (
+                expected_action_dim is not None
+                and self.action_space.shape != (expected_action_dim,)):
+            raise RuntimeError(
+                f'{self.name} action contract changed: expected '
+                f'{expected_action_dim}, got {self.action_space.shape}'
+            )
         self.observation_space = vector_goal_observation_space(state.size)
         self._goal_values = goal_values
         self._elapsed_steps = 0
@@ -86,6 +128,32 @@ class DMCGoalEnv(gym.Env):
                 np.asarray(observation['position']).reshape(-1),
                 np.asarray(observation['velocity']).reshape(-1),
             ])
+            return state.astype(np.float32), target
+
+        if domain == 'point_mass':
+            target = np.asarray(
+                self._env.physics.named.data.geom_xpos['target', :2],
+                dtype=np.float32,
+            )
+            state = np.concatenate([
+                np.asarray(observation['position']).reshape(-1),
+                np.asarray(observation['velocity']).reshape(-1),
+            ])
+            return state.astype(np.float32), target
+
+        if domain == 'finger':
+            position = np.asarray(observation['position']).reshape(-1)
+            # bounded_position stores the spinner tip (x, z) last. Move it to
+            # the front so the task coordinates agree with goal_dims.
+            state = np.concatenate([
+                position[-2:],
+                position[:-2],
+                np.asarray(observation['velocity']).reshape(-1),
+                np.asarray(observation['touch']).reshape(-1),
+            ])
+            target = np.asarray(
+                observation['target_position'], dtype=np.float32,
+            ).reshape(-1)
             return state.astype(np.float32), target
 
         if domain == 'swimmer':
@@ -121,16 +189,120 @@ class DMCGoalEnv(gym.Env):
             ])
             return state.astype(np.float32), target
 
-        object_pose = np.asarray(observation['object_pos']).reshape(-1)
-        target_pose = np.asarray(observation['target_pos']).reshape(-1)
-        state_parts = [object_pose]
-        for key in (
-                'arm_pos', 'arm_vel', 'touch', 'hand_pos', 'object_vel'):
-            state_parts.append(np.asarray(observation[key]).reshape(-1))
-        return (
-            np.concatenate(state_parts).astype(np.float32),
-            target_pose[list(self.goal_dims)].astype(np.float32),
-        )
+        if domain == 'manipulator':
+            object_pose = np.asarray(observation['object_pos']).reshape(-1)
+            target_pose = np.asarray(observation['target_pos']).reshape(-1)
+            state_parts = [object_pose]
+            for key in (
+                    'arm_pos', 'arm_vel', 'touch', 'hand_pos', 'object_vel'):
+                state_parts.append(np.asarray(observation[key]).reshape(-1))
+            return (
+                np.concatenate(state_parts).astype(np.float32),
+                target_pose[list(self.goal_dims)].astype(np.float32),
+            )
+
+        if domain == 'dog':
+            physics = self._env.physics
+            ball = np.asarray(
+                physics.named.data.geom_xpos['ball'], dtype=np.float32,
+            ).reshape(-1)
+            target = np.asarray(
+                physics.named.data.geom_xpos['target'], dtype=np.float32,
+            ).reshape(-1)
+            qpos = np.asarray(physics.data.qpos).reshape(-1)
+            ball_qpos_address = int(
+                physics.named.model.jnt_qposadr['ball_root']
+            )
+            if not 0 <= ball_qpos_address <= qpos.size - 7:
+                raise RuntimeError(
+                    'dog_fetch ball_root must address a seven-coordinate '
+                    f'free joint, got qpos address {ball_qpos_address} for '
+                    f'{qpos.size} coordinates'
+                )
+            ball_qpos = qpos[ball_qpos_address:ball_qpos_address + 3]
+            if not np.allclose(ball_qpos, ball, rtol=0, atol=1e-6):
+                raise RuntimeError(
+                    'dog_fetch ball_root qpos XYZ disagrees with ball geom '
+                    f'position: {ball_qpos} != {ball}'
+                )
+            qpos_without_ball_xyz = np.concatenate([
+                qpos[:ball_qpos_address],
+                qpos[ball_qpos_address + 3:],
+            ])
+            # The goal prefix already contains the ball translation. Remove
+            # that duplicate from qpos while retaining its quaternion, all
+            # other qpos, and the activation dynamics needed for Markov state.
+            state = np.concatenate([
+                ball,
+                qpos_without_ball_xyz,
+                np.asarray(physics.data.qvel).reshape(-1),
+                np.asarray(physics.data.act).reshape(-1),
+            ])
+            return state.astype(np.float32), target
+
+        if domain == 'stacker':
+            boxes = np.asarray(observation['box_pos']).reshape(
+                self.task_spec['n_boxes'], -1,
+            )
+            target = np.asarray(observation['target_pos']).reshape(-1)
+            closest = int(np.argmin(np.linalg.norm(
+                boxes[:, :2] - target[None, :], axis=1,
+            )))
+            # The native task accepts any box at the target. The nearest box
+            # supplies the achieved goal while all box states remain visible.
+            state_parts = [boxes[closest, :2]]
+            for key in (
+                    'arm_pos', 'arm_vel', 'touch', 'hand_pos',
+                    'box_pos', 'box_vel'):
+                state_parts.append(np.asarray(observation[key]).reshape(-1))
+            return (
+                np.concatenate(state_parts).astype(np.float32),
+                target.astype(np.float32),
+            )
+
+        if domain == 'ball_in_cup':
+            physics = self._env.physics
+            position = np.asarray(observation['position']).reshape(-1)
+            ball_from_target = -np.asarray(
+                physics.ball_to_target(), dtype=np.float32,
+            ).reshape(-1)
+            # The cup target moves with the controlled cup. Expressing the
+            # task in the cup frame gives a fixed zero goal. Cup position and
+            # all velocities retain a Markov state without duplicating ball
+            # position coordinates.
+            state = np.concatenate([
+                ball_from_target,
+                position[:2],
+                np.asarray(observation['velocity']).reshape(-1),
+            ])
+            return state.astype(np.float32), np.zeros(2, dtype=np.float32)
+
+        raise RuntimeError(f'Unsupported dm_control domain: {domain!r}')
+
+    def _is_success(self, reward: float, distance: float) -> bool:
+        domain = self.task_spec['domain']
+        physics = self._env.physics
+        if domain == 'point_mass':
+            radius = float(physics.named.model.geom_size['target', 0])
+            return distance <= radius
+        if domain == 'finger':
+            return bool(physics.dist_to_target() <= 0)
+        if domain == 'swimmer':
+            radius = float(physics.named.model.geom_size['target', 0])
+            return distance <= radius
+        if domain == 'quadruped':
+            radius = float(physics.named.model.site_size['target', 0])
+            return distance <= radius
+        if domain == 'dog':
+            radius = float(physics.named.model.geom_size['target', 0])
+            return distance <= radius
+        if domain == 'stacker':
+            # dm_control exposes only a shaped reward for stacker. A 0.95
+            # threshold is an explicit binary evaluation convention.
+            return reward >= 0.95
+        if domain == 'ball_in_cup':
+            return bool(physics.in_target())
+        return reward >= 1.0 - 1e-7
 
     def _pack(self, state):
         return pack_goal_observation(state, self._goal_values, self.goal_dims)
@@ -165,19 +337,7 @@ class DMCGoalEnv(gym.Env):
         distance = float(np.linalg.norm(
             state[list(self.goal_dims)] - self._goal_values
         ))
-        domain = self.task_spec['domain']
-        if domain == 'swimmer':
-            success_radius = float(
-                self._env.physics.named.model.geom_size['target', 0]
-            )
-            is_success = distance <= success_radius
-        elif domain == 'quadruped':
-            success_radius = float(
-                self._env.physics.named.model.site_size['target', 0]
-            )
-            is_success = distance <= success_radius
-        else:
-            is_success = reward >= 1.0 - 1e-7
+        is_success = self._is_success(reward, distance)
         timeout = bool(timestep.last()) or self._elapsed_steps == self.episode_length
         if timeout and self._elapsed_steps != self.episode_length:
             raise RuntimeError(
@@ -207,6 +367,7 @@ for task_name in TASK_SPECS:
         'dmc', task_name,
         create_env_fn=lambda task_name=task_name: create_env_from_spec(task_name),
         episode_length=DMC_EPISODE_LENGTH,
+        goal_dims=TASK_SPECS[task_name]['goal_dims'],
     )
 
 

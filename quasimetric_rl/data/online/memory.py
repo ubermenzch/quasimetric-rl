@@ -15,7 +15,7 @@ from quasimetric_rl.data.env_spec import EnvSpec
 from .. import EnvSpec
 from ..base import (
     EpisodeData, MultiEpisodeData, Dataset, BatchData,
-    register_offline_env,
+    GOAL_SET_DIMS_REGISTRY, register_offline_env,
 )
 from .utils import get_empty_episode, get_empty_episodes
 
@@ -77,16 +77,35 @@ def load_episode_error():
 
 def register_online_env(kind: str, spec: str, *,
                  load_episodes_fn=load_episode_error,
-                 create_env_fn, episode_length: int):
+                 create_env_fn, episode_length: int,
+                 goal_dims: Optional[Sequence[int]] = None):
     r"""
     Similar to `register_offline_env`, but
       1. has a default `load_episodes_fn` that errors out.
       2. requires each episode to have a fixed length specified by `episode_length`.
     """
+    normalized_goal_dims = None
+    if goal_dims is not None:
+        normalized_goal_dims = tuple(int(dim) for dim in goal_dims)
+        if not normalized_goal_dims:
+            raise ValueError(f'{kind}/{spec} must define at least one goal dimension')
+        if len(set(normalized_goal_dims)) != len(normalized_goal_dims):
+            raise ValueError(f'{kind}/{spec} has duplicate goal dimensions')
+        if min(normalized_goal_dims) < 0:
+            raise ValueError(f'{kind}/{spec} has a negative goal dimension')
+
     register_offline_env(
         kind, spec,
         load_episodes_fn=load_episodes_fn,
         create_env_fn=lambda: FixedLengthEnvWrapper(create_env_fn(), episode_length))
+    if normalized_goal_dims is not None:
+        existing = GOAL_SET_DIMS_REGISTRY.get((kind, spec))
+        if existing is not None and tuple(existing) != normalized_goal_dims:
+            raise ValueError(
+                f'{kind}/{spec} goal dimensions disagree with the existing '
+                f'registration: {existing} != {normalized_goal_dims}'
+            )
+        GOAL_SET_DIMS_REGISTRY[(kind, spec)] = normalized_goal_dims
 
 
 class ReplayBuffer(Dataset):
@@ -475,4 +494,11 @@ class ReplayBuffer(Dataset):
         return '\n'.join(lines)
 
 
-from . import dmc, gcrl, gym_mujoco, maze2d  # register
+from . import (  # register
+    dmc,
+    gcrl,
+    gym_mujoco,
+    gymnasium_robotics,
+    maze2d,
+    panda_gym,
+)

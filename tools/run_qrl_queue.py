@@ -16,7 +16,9 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -49,6 +51,7 @@ NOTIFICATION_STATE_VERSION = 1
 DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG = (
     "queue.delete_checkpoints_after_completion"
 )
+REMOTE_SYNC_MARKER_NAME = ".qrl_remote_sync.json"
 
 
 @dataclass
@@ -549,7 +552,7 @@ def notify_queue_events(
     hostname = notification_host_label(config)
 
     if current_pending == 0 and pending_present:
-        if notification_enabled(config, "NO_PENDING", "1"):
+        if notification_enabled(config, "NO_PENDING", "0"):
             counts = {
                 state: sum(
                     status.get("state", "PENDING") == state
@@ -670,7 +673,7 @@ def notify_queue_events(
 
     if tasks and queue_terminal:
         event = queue_notification_event(tasks, statuses)
-        notify_queue_done = notification_enabled(config, "QUEUE_DONE", "0")
+        notify_queue_done = notification_enabled(config, "QUEUE_DONE", "1")
         if not notify_queue_done and event not in events:
             events.add(event)
             changed = True
@@ -1209,6 +1212,177 @@ def task_output_dir(config: dict[str, str], task: Task) -> Path:
     return results_root(config) / task.task_id
 
 
+def remote_results_sync_enabled(config: dict[str, str]) -> bool:
+    return as_bool(cfg(config, "REMOTE_RESULTS_SYNC_ENABLED", "0"))
+
+
+def remote_results_sync_baseline(config: dict[str, str]) -> set[str]:
+    configured = cfg(config, "REMOTE_RESULTS_SYNC_BASELINE_FILE", "").strip()
+    if not configured:
+        raise ValueError(
+            "REMOTE_RESULTS_SYNC_BASELINE_FILE is required when remote sync is enabled"
+        )
+    path = resolve_path(configured)
+    if not path.is_file():
+        raise FileNotFoundError(f"Remote-sync baseline does not exist: {path}")
+    task_ids = set()
+    for raw_line in path.read_text(errors="replace").splitlines():
+        task_id = raw_line.strip()
+        if not task_id or task_id.startswith("#"):
+            continue
+        if "/" in task_id or "\\" in task_id:
+            raise ValueError(f"Invalid task ID in remote-sync baseline: {task_id!r}")
+        task_ids.add(task_id)
+    return task_ids
+
+
+def remote_result_sync_marker(output_dir: Path) -> Path:
+    return output_dir / REMOTE_SYNC_MARKER_NAME
+
+
+def remote_result_sync_eligible(
+    task: Task,
+    status: dict[str, str],
+    output_dir: Path,
+    baseline_task_ids: set[str],
+) -> bool:
+    return bool(
+        status.get("state") == "DONE"
+        and task.task_id not in baseline_task_ids
+        and (output_dir / "COMPLETE").is_file()
+        and not remote_result_sync_marker(output_dir).is_file()
+    )
+
+
+def remote_results_ssh_args(config: dict[str, str]) -> tuple[list[str], str]:
+    key = resolve_path(cfg(config, "REMOTE_RESULTS_SYNC_KEY", ""))
+    known_hosts = resolve_path(
+        cfg(config, "REMOTE_RESULTS_SYNC_KNOWN_HOSTS", "")
+    )
+    if not key.is_file():
+        raise FileNotFoundError(f"Remote-sync SSH key does not exist: {key}")
+    if not known_hosts.is_file():
+        raise FileNotFoundError(
+            f"Remote-sync known-hosts file does not exist: {known_hosts}"
+        )
+    port = str(as_int(cfg(config, "REMOTE_RESULTS_SYNC_PORT", "22"), 22))
+    args = [
+        "ssh",
+        "-p", port,
+        "-i", str(key),
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={known_hosts}",
+    ]
+    return args, shlex.join(args)
+
+
+def sync_completed_task_result(
+    config: dict[str, str], task: Task, output_dir: Path,
+) -> bool:
+    """Copy one immutable completed result directory and record local success."""
+    root = results_root(config)
+    if output_dir.resolve().parent != root.resolve():
+        raise ValueError(f"Task output must be directly inside {root}: {output_dir}")
+    if "/" in task.task_id or "\\" in task.task_id:
+        raise ValueError(f"Invalid task ID for remote sync: {task.task_id!r}")
+    if not (output_dir / "COMPLETE").is_file():
+        raise FileNotFoundError(f"Completed task lacks COMPLETE: {output_dir}")
+
+    host = cfg(config, "REMOTE_RESULTS_SYNC_HOST", "").strip()
+    user = cfg(config, "REMOTE_RESULTS_SYNC_USER", "").strip()
+    remote_root = cfg(config, "REMOTE_RESULTS_SYNC_ROOT", "").strip().rstrip("/")
+    if not host or not user or not remote_root.startswith("/"):
+        raise ValueError(
+            "REMOTE_RESULTS_SYNC_HOST, REMOTE_RESULTS_SYNC_USER, and an absolute "
+            "REMOTE_RESULTS_SYNC_ROOT are required"
+        )
+    ssh_args, rsync_ssh = remote_results_ssh_args(config)
+    timeout_seconds = max(
+        30, as_int(cfg(config, "REMOTE_RESULTS_SYNC_TIMEOUT_SECONDS", "300"), 300)
+    )
+    remote_path = posixpath.join(remote_root, task.task_id)
+    destination = f"{user}@{host}:{remote_path}/"
+    rsync_command = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--delay-updates",
+        f"--timeout={timeout_seconds}",
+        "--protect-args",
+        "-e", rsync_ssh,
+        f"{output_dir}/",
+        destination,
+    ]
+    try:
+        transfer = subprocess.run(
+            rsync_command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"[{timestamp()}] WARNING: remote result sync failed for "
+            f"{task.task_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+    if transfer.returncode != 0:
+        detail = (transfer.stderr or transfer.stdout).strip()[-1000:]
+        print(
+            f"[{timestamp()}] WARNING: remote result sync failed for "
+            f"{task.task_id}: rsync_exit={transfer.returncode} detail={detail!r}",
+            flush=True,
+        )
+        return False
+
+    remote_complete = posixpath.join(remote_path, "COMPLETE")
+    try:
+        verify = subprocess.run(
+            [*ssh_args, f"{user}@{host}", f"test -f {shlex.quote(remote_complete)}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"[{timestamp()}] WARNING: remote COMPLETE verification failed for "
+            f"{task.task_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+    if verify.returncode != 0:
+        detail = (verify.stderr or verify.stdout).strip()[-1000:]
+        print(
+            f"[{timestamp()}] WARNING: remote COMPLETE verification failed for "
+            f"{task.task_id}: ssh_exit={verify.returncode} detail={detail!r}",
+            flush=True,
+        )
+        return False
+
+    marker = remote_result_sync_marker(output_dir)
+    marker_payload = {
+        "host": host,
+        "remote_path": remote_path,
+        "synced_at": timestamp(),
+        "task_id": task.task_id,
+    }
+    temp = marker.with_suffix(marker.suffix + ".tmp")
+    temp.write_text(json.dumps(marker_payload, indent=2, sort_keys=True) + "\n")
+    temp.replace(marker)
+    print(
+        f"[{timestamp()}] REMOTE_RESULT_SYNCED {task.task_id} "
+        f"destination={user}@{host}:{remote_path}",
+        flush=True,
+    )
+    return True
+
+
 def task_manifest_path(output_dir: Path) -> Path:
     return output_dir / TASK_MANIFEST_NAME
 
@@ -1530,7 +1704,30 @@ def task_terminal(status: dict[str, str], retry_failed: bool) -> bool:
     return state == "DONE" or state == "PAUSED" or (state == "FAILED" and not retry_failed)
 
 
-def sync_finished_outputs(config: dict[str, str], tasks: list[Task], status_dir: Path) -> None:
+def sync_finished_outputs(
+    config: dict[str, str], tasks: list[Task], status_dir: Path,
+) -> bool:
+    """Reconcile completed outputs and report whether remote copies remain."""
+    remote_sync_requested = remote_results_sync_enabled(config)
+    remote_sync_ready = remote_sync_requested
+    remote_sync_pending = False
+    baseline_task_ids: set[str] = set()
+    if remote_sync_ready:
+        try:
+            baseline_task_ids = remote_results_sync_baseline(config)
+        except (OSError, ValueError) as exc:
+            remote_sync_ready = False
+            remote_sync_pending = True
+            print(
+                f"[{timestamp()}] WARNING: remote result sync is disabled for "
+                f"this pass: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    remote_sync_limit = max(
+        1,
+        as_int(cfg(config, "REMOTE_RESULTS_SYNC_MAX_PER_PASS", "2"), 2),
+    )
+    remote_sync_attempts = 0
     for task in tasks:
         status = read_status(status_dir, task.task_id)
         output_dir = task_output_dir(config, task)
@@ -1553,7 +1750,33 @@ def sync_finished_outputs(config: dict[str, str], tasks: list[Task], status_dir:
             print(f"[{timestamp()}] MARK_DONE_FINISHED_OUTPUT {task.task_id}", flush=True)
             status = read_status(status_dir, task.task_id)
         if status.get("state") == "DONE":
+            needs_remote_sync = (
+                remote_sync_ready
+                and remote_result_sync_eligible(
+                    task, status, output_dir, baseline_task_ids,
+                )
+            )
+            if needs_remote_sync:
+                if remote_sync_attempts >= remote_sync_limit:
+                    remote_sync_pending = True
+                    continue
+                remote_sync_attempts += 1
+                try:
+                    synced = sync_completed_task_result(config, task, output_dir)
+                except (OSError, ValueError) as exc:
+                    synced = False
+                    print(
+                        f"[{timestamp()}] WARNING: remote result sync failed for "
+                        f"{task.task_id}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                if not synced:
+                    # Avoid deleting local checkpoints until a requested remote
+                    # copy has been verified. The next scheduler pass retries.
+                    remote_sync_pending = True
+                    continue
             cleanup_completed_task_checkpoints(task, output_dir)
+    return remote_sync_pending
 
 
 def clear_non_running_transient_fields(tasks: list[Task], status_dir: Path, dry_run: bool) -> None:
@@ -2276,8 +2499,10 @@ def main() -> int:
                 )
 
             if args.sync_only:
-                sync_finished_outputs(config, tasks, status_dir)
-                terminal = bool(tasks) and all(
+                remote_sync_pending = sync_finished_outputs(
+                    config, tasks, status_dir,
+                )
+                terminal = bool(tasks) and not remote_sync_pending and all(
                     task_terminal(read_status(status_dir, task.task_id), retry_failed)
                     for task in tasks
                 )
@@ -2323,7 +2548,9 @@ def main() -> int:
                 if gpu not in gpu_states:
                     print(f"[{timestamp()}] WARNING: cannot query GPU {gpu}; treating as busy.", flush=True)
 
-            sync_finished_outputs(config, tasks, status_dir)
+            remote_sync_pending = sync_finished_outputs(
+                config, tasks, status_dir,
+            )
             running_by_gpu = reconcile_running_statuses(
                 config, tasks, status_dir, allowed_gpus, apps, dry_run)
             active_task_ids = {job.task.task_id for job in active.values()}
@@ -2418,7 +2645,12 @@ def main() -> int:
             for task in tasks:
                 if task_terminal(read_status(status_dir, task.task_id), retry_failed):
                     terminal_count += 1
-            queue_terminal = bool(tasks) and terminal_count >= len(tasks) and not active
+            queue_terminal = (
+                bool(tasks)
+                and terminal_count >= len(tasks)
+                and not active
+                and not remote_sync_pending
+            )
             if not dry_run:
                 notify_queue_events(
                     config,

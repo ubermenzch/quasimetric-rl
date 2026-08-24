@@ -60,8 +60,8 @@ bootstrap script uses 3 retries for package downloads. MuJoCo and every dataset
 are validated before use. Asset paths are normalized before launching
 `mujoco-py`, whose legacy loader requires canonical library paths.
 
-To add only the online DMC and Gym MuJoCo simulators to a server that already
-has this repository's `.venv`, run:
+To add only the online DMC, Gym MuJoCo, Gymnasium-Robotics, and Panda-Gym
+simulators to a server that already has this repository's `.venv`, run:
 
 ```bash
 git pull
@@ -71,11 +71,11 @@ tools/setup_environment.sh --simulators-only
 This is an incremental installation: matching packages and an existing MuJoCo
 2.1 runtime are retained, while missing or mismatched components are repaired.
 It does not initialize submodules, download D4RL datasets, or rebuild the
-virtual environment. The pinned versions and legacy Gym backends match the
-environment used on the source server. To prevent a silent backend change, it
-removes Gymnasium packages if they are present in that project virtual
-environment. Finally, the command creates, resets, and steps all four DMC tasks
-and all three Gym MuJoCo tasks. Set
+virtual environment. Gym 0.18 and Gymnasium intentionally coexist: the legacy
+adapter selects its original Gym backend explicitly, while the Robotics and
+Panda adapters use Gymnasium. Finally, the command creates, resets, and steps
+every registered DMC, Gym MuJoCo, Gymnasium-Robotics, online-maze, and
+Panda-Gym task. Set
 `VENV_DIR=/path/to/venv` if the existing environment is not `.venv` in the
 repository root.
 
@@ -166,6 +166,73 @@ preferences do not leak into the repository. The setup script creates an empty
 runtime task list at `runs/qrl_queue/tasks.tsv`; add local task rows there
 before starting the scheduler.
 
+### Result Storage Modes
+
+The queue supports two explicit storage modes. Local-only mode is the default:
+set `RESULTS_ROOT` to a filesystem with enough capacity and leave remote sync
+disabled. On server 225, for example:
+
+```bash
+# configs/qrl_queue.env
+RESULTS_ROOT="/data2/zhangcheng/qrl-assets/results/queue"
+REMOTE_RESULTS_SYNC_ENABLED=0
+```
+
+Remote-mirror mode first writes the active training result locally, then copies
+each newly completed task directory to an SSH-accessible result server. A copy
+is considered successful only after `rsync` exits successfully and the remote
+`COMPLETE` marker is verified. Failures are retried by later scheduler passes,
+and the scheduler does not report the queue complete while requested copies are
+pending. Verified local task directories are retained; this mode does not
+delete local results.
+
+Create a dedicated key on the training server. The private key and connection
+state live under the Git-ignored `runs/` directory and must never be committed:
+
+```bash
+mkdir -p runs/qrl_queue/ssh
+ssh-keygen -t ed25519 \
+  -f runs/qrl_queue/ssh/id_ed25519_qrl_results \
+  -N '' -C qrl-results
+ssh-copy-id -i runs/qrl_queue/ssh/id_ed25519_qrl_results.pub \
+  -p <ssh-port> <remote-user>@<remote-host>
+```
+
+Create the destination directory on the result server and ensure `rsync` is
+installed on both machines. Then configure the ignored training-server file:
+
+```bash
+# configs/qrl_queue.env
+RESULTS_ROOT="../qrl-assets/results/queue"
+REMOTE_RESULTS_SYNC_ENABLED=1
+REMOTE_RESULTS_SYNC_HOST="<remote-host>"
+REMOTE_RESULTS_SYNC_PORT=<ssh-port>
+REMOTE_RESULTS_SYNC_USER="<remote-user>"
+REMOTE_RESULTS_SYNC_ROOT="/absolute/remote/results/queue"
+REMOTE_RESULTS_SYNC_KEY="runs/qrl_queue/ssh/id_ed25519_qrl_results"
+REMOTE_RESULTS_SYNC_KNOWN_HOSTS="runs/qrl_queue/ssh/known_hosts_remote_results"
+REMOTE_RESULTS_SYNC_BASELINE_FILE="runs/qrl_queue/remote_sync/local_only_baseline.txt"
+REMOTE_RESULTS_SYNC_TIMEOUT_SECONDS=300
+REMOTE_RESULTS_SYNC_MAX_PER_PASS=2
+```
+
+Before enabling a scheduler for the first time, snapshot all result directories
+that already exist locally. Those task IDs remain local-only; directories
+created later are eligible for remote copying:
+
+```bash
+mkdir -p ../qrl-assets/results/queue
+.venv/bin/python tools/snapshot_qrl_remote_sync_baseline.py \
+  --config configs/qrl_queue.env \
+  --output runs/qrl_queue/remote_sync/local_only_baseline.txt
+tools/verify_qrl_remote_results.sh
+```
+
+The verification command records the remote host key, checks non-interactive
+key authentication, confirms destination write access and `rsync`, and performs
+a temporary write probe. Machine-specific values can also be supplied through
+the `QRL_RESULTS_REMOTE_*` environment overrides.
+
 Stop only the scheduler while allowing its current training jobs to finish:
 
 ```bash
@@ -200,10 +267,10 @@ or print it.
 SERVERCHAN_SENDKEY="<SCT SendKey>"
 NOTIFY_HOST_LABEL="<friendly server name>"
 NTFY_TOPIC_URL=""
-NOTIFY_NO_PENDING=1
+NOTIFY_NO_PENDING=0
 NOTIFY_TASK_DONE=0
 NOTIFY_TASK_FAILED=1
-NOTIFY_QUEUE_DONE=0
+NOTIFY_QUEUE_DONE=1
 ```
 
 Configure a ServerChan delivery channel, then send a lock-free test message:
@@ -220,15 +287,17 @@ setting is empty, the operating-system hostname is used.
 
 The running scheduler reloads this configuration on every polling cycle.
 When notifications are first enabled, it records the current queue state as a
-baseline instead of replaying historical events. By default, one notification
-is sent when the `PENDING` count transitions from a positive number to zero;
-currently running training does not need to finish first. Adding new pending
-tasks rearms the notification for the next drain. Newly `FAILED` or `PAUSED`
-tasks are also reported with their task metadata, error, log path, and a short
-log excerpt; multiple failures found in one scheduler cycle are combined into
-one message. Per-task completion and all-terminal notifications remain
-available through the disabled options above. Delivery errors are logged and
-retried later without stopping training.
+baseline instead of replaying historical events. By default, the completion
+notification is sent only after every task is terminal and no training process
+remains. A queue containing `FAILED` or `PAUSED` tasks is reported as finished
+with issues rather than successfully completed. Reaching zero `PENDING` tasks
+does not notify because currently `RUNNING` tasks may still be training; the
+optional `NOTIFY_NO_PENDING` setting can restore that separate backlog-drained
+notification when explicitly needed. Newly `FAILED` or `PAUSED` tasks are also
+reported with their task metadata, error, log path, and a short log excerpt;
+multiple failures found in one scheduler cycle are combined into one message.
+Per-task completion notifications remain optional. Delivery errors are logged
+and retried later without stopping training.
 
 Permanently deleting a task removes its rows from the active task table and
 local `tasks.tsv.before_*` histories, its status and status temporary file, all
@@ -317,6 +386,9 @@ not a training requirement. It needs the companion `scaling-crl` checkout; set
 Commit source code, `configs/qrl_tasks*.tsv`, `tools/`, `docs/`, requirements,
 and small evaluation summaries. Keep virtual environments, external assets,
 raw logs, TensorBoard files, replay buffers, and checkpoints outside Git.
+Also keep `configs/qrl_queue.env`, ServerChan SendKeys, SSH private keys,
+`known_hosts`, and remote-sync baseline/state files outside Git; commit only
+`configs/qrl_queue.example.env` and the generic tooling.
 
 Use a personal fork as the working repository while retaining the official
 repository as `upstream`:
