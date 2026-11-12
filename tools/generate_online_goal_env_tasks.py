@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the QRL/GO-QRL online goal-environment task matrix."""
+"""Generate the QRL/CQRL online goal-environment task matrix."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quasimetric_rl.model_size import (
-    go_qrl_agent_parameter_count,
+    cqrl_agent_parameter_count,
     qrl_agent_parameter_count,
 )
 from tools.run_qrl_queue import Task, read_tasks
@@ -60,7 +60,7 @@ LONG_HORIZON_ENVIRONMENTS = frozenset({
     ('dmc', 'manipulator_bring_peg'),
 })
 
-GO_QRL_ARGS = (
+CQRL_ARGS = (
     'agent.actor.losses.min_dist.latent_goal_steps=4',
     'agent.actor.losses.min_dist.latent_goal_keep_best=true',
     'agent.actor.losses.min_dist.latent_goal_lr=0.01',
@@ -94,36 +94,36 @@ def evaluation_episode_count(env_kind: str, env_name: str) -> int:
 VARIANTS = (
     ('Base', 'auto', ()),
     (
-        'GO-QRL+Max4',
+        'CQRL+Max4',
         'auto',
-        GO_QRL_ARGS + (
+        CQRL_ARGS + (
             'agent.quasimetric_critic.model.encoder.branch_normalization=none',
             'agent.actor.losses.min_dist.latent_goal_mode=max',
             'agent.actor.losses.min_dist.latent_goal_optim=sgd',
         ),
     ),
     (
-        'GO-QRL+Min4',
+        'CQRL+Min4',
         'auto',
-        GO_QRL_ARGS + (
+        CQRL_ARGS + (
             'agent.quasimetric_critic.model.encoder.branch_normalization=none',
             'agent.actor.losses.min_dist.latent_goal_mode=min',
             'agent.actor.losses.min_dist.latent_goal_optim=sgd',
         ),
     ),
     (
-        'GO-QRL+Max4+LN+RMSG',
+        'CQRL+Max4+LN+RMSG',
         'auto',
-        GO_QRL_ARGS + (
+        CQRL_ARGS + (
             'agent.quasimetric_critic.model.encoder.branch_normalization=layernorm',
             'agent.actor.losses.min_dist.latent_goal_mode=max',
             'agent.actor.losses.min_dist.latent_goal_optim=rmsg',
         ),
     ),
     (
-        'GO-QRL+Min4+LN+RMSG',
+        'CQRL+Min4+LN+RMSG',
         'auto',
-        GO_QRL_ARGS + (
+        CQRL_ARGS + (
             'agent.quasimetric_critic.model.encoder.branch_normalization=layernorm',
             'agent.actor.losses.min_dist.latent_goal_mode=min',
             'agent.actor.losses.min_dist.latent_goal_optim=rmsg',
@@ -153,14 +153,14 @@ def resolve_variant_for_environment(
             compact_parameter_count(parameter_count),
             (f'+qrl_model_size={level}',),
         )
-    if variant.startswith('GO-QRL+'):
-        parameter_count = go_qrl_agent_parameter_count(
+    if variant.startswith('CQRL+'):
+        parameter_count = cqrl_agent_parameter_count(
             state_dim, action_dim, goal_dim, level,
         )
         return (
             f'{variant}-{level.upper()}',
             compact_parameter_count(parameter_count),
-            (f'+go_qrl_model_size={level}', *variant_args),
+            (f'+cqrl_model_size={level}', *variant_args),
         )
     return variant, params, variant_args
 

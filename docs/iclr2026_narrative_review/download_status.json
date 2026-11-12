@@ -1,0 +1,67 @@
+{
+  "checked_at": "2026-09-08T12:30:00.850811+00:00",
+  "pdfs_available": 0,
+  "pdfs_expected": 10,
+  "results": [
+    {
+      "id": "01_mqe",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/eddc0fab5a42f8d8de6eb5566cd9f1d3-Paper-Conference.pdf",
+      "status": "failed",
+      "error": "<urlopen error [Errno -3] Temporary failure in name resolution>"
+    },
+    {
+      "id": "02_dual_goal",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/f8cd7eb180deb5c6ec876de2b442fa72-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "03_emergent_exploration",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/cbaffeeda13dbd8bf9489feb3f198ff4-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "04_occupancy_reward",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/5683583b88da51c79d2eb263f295286e-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "05_hecrl",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/de2bc3eed995c24307e8011161ac1438-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "06_scorer",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/050f729db878738a9d44d4a7f995bf36-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "07_ego_foresight",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/7504142a20a3e1fe9dd7de42f475828c-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "08_spectral_bellman",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/58a5aafe8df63a20a7f6d7840100067c-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "09_qflex",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/5a05d477fef5a43c805d3377700efa40-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    },
+    {
+      "id": "10_identifiable_skills",
+      "url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/247a729f6b08f91a9b27de6d8e38980b-Paper-Conference.pdf",
+      "status": "not_attempted",
+      "error": "Network unavailable: [Errno -3] Temporary failure in name resolution"
+    }
+  ]
+}

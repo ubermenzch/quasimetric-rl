@@ -4,7 +4,7 @@ The online trainer supports five reward-free goal-conditioned methods on the
 seven validated environments in `ONLINE_GOAL_ENVS.md`. The existing strict
 baseline matrix still contains the first four. They now have M and L capacity
 presets; Scaling-CRL has a separate multi-level scale for the planned
-QRL/GO-QRL capacity comparison.
+QRL/CQRL capacity comparison.
 
 | CLI value | Method | Implementation source |
 | --- | --- | --- |
@@ -39,7 +39,8 @@ rule, initialization, or update schedule.
 The implementation deliberately retains source behavior that might otherwise
 look like something to "fix". Examples include CRL's unweighted `B x B` sigmoid
 BCE with the diagonal as positives and every off-diagonal pair as a negative,
-GCSL's joint action discretization for these seven action spaces, and
+GCSL's official switch from joint to factorized action discretization when the
+joint action count exceeds 100, and
 C-Learning's unclamped odds denominator and default policy standard-deviation
 transform. There are no task-specific rescue settings or numerical-stability
 substitutions in the comparison tasks.
@@ -70,8 +71,10 @@ This distinction preserves gripper-motion learning during early exploration;
 the three object coordinates are an evaluation predicate, not a shared goal
 encoder for all methods. Original CRL uses `start_index=0` and
 `end_index=-1`, so it conditions on the complete state in every validated
-environment. The other methods retain their registered task-goal dimensions
-outside the three Fetch manipulation tasks.
+environment except AntMaze. The official AntMaze CRL configuration sets
+`end_index=2`, so AntMaze conditions only on the XY goal `(0, 1)`. The other
+methods retain their registered task-goal dimensions outside the three Fetch
+manipulation tasks.
 
 Fetch manipulation checkpoints trained before the goal-representation
 separation used a 3-D baseline goal input. Their actor/critic parameter shapes
@@ -136,7 +139,7 @@ source tools/qrl_env.sh
 Use `crl`, `gcsl`, or `c_learning` together with their corresponding model-size
 group. Replace `m` with `l` in any of the four baseline overrides to select the
 L budget. As with QRL and
-GO-QRL, every 20k boundary is evaluated on the validation seeds and saved with
+CQRL, every 20k boundary is evaluated on the validation seeds and saved with
 the replay and optimizer state. Training then reloads the checkpoint with the
 best validation success, hitting time, and return tie-breakers, and evaluates
 that model once on the disjoint test seeds. The selected artifact is

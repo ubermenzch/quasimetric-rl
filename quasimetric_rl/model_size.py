@@ -21,7 +21,7 @@ BASE_MODEL_SIZE_LEVELS = MODEL_SIZE_LEVELS
 
 
 @dataclass(frozen=True)
-class GOQRLBranchPlan:
+class CQRLBranchPlan:
     goal_arch: Tuple[int, ...]
     non_goal_arch: Tuple[int, ...]
     goal_latent_size: int
@@ -38,15 +38,13 @@ def model_size_path(family: str, level: str) -> Path:
     family = family.lower().replace('-', '_')
     if family == 'base':
         family = 'qrl'
-    elif family == 'cqrl':
-        # CQRL is the public algorithm name. Keep the existing directory as a
-        # checkpoint/config compatibility detail.
-        family = 'go_qrl'
+    elif family == 'go_qrl':
+        # Old manifests use this family name. CQRL is canonical for new code.
+        family = 'cqrl'
     return MODEL_SIZE_ROOT / family / f'{level.lower()}.yaml'
 
 
 def load_model_size_preset(family: str, level: str) -> DictConfig:
-    requested_family = family.lower().replace('-', '_')
     path = model_size_path(family, level)
     if not path.is_file():
         raise ValueError(
@@ -54,8 +52,6 @@ def load_model_size_preset(family: str, level: str) -> DictConfig:
             f'expected a preset at {path}'
         )
     preset = OmegaConf.load(path)
-    if requested_family == 'cqrl' and preset.get('model_size') is not None:
-        preset.model_size = str(preset.model_size).replace('GO-QRL', 'CQRL')
     return preset
 
 
@@ -65,15 +61,11 @@ def register_model_size_presets(config_store) -> None:
         groups = [f'{family_dir.name}_model_size']
         if family_dir.name == 'qrl':
             groups.append('base_model_size')
-        elif family_dir.name == 'go_qrl':
-            groups.append('cqrl_model_size')
+        elif family_dir.name == 'cqrl':
+            groups.append('go_qrl_model_size')
         for path in sorted(family_dir.glob('*.yaml')):
             for group in groups:
                 node = OmegaConf.load(path)
-                if group == 'cqrl_model_size':
-                    node.model_size = str(node.model_size).replace(
-                        'GO-QRL', 'CQRL',
-                    )
                 config_store.store(
                     group=group,
                     name=path.stem,
@@ -258,7 +250,7 @@ def _branch_parameter_weights(
     # The supported presets use the exact, auditable 1:8 floor.
     if abs(min_goal_ratio - 0.125) > 1e-12:
         raise ValueError(
-            'Automatic GO-QRL branch matching currently requires '
+            'Automatic CQRL branch matching currently requires '
             f'min_goal_ratio=0.125, got {min_goal_ratio}'
         )
     return 1, 8, True
@@ -288,12 +280,12 @@ def _branch_architecture_candidates(
     return candidates
 
 
-def match_go_qrl_split_encoder(
+def match_cqrl_split_encoder(
         state_dim: int, goal_dim: int, latent_size: int,
         reference_arch: Iterable[int], min_goal_ratio: float = 0.125,
         max_relative_budget_error: float = 0.0025,
         mlp_kind: str = 'plain', residual_block_size: int = 4,
-) -> GOQRLBranchPlan:
+) -> CQRLBranchPlan:
     """Match two split MLPs to a QRL encoder's parameter budget.
 
     Two-layer plain MLPs are matched exactly. Deeper plain and residual MLP
@@ -309,7 +301,7 @@ def match_go_qrl_split_encoder(
         raise ValueError(f'latent_size must exceed one, got {latent_size}')
     if len(reference_arch) < 2 or min(reference_arch) <= 0:
         raise ValueError(
-            'Automatic GO-QRL branch matching requires at least two positive '
+            'Automatic CQRL branch matching requires at least two positive '
             'reference hidden widths, '
             f'got {reference_arch}'
         )
@@ -338,7 +330,7 @@ def match_go_qrl_split_encoder(
             mlp_kind == 'plain' and len(reference_arch) > 2):
         if len(set(reference_arch)) != 1:
             raise ValueError(
-                'Deep plain and residual GO-QRL matching require a constant '
+                'Deep plain and residual CQRL matching require a constant '
                 'reference width, '
                 f'got {reference_arch}'
             )
@@ -371,6 +363,8 @@ def match_go_qrl_split_encoder(
         goal_budget_tolerance = max_relative_budget_error
         if mlp_kind == 'plain':
             goal_budget_tolerance = max(goal_budget_tolerance, 0.003)
+        else:
+            goal_budget_tolerance = max(goal_budget_tolerance, 0.0027)
         for _goal_error, goal_width, goal_parameters in goal_candidates:
             for _non_goal_error, non_goal_width, non_goal_parameters in non_goal_candidates:
                 if goal_parameters / non_goal_parameters < min_goal_ratio:
@@ -395,7 +389,7 @@ def match_go_qrl_split_encoder(
                 ))
         if not feasible:
             raise ValueError(
-                f'Could not construct {mlp_kind} GO-QRL encoder branches for '
+                f'Could not construct {mlp_kind} CQRL encoder branches for '
                 f'state_dim={state_dim}, goal_dim={goal_dim}'
             )
         (
@@ -403,7 +397,7 @@ def match_go_qrl_split_encoder(
             goal_width, non_goal_width,
             goal_parameters, non_goal_parameters,
         ) = min(feasible)
-        return GOQRLBranchPlan(
+        return CQRLBranchPlan(
             goal_arch=(goal_width,) * depth,
             non_goal_arch=(non_goal_width,) * depth,
             goal_latent_size=goal_latent_size,
@@ -416,10 +410,10 @@ def match_go_qrl_split_encoder(
             minimum_ratio_applied=floor_applied,
         )
     if mlp_kind != 'plain':
-        raise ValueError(f'Unknown GO-QRL encoder MLP kind {mlp_kind!r}')
+        raise ValueError(f'Unknown CQRL encoder MLP kind {mlp_kind!r}')
     if len(reference_arch) != 2:
         raise ValueError(
-            'Plain GO-QRL branch matching requires two reference hidden widths, '
+            'Plain CQRL branch matching requires two reference hidden widths, '
             f'got {reference_arch}'
         )
 
@@ -465,7 +459,7 @@ def match_go_qrl_split_encoder(
                 _error, _score, goal_arch, non_goal_arch,
                 goal_parameters, non_goal_parameters,
             ) = min(feasible)
-            return GOQRLBranchPlan(
+            return CQRLBranchPlan(
                 goal_arch=goal_arch,
                 non_goal_arch=non_goal_arch,
                 goal_latent_size=goal_latent_size,
@@ -479,29 +473,32 @@ def match_go_qrl_split_encoder(
             )
 
     raise ValueError(
-        'Could not construct a two-branch GO-QRL encoder with exact QRL total '
+        'Could not construct a two-branch CQRL encoder with exact QRL total '
         f'parameters for state_dim={state_dim}, goal_dim={goal_dim}, '
         f'latent_size={latent_size}, reference_arch={reference_arch}'
     )
 
 
-def go_qrl_agent_parameter_count(
+def cqrl_agent_parameter_count(
         state_dim: int, action_dim: int, goal_dim: int, level: str,
 ) -> int:
-    """Count GO-QRL parameters after resolving its matched split encoder."""
-    preset = load_model_size_preset('go_qrl', level)
+    """Count CQRL parameters after resolving its matched split encoder."""
+    preset = load_model_size_preset('cqrl', level)
     encoder = preset.quasimetric_critic.model.encoder
     quasimetric = preset.quasimetric_critic.model.quasimetric_model
     dynamics = preset.quasimetric_critic.model.latent_dynamics
     actor = preset.actor.model
     if encoder.kind != 'split' or actor.input_mode != 'split_latent':
-        raise ValueError('GO-QRL counting requires split/split_latent architecture')
-    plan = match_go_qrl_split_encoder(
+        raise ValueError('CQRL counting requires split/split_latent architecture')
+    plan = match_cqrl_split_encoder(
         state_dim=state_dim,
         goal_dim=goal_dim,
         latent_size=int(encoder.latent_size),
         reference_arch=encoder.arch,
         min_goal_ratio=float(encoder.min_goal_parameter_ratio),
+        max_relative_budget_error=float(
+            encoder.get('split_max_relative_budget_error', 0.0025)
+        ),
         mlp_kind=str(encoder.get('mlp_kind', 'plain')),
         residual_block_size=int(encoder.get('residual_block_size', 4)),
     )
@@ -539,16 +536,25 @@ def go_qrl_agent_parameter_count(
     )
 
 
+# Compatibility aliases for historical scripts and task manifests.
+GOQRLBranchPlan = CQRLBranchPlan
+match_go_qrl_split_encoder = match_cqrl_split_encoder
+go_qrl_agent_parameter_count = cqrl_agent_parameter_count
+
+
 __all__ = [
     'BASE_MODEL_SIZE_LEVELS',
+    'CQRLBranchPlan',
     'GOQRLBranchPlan',
     'MODEL_SIZE_LEVELS',
     'QRL_MODEL_SIZE_LEVELS',
     'MODEL_SIZE_ROOT',
     'SCALING_CRL_MODEL_SIZE_LEVELS',
     'base_agent_parameter_count',
+    'cqrl_agent_parameter_count',
     'go_qrl_agent_parameter_count',
     'load_model_size_preset',
+    'match_cqrl_split_encoder',
     'match_go_qrl_split_encoder',
     'model_size_path',
     'qrl_agent_parameter_count',

@@ -160,7 +160,7 @@ class OnlineGoalEnvironmentRegistrationTest(unittest.TestCase):
         resolve_split_encoder_goal_dims(cfg)
         self.assertEqual(encoder.goal_dims, (2, 3))
 
-    def test_go_qrl_level_resolves_task_specific_encoder_branches(self):
+    def test_cqrl_level_resolves_task_specific_encoder_branches(self):
         for (kind, name), (observation_shape, action_shape, goal_dims) in (
                 ONLINE_GOAL_ENV_SPECS.items()):
             with self.subTest(environment=(kind, name)):
@@ -170,7 +170,7 @@ class OnlineGoalEnvironmentRegistrationTest(unittest.TestCase):
                 cfg.env.name = name
                 merged_agent = OmegaConf.merge(
                     OmegaConf.structured(cfg.agent),
-                    load_model_size_preset('go_qrl', level),
+                    load_model_size_preset('cqrl', level),
                 )
                 cfg.agent = OmegaConf.to_container(
                     merged_agent,
@@ -329,6 +329,7 @@ class OnlineInteractionScheduleTest(unittest.TestCase):
         trainer.make_evaluate_env = mock.Mock(return_value=fake_env)
 
         def rollout(**_kwargs):
+            fake_env.initial_is_success = fake_env.seed.call_args[0][0] == 1001
             episode = get_empty_episode(env_spec, fake_env.episode_length)
             episode.rewards.zero_()
             episode.transition_infos['is_success'].zero_()
@@ -336,13 +337,41 @@ class OnlineInteractionScheduleTest(unittest.TestCase):
 
         trainer.collect_rollout = mock.Mock(side_effect=rollout)
 
-        trainer.evaluate(num_episodes=3, seed=1000)
+        result = trainer.evaluate(num_episodes=3, seed=1000)
 
         self.assertEqual(
             fake_env.seed.call_args_list,
             [mock.call(1000), mock.call(1001), mock.call(1002)],
         )
         fake_env.close.assert_called_once_with()
+        self.assertEqual(result.initial_is_success.tolist(), [False, True, False])
+
+    def test_original_qrl_evaluation_uses_one_seed_and_the_original_rng_stream(self):
+        env_spec = EnvSpec(
+            observation_space=gym.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32),
+            observation_space_is_dict=True,
+            action_space=gym.spaces.Box(-1, 1, shape=(2,), dtype=np.float32),
+        )
+        env = mock.Mock(episode_length=2)
+        env.initial_is_success = False
+        trainer = Trainer.__new__(Trainer)
+        trainer.original_qrl_evaluation = True
+        trainer.eval_seed, trainer.num_eval_episodes, trainer.profiler = 99, 3, None
+        def make_env(seed):
+            env.seed(seed)
+            return env
+        trainer.make_evaluate_env = make_env
+        def rollout(**kwargs):
+            episode = get_empty_episode(env_spec, 2)
+            episode.rewards.zero_()
+            episode.transition_infos['is_success'].zero_()
+            return episode
+        trainer.collect_rollout = rollout
+        with mock.patch('online.trainer.utils.load_rng_state') as restore:
+            trainer.evaluate(num_episodes=3, seed=1000)
+        self.assertEqual(env.seed.call_args_list, [mock.call(1000)])
+        restore.assert_not_called()
+        env.close.assert_called_once()
 
     def test_default_transition_budget_scales_with_episode_length(self):
         expected = {
@@ -447,6 +476,99 @@ class OnlineCheckpointSelectionTest(unittest.TestCase):
         self.assertEqual(summary['success_count'], 2)
         self.assertAlmostEqual(summary['succ_rate'], 2 / 3)
         self.assertAlmostEqual(summary['hitting_time'], (2 + 5 + 1) / 3)
+        self.assertAlmostEqual(summary['success_state_step_fraction'], (3 / 4 + 0 + 1) / 3)
+        self.assertAlmostEqual(summary['successful_episode_first_arrival_steps'], 1.5)
+
+    def test_execution_metrics_with_no_successful_episodes(self):
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.ones(2, 4), torch.zeros(2, 4, dtype=torch.bool),
+        )
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=4,
+        )
+        self.assertEqual(summary['success_state_step_fraction'], 0)
+        self.assertIsNone(summary['successful_episode_first_arrival_steps'])
+        self.assertEqual(summary['hitting_time'], 5)
+
+    def test_valid_seed_mean_includes_action_one_arrivals(self):
+        successes = torch.tensor([
+            [True, True, True, True],
+            [True, False, False, False],
+            [False, False, True, True],
+            [False, False, False, False],
+        ])
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.zeros(4, 4), successes,
+        )
+        result.initial_is_success = torch.tensor([True, False, False, False])
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=4,
+        )
+        self.assertEqual(summary['initial_success_count'], 1)
+        self.assertEqual(summary['first_arrival_filter'], 'seed_mean_above_one')
+        self.assertTrue(summary['first_arrival_seed_valid'])
+        self.assertEqual(summary['first_step_success_count'], 2)
+        self.assertEqual(summary['valid_success_count'], 3)
+        self.assertAlmostEqual(summary['valid_successful_episode_first_arrival_steps'], 5 / 3)
+        self.assertEqual(summary['success_count'], 3)
+
+    def test_no_valid_arrival_when_all_successes_arrive_at_step_one(self):
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.zeros(2, 4), torch.ones(2, 4, dtype=torch.bool),
+        )
+        result.initial_is_success = torch.ones(2, dtype=torch.bool)
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=4,
+        )
+        self.assertEqual(summary['valid_success_count'], 0)
+        self.assertFalse(summary['first_arrival_seed_valid'])
+        self.assertIsNone(summary['valid_successful_episode_first_arrival_steps'])
+
+    def test_seed_mean_filter_does_not_require_initial_flags(self):
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.zeros(2, 4), torch.tensor([[True, True, True, True],
+                                            [False, False, True, True]]),
+        )
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=4,
+        )
+        self.assertEqual(summary['first_step_success_count'], 1)
+        self.assertEqual(summary['valid_success_count'], 2)
+        self.assertEqual(summary['valid_successful_episode_first_arrival_steps'], 2)
+        self.assertTrue(summary['first_arrival_seed_valid'])
+        self.assertNotIn('initial_success_count', summary)
+
+    def test_seed_mean_filter_precedes_display_rounding(self):
+        successes = torch.ones(1000, 2, dtype=torch.bool)
+        successes[-1, 0] = False
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.zeros(1000, 2), successes,
+        )
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=2,
+        )
+        self.assertEqual(round(summary['successful_episode_first_arrival_steps'], 1), 1.0)
+        self.assertTrue(summary['first_arrival_seed_valid'])
+        self.assertEqual(summary['valid_success_count'], 1000)
+        self.assertEqual(summary['valid_successful_episode_first_arrival_steps'], 1.001)
+
+    def test_success_state_fraction_counts_departures_after_arrival(self):
+        successes = torch.tensor([[False, True, False, False], [True, True, True, True]])
+        result = EvalEpisodeResult.from_timestep_reward_is_success(
+            torch.zeros(2, 4), successes,
+        )
+        summary = summarize_evaluation(
+            result, split='test', seed=20, env_steps=20_000,
+            optim_steps=11_000, episode_length=4,
+        )
+        self.assertEqual(summary['succ_rate'], 1)
+        self.assertAlmostEqual(summary['success_state_step_fraction'], 5 / 8)
+        self.assertAlmostEqual(summary['successful_episode_first_arrival_steps'], 1.5)
 
     def test_selection_prioritizes_success_then_speed_then_return(self):
         base = {

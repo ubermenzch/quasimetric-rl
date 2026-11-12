@@ -1,4 +1,4 @@
-# Scaling-CRL-XL: official 16-layer residual architecture at GO-QRL-XL capacity.
+# Scaling-CRL-XL: official 16-layer residual architecture at CQRL-XL capacity.
 model_size: Scaling-CRL-XL
 baselines:
   scaling_crl:

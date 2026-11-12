@@ -75,6 +75,7 @@ class FetchReachEnv(reach.FetchReachEnv):
         self.observation_space = self._old_observation_space
         s = super(FetchReachEnv, self).reset()
         self.observation_space = self._new_observation_space
+        self.initial_is_success = bool(np.linalg.norm(s['achieved_goal'] - s['desired_goal']) < 0.05)
         return self.observation(s)
 
     def step(self, action):
@@ -119,6 +120,7 @@ class FetchPushEnv(push.FetchPushEnv):
         self.observation_space = self._old_observation_space
         s = super(FetchPushEnv, self).reset()
         self.observation_space = self._new_observation_space
+        self.initial_is_success = bool(np.linalg.norm(s['achieved_goal'] - s['desired_goal']) < 0.05)
         return self.observation(s)
 
     def step(self, action):
@@ -164,6 +166,7 @@ class FetchSlideEnv(slide.FetchSlideEnv):
         self.observation_space = self._old_observation_space
         s = super(FetchSlideEnv, self).reset()
         self.observation_space = self._new_observation_space
+        self.initial_is_success = bool(np.linalg.norm(s['achieved_goal'] - s['desired_goal']) < 0.05)
         return self.observation(s)
 
     def step(self, action):
@@ -208,6 +211,9 @@ class FetchPickAndPlaceEnv(pick_and_place.FetchPickAndPlaceEnv):
         self.observation_space = self._old_observation_space
         state = super().reset()
         self.observation_space = self._new_observation_space
+        self.initial_is_success = bool(np.linalg.norm(
+            state['achieved_goal'] - state['desired_goal']
+        ) < 0.05)
         return self.observation(state)
 
     def step(self, action):

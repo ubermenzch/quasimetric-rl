@@ -474,6 +474,9 @@ class ReplayBuffer(Dataset):
         return attrs.evolve(
             self[transition_indices],
             future_observations=self.get_observations(future_observation_indices),
+            future_steps=torch.from_numpy(goal_timesteps - state_timesteps).long(),
+            replay_episode_indices=torch.from_numpy(episode_indices).long(),
+            replay_timesteps=torch.from_numpy(state_timesteps).long(),
         )
 
     def get_dataloader(self, *args, **kwargs):
@@ -501,4 +504,5 @@ from . import (  # register
     gymnasium_robotics,
     maze2d,
     panda_gym,
+    paper_validation,
 )

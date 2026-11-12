@@ -22,6 +22,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -29,17 +30,35 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    from tools.checkpoint_cleanup import cleanup_task_checkpoints
-except ModuleNotFoundError:  # Direct execution via tools/run_qrl_queue.py.
-    from checkpoint_cleanup import cleanup_task_checkpoints
-
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from tools.checkpoint_cleanup import (
+        cleanup_task_checkpoints,
+        task_checkpoint_files,
+    )
+except ModuleNotFoundError:  # Direct execution via tools/run_qrl_queue.py.
+    from checkpoint_cleanup import cleanup_task_checkpoints, task_checkpoint_files
+
+from quasimetric_rl.utils import full_checkpoint_key
+from tools.qrl_repro_plateau import plateau_from_eval_log, validation_at_or_after
+
+try:
+    from tools.git_metadata import git_output
+except ModuleNotFoundError:
+    from git_metadata import git_output
+
 TRANSIENT_FAILURE_PATTERNS = (
     "CUDA driver initialization failed",
     "CUDA unknown error",
     "Setting the available devices to be zero.",
+)
+DISK_FULL_PATTERNS = (
+    "No space left on device",
+    "PytorchStreamWriter failed writing file",
+    "unexpected pos",
 )
 CUDA_OOM_PATTERNS = (
     "CUDA out of memory",
@@ -51,7 +70,14 @@ NOTIFICATION_STATE_VERSION = 1
 DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG = (
     "queue.delete_checkpoints_after_completion"
 )
+TASK_CODE_REPO_ARG = "queue.code_repo"
+TASK_CODE_REVISION_ARG = "queue.code_revision"
+TASK_NATIVE_QRL_ARG = "queue.native_qrl"
+TASK_LOGS_ONLY_ARG = "queue.logs_only"
+TASK_EXECUTION_ARGS = {TASK_CODE_REPO_ARG, TASK_CODE_REVISION_ARG, TASK_NATIVE_QRL_ARG,
+                       TASK_LOGS_ONLY_ARG}
 REMOTE_SYNC_MARKER_NAME = ".qrl_remote_sync.json"
+REMOTE_CHECKPOINT_SYNC_MARKER_NAME = ".qrl_remote_checkpoints.json"
 
 
 @dataclass
@@ -83,12 +109,27 @@ class GpuState:
 
 
 def task_training_args(task: Task) -> list[str]:
-    prefix = DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG + "="
     return [
         arg
         for arg in task.extra_args.split()
-        if not arg.startswith(prefix)
+        if arg.partition("=")[0] not in TASK_EXECUTION_ARGS
+        and not arg.startswith(DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG + "=")
     ]
+
+
+def task_execution_options(task: Task) -> dict[str, str]:
+    options = {}
+    for arg in shlex.split(task.extra_args):
+        key, separator, value = arg.partition("=")
+        if key in TASK_EXECUTION_ARGS:
+            if not separator or not value or key in options:
+                raise ValueError(f"Invalid task execution option: {arg}")
+            options[key] = value
+    return options
+
+
+def task_uses_native_qrl(task: Task) -> bool:
+    return task_execution_options(task).get(TASK_NATIVE_QRL_ARG, "false").lower() == "true"
 
 
 def task_deletes_checkpoints_after_completion(task: Task) -> bool:
@@ -99,8 +140,17 @@ def task_deletes_checkpoints_after_completion(task: Task) -> bool:
     )
 
 
+def task_preserves_checkpoints_after_completion(task: Task) -> bool:
+    """An explicit false also opts out of global post-backup local cleanup."""
+    return not bool_arg_value(
+        task.extra_args.split(),
+        DELETE_CHECKPOINTS_AFTER_COMPLETION_ARG,
+        True,
+    )
+
+
 def normalized_task_definition(task: Task) -> dict[str, object]:
-    return {
+    definition = {
         "task_id": task.task_id,
         "mode": task.mode,
         "env_name": task.env_name,
@@ -109,6 +159,11 @@ def normalized_task_definition(task: Task) -> dict[str, object]:
         "params": task.params,
         "extra_args": task_training_args(task),
     }
+    # Preserve all historical fingerprints when no per-task repository is set.
+    options = task_execution_options(task)
+    if options:
+        definition["execution"] = options
+    return definition
 
 
 def task_fingerprint(task: Task) -> str:
@@ -129,13 +184,17 @@ class QueueLock:
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("w")
+        # Do not truncate the lock metadata before flock succeeds. A helper
+        # that races with the scheduler must leave its PID information intact.
+        self.handle = self.path.open("a+")
         try:
             fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             self.handle.close()
             self.handle = None
             return False
+        self.handle.seek(0)
+        self.handle.truncate()
         self.handle.write(f"pid={os.getpid()}\nstarted_at={timestamp()}\n")
         self.handle.flush()
         return True
@@ -787,7 +846,7 @@ def write_status(status_dir: Path, task: Task, state: str, extra: dict[str, str]
         extra["started_at"] = previous["started_at"]
     if state != "RUNNING" and previous.get("gpu_started_at") and "gpu_started_at" not in extra:
         extra["gpu_started_at"] = previous["gpu_started_at"]
-    if state in {"DONE", "FAILED", "PAUSED"} and not extra.get("finished_at"):
+    if state in {"DONE", "FAILED", "PAUSED", "EARLY_STOPPED"} and not extra.get("finished_at"):
         extra["finished_at"] = now
     if state != "RUNNING":
         extra.pop("gpu", None)
@@ -930,10 +989,10 @@ def terminate_pid(pid: str, config: dict[str, str], grace_seconds: float) -> str
         return f"terminate_error:{exc}"
     deadline = time.time() + grace_seconds
     while time.time() < deadline:
-        if not pid_alive(pid):
+        if not pid_alive(pid) or not plateau_pid_is_running(pid):
             return "terminated"
         time.sleep(0.2)
-    if not pid_alive(pid):
+    if not pid_alive(pid) or not plateau_pid_is_running(pid):
         return "terminated"
     try:
         os.kill(pid_int, signal.SIGKILL)
@@ -943,7 +1002,7 @@ def terminate_pid(pid: str, config: dict[str, str], grace_seconds: float) -> str
         return f"kill_error:{exc}"
     deadline = time.time() + 5
     while time.time() < deadline:
-        if not pid_alive(pid):
+        if not pid_alive(pid) or not plateau_pid_is_running(pid):
             return "killed"
         time.sleep(0.2)
     return "kill_timeout"
@@ -961,18 +1020,20 @@ def gpu_uuid_to_index() -> dict[str, str]:
         )
     except Exception:
         return {}
-    if result.returncode != 0:
-        return {}
     mapping: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 2:
-            mapping[parts[1]] = parts[0]
+    # Validate returned data: nvidia-smi may emit valid CSV and still exit 255.
+    for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
+        parts = [part.strip() for part in row]
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].startswith("GPU-"):
+            return {}
+        mapping[parts[1]] = parts[0]
     return mapping
 
 
 def gpu_compute_apps() -> list[dict[str, str]] | None:
     uuid_to_index = gpu_uuid_to_index()
+    if not uuid_to_index:
+        return None
     try:
         result = subprocess.run(
             [
@@ -988,15 +1049,16 @@ def gpu_compute_apps() -> list[dict[str, str]] | None:
         )
     except Exception:
         return None
-    if result.returncode != 0:
+    if result.returncode != 0 and not result.stdout.strip():
+        # Empty output with an error is not evidence that the GPUs are idle.
         return None
     apps: list[dict[str, str]] = []
     unmapped_gpu_uuids: set[str] = set()
-    for line in result.stdout.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4:
-            continue
-        gpu_uuid, pid, process_name, used_memory = parts[:4]
+    for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
+        parts = [part.strip() for part in row]
+        if len(parts) != 4 or not parts[1].isdigit():
+            return None
+        gpu_uuid, pid, process_name, used_memory = parts
         gpu = uuid_to_index.get(gpu_uuid, "")
         if gpu_uuid and not gpu:
             unmapped_gpu_uuids.add(gpu_uuid)
@@ -1062,25 +1124,34 @@ def sample_gpu_memory_during_wait(
     status_dir: Path,
     wait_seconds: float,
     dry_run: bool,
+    active: dict[str, ActiveJob] | None = None,
 ) -> None:
-    """Wait for the next allocation pass while sampling GPU memory peaks."""
+    """Sample GPU peaks and check requested step limits between allocations."""
     wait_seconds = max(0.0, wait_seconds)
     sample_seconds = max(
         0.1,
         as_float(cfg(config, "GPU_MEMORY_SAMPLE_SECONDS", "5"), 5.0),
     )
     deadline = time.monotonic() + wait_seconds
+    next_gpu_sample = time.monotonic() + sample_seconds
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
-        time.sleep(min(sample_seconds, remaining))
-        update_running_gpu_memory_peaks(
-            tasks,
-            status_dir,
-            gpu_compute_apps(),
-            dry_run=dry_run,
-        )
+        check_seconds = 1.0 if active is not None else sample_seconds
+        time.sleep(min(check_seconds, remaining, max(0.0, next_gpu_sample - time.monotonic())))
+        if active is not None:
+            stop_qrl_reproduction_plateaus(
+                config, tasks, status_dir, active, dry_run, hard_limits_only=True,
+            )
+        if time.monotonic() >= next_gpu_sample:
+            update_running_gpu_memory_peaks(
+                tasks,
+                status_dir,
+                gpu_compute_apps(),
+                dry_run=dry_run,
+            )
+            next_gpu_sample = time.monotonic() + sample_seconds
 
 
 def legal_running_gpu_pids(
@@ -1178,21 +1249,22 @@ def query_gpu_state(gpu: str, apps: list[dict[str, str]] | None) -> GpuState | N
         )
     except Exception:
         return None
-    if result.returncode != 0:
-        return None
-    line = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else ""
-    parts = [part.strip() for part in line.split(",")]
-    if len(parts) != 3:
+    rows = list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
+    if len(rows) != 1 or len(rows[0]) != 3:
         return None
     try:
-        return GpuState(
+        state = GpuState(
             gpu=gpu,
-            mem_used_mb=int(float(parts[0])),
-            mem_total_mb=int(float(parts[1])),
-            util_pct=int(float(parts[2])),
+            mem_used_mb=int(float(rows[0][0])),
+            mem_total_mb=int(float(rows[0][1])),
+            util_pct=int(float(rows[0][2])),
         )
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
+    if not (0 <= state.mem_used_mb <= state.mem_total_mb and state.mem_total_mb > 0
+            and 0 <= state.util_pct <= 100):
+        return None
+    return state
 
 
 def query_gpu_states(gpus: list[str], apps: list[dict[str, str]] | None) -> dict[str, GpuState]:
@@ -1212,8 +1284,17 @@ def task_output_dir(config: dict[str, str], task: Task) -> Path:
     return results_root(config) / task.task_id
 
 
+def available_disk_gib(path: Path) -> float:
+    stat = os.statvfs(path)
+    return stat.f_bavail * stat.f_frsize / (1024 ** 3)
+
+
 def remote_results_sync_enabled(config: dict[str, str]) -> bool:
     return as_bool(cfg(config, "REMOTE_RESULTS_SYNC_ENABLED", "0"))
+
+
+def remote_checkpoint_sync_enabled(config: dict[str, str]) -> bool:
+    return as_bool(cfg(config, "REMOTE_CHECKPOINT_SYNC_ENABLED", "0"))
 
 
 def remote_results_sync_baseline(config: dict[str, str]) -> set[str]:
@@ -1238,6 +1319,82 @@ def remote_results_sync_baseline(config: dict[str, str]) -> set[str]:
 
 def remote_result_sync_marker(output_dir: Path) -> Path:
     return output_dir / REMOTE_SYNC_MARKER_NAME
+
+
+def remote_checkpoint_sync_marker(output_dir: Path) -> Path:
+    return output_dir / REMOTE_CHECKPOINT_SYNC_MARKER_NAME
+
+
+def checkpoint_inventory(output_dir: Path) -> dict[str, dict[str, int]]:
+    inventory = {}
+    for path in task_checkpoint_files(output_dir):
+        stat = path.stat()
+        inventory[path.name] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    return inventory
+
+
+def remote_marker_matches_destination(
+    config: dict[str, str], task: Task, marker_path: Path,
+) -> bool:
+    host = cfg(config, "REMOTE_RESULTS_SYNC_HOST", "").strip()
+    remote_root = cfg(config, "REMOTE_RESULTS_SYNC_ROOT", "").strip().rstrip("/")
+    try:
+        marker = json.loads(marker_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("host") == host
+        and marker.get("task_id") == task.task_id
+        and marker.get("remote_path")
+        == posixpath.join(remote_root, task.task_id)
+    )
+
+
+def remote_result_sync_marker_is_current(
+    config: dict[str, str], task: Task, output_dir: Path,
+) -> bool:
+    marker_path = remote_result_sync_marker(output_dir)
+    if not remote_marker_matches_destination(config, task, marker_path):
+        return False
+    try:
+        marker_mtime_ns = marker_path.stat().st_mtime_ns
+        return all(
+            path.stat().st_mtime_ns <= marker_mtime_ns
+            for path in task_checkpoint_files(output_dir)
+        )
+    except OSError:
+        return False
+
+
+def checkpoint_sync_marker_is_current(
+    config: dict[str, str], task: Task, output_dir: Path,
+) -> bool:
+    inventory = checkpoint_inventory(output_dir)
+    if not inventory:
+        return False
+    marker_path = remote_checkpoint_sync_marker(output_dir)
+    if not remote_marker_matches_destination(config, task, marker_path):
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(marker, dict) and marker.get("files") == inventory
+
+
+def task_checkpoints_remotely_verified(
+    config: dict[str, str], task: Task, output_dir: Path,
+) -> bool:
+    if not task_checkpoint_files(output_dir):
+        return True
+    return bool(
+        checkpoint_sync_marker_is_current(config, task, output_dir)
+        or remote_result_sync_marker_is_current(config, task, output_dir)
+    )
 
 
 def remote_result_sync_eligible(
@@ -1383,6 +1540,137 @@ def sync_completed_task_result(
     return True
 
 
+def sync_task_checkpoints_to_remote(
+    config: dict[str, str], task: Task, output_dir: Path,
+) -> bool:
+    """Copy committed checkpoint files and verify every remote file size."""
+    root = results_root(config)
+    if output_dir.resolve().parent != root.resolve():
+        raise ValueError(f"Task output must be directly inside {root}: {output_dir}")
+    if "/" in task.task_id or "\\" in task.task_id:
+        raise ValueError(f"Invalid task ID for checkpoint sync: {task.task_id!r}")
+    checkpoint_files = task_checkpoint_files(output_dir)
+    if not checkpoint_files:
+        return True
+
+    host = cfg(config, "REMOTE_RESULTS_SYNC_HOST", "").strip()
+    user = cfg(config, "REMOTE_RESULTS_SYNC_USER", "").strip()
+    remote_root = cfg(config, "REMOTE_RESULTS_SYNC_ROOT", "").strip().rstrip("/")
+    if not host or not user or not remote_root.startswith("/"):
+        raise ValueError(
+            "REMOTE_RESULTS_SYNC_HOST, REMOTE_RESULTS_SYNC_USER, and an absolute "
+            "REMOTE_RESULTS_SYNC_ROOT are required"
+        )
+    ssh_args, rsync_ssh = remote_results_ssh_args(config)
+    timeout_seconds = max(
+        30, as_int(cfg(config, "REMOTE_RESULTS_SYNC_TIMEOUT_SECONDS", "300"), 300)
+    )
+    remote_path = posixpath.join(remote_root, task.task_id)
+    destination = f"{user}@{host}:{remote_path}/"
+    rsync_command = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--delay-updates",
+        f"--timeout={timeout_seconds}",
+        "--protect-args",
+        "-e", rsync_ssh,
+        *(str(path) for path in checkpoint_files),
+        destination,
+    ]
+    try:
+        transfer = subprocess.run(
+            rsync_command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"[{timestamp()}] WARNING: remote checkpoint sync failed for "
+            f"{task.task_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+    if transfer.returncode != 0:
+        detail = (transfer.stderr or transfer.stdout).strip()[-1000:]
+        print(
+            f"[{timestamp()}] WARNING: remote checkpoint sync failed for "
+            f"{task.task_id}: rsync_exit={transfer.returncode} detail={detail!r}",
+            flush=True,
+        )
+        return False
+
+    expected_sizes = {
+        path.name: path.stat().st_size for path in checkpoint_files
+    }
+    remote_files = [
+        posixpath.join(remote_path, name) for name in expected_sizes
+    ]
+    stat_command = " ".join((
+        "stat", "-c", shlex.quote("%n\t%s"),
+        *(shlex.quote(path) for path in remote_files),
+    ))
+    try:
+        verify = subprocess.run(
+            [*ssh_args, f"{user}@{host}", stat_command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            f"[{timestamp()}] WARNING: remote checkpoint verification failed for "
+            f"{task.task_id}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+    if verify.returncode != 0:
+        detail = (verify.stderr or verify.stdout).strip()[-1000:]
+        print(
+            f"[{timestamp()}] WARNING: remote checkpoint verification failed for "
+            f"{task.task_id}: ssh_exit={verify.returncode} detail={detail!r}",
+            flush=True,
+        )
+        return False
+    remote_sizes = {}
+    try:
+        for line in verify.stdout.splitlines():
+            path, size = line.rsplit("\t", 1)
+            remote_sizes[posixpath.basename(path)] = int(size)
+    except (ValueError, TypeError):
+        return False
+    if remote_sizes != expected_sizes:
+        print(
+            f"[{timestamp()}] WARNING: remote checkpoint size mismatch for "
+            f"{task.task_id}",
+            flush=True,
+        )
+        return False
+
+    marker_payload = {
+        "host": host,
+        "remote_path": remote_path,
+        "synced_at": timestamp(),
+        "task_id": task.task_id,
+        "files": checkpoint_inventory(output_dir),
+    }
+    marker = remote_checkpoint_sync_marker(output_dir)
+    temporary = marker.with_suffix(marker.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(marker_payload, indent=2, sort_keys=True) + "\n"
+    )
+    temporary.replace(marker)
+    print(
+        f"[{timestamp()}] REMOTE_CHECKPOINTS_SYNCED {task.task_id} "
+        f"count={len(checkpoint_files)} destination={destination}",
+        flush=True,
+    )
+    return True
+
+
 def task_manifest_path(output_dir: Path) -> Path:
     return output_dir / TASK_MANIFEST_NAME
 
@@ -1422,6 +1710,32 @@ def output_finished(output_dir: Path) -> bool:
     return any(output_dir.glob("checkpoint_*_final.pth"))
 
 
+def latest_online_checkpoint_step(output_dir: Path) -> int | None:
+    """Return the largest committed environment-step checkpoint in a result dir."""
+    steps = [
+        key[0]
+        for path in output_dir.glob("checkpoint_env*_opt*.pth")
+        if (key := full_checkpoint_key(path)) is not None
+    ]
+    return max(steps) if steps else None
+
+
+def output_finished_for_task(output_dir: Path, task: Task) -> bool:
+    """Treat an older completed online run as resumable, not terminal."""
+    if not output_finished(output_dir):
+        return False
+    if task.mode != "online":
+        return True
+    try:
+        requested_steps = int(task.steps)
+    except ValueError:
+        return True
+    latest_steps = latest_online_checkpoint_step(output_dir)
+    if latest_steps is None:
+        return True
+    return latest_steps >= requested_steps
+
+
 def completion_evidence(output_dir: Path) -> str:
     if output_complete(output_dir):
         return "COMPLETE"
@@ -1450,8 +1764,12 @@ def final_evaluation_complete(task: Task, output_dir: Path) -> bool:
     )
 
 
-def cleanup_completed_task_checkpoints(task: Task, output_dir: Path) -> bool:
-    if not task_deletes_checkpoints_after_completion(task):
+def cleanup_completed_task_checkpoints(
+    task: Task, output_dir: Path, *, force: bool = False,
+) -> bool:
+    if task_preserves_checkpoints_after_completion(task):
+        return False
+    if not force and not task_deletes_checkpoints_after_completion(task):
         return False
     if not final_evaluation_complete(task, output_dir):
         return False
@@ -1492,6 +1810,58 @@ def transient_failure_reason_from_log(config: dict[str, str], log_file: Path) ->
         if pattern in tail:
             return pattern
     return ""
+
+
+def disk_full_failure_reason_from_log(
+    config: dict[str, str], log_file: Path,
+) -> str:
+    if not as_bool(cfg(config, "REQUEUE_DISK_FULL", "1")):
+        return ""
+    tail = log_tail(log_file)
+    for pattern in DISK_FULL_PATTERNS:
+        if pattern in tail:
+            return pattern
+    return ""
+
+
+def requeue_disk_full_status(
+    config: dict[str, str],
+    task: Task,
+    status_dir: Path,
+    status: dict[str, str],
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Requeue checkpoint writes that failed because local storage filled."""
+    reason = disk_full_failure_reason_from_log(
+        config, Path(status.get("log_file", ""))
+    )
+    if not reason:
+        return False
+    retry_count = as_int(status.get("disk_full_retry_count", "0"), 0) + 1
+    extra = status_extra_fields(status)
+    extra.pop("finished_at", None)
+    extra.update({
+        "exit_code": status.get("exit_code", "1"),
+        "previous_gpu": status.get("gpu") or status.get("previous_gpu", ""),
+        "previous_pid": status.get("pid") or status.get("previous_pid", ""),
+        "error": "disk_full_requeued",
+        "requeue_reason": reason,
+        "disk_full_retry_count": str(retry_count),
+    })
+    if dry_run:
+        print(
+            f"[{timestamp()}] DRY_RUN would requeue disk-full failure "
+            f"{task.task_id}: reason={reason}",
+            flush=True,
+        )
+        return True
+    write_status(status_dir, task, "PENDING", extra)
+    print(
+        f"[{timestamp()}] REQUEUE_DISK_FULL {task.task_id} reason={reason}",
+        flush=True,
+    )
+    return True
 
 
 def requeue_transient_status(
@@ -1634,6 +2004,27 @@ def requeue_existing_cuda_oom_failures(
         )
 
 
+def requeue_existing_disk_full_failures(
+    config: dict[str, str],
+    tasks: list[Task],
+    status_dir: Path,
+    dry_run: bool,
+) -> None:
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        if status.get("state") != "FAILED":
+            continue
+        if status.get("task_fingerprint") != task_fingerprint(task):
+            continue
+        requeue_disk_full_status(
+            config,
+            task,
+            status_dir,
+            status,
+            dry_run=dry_run,
+        )
+
+
 def requeue_existing_transient_failures(
     config: dict[str, str],
     tasks: list[Task],
@@ -1682,6 +2073,9 @@ def task_identity_issue(status: dict[str, str], output_dir: Path, task: Task) ->
         return "invalid_output_task_manifest"
     if recorded != expected:
         return "output_task_definition_mismatch"
+    logs_only = as_bool(task_execution_options(task).get(TASK_LOGS_ONLY_ARG, 'false'))
+    if task_uses_native_qrl(task) and not logs_only and not output_finished_for_task(output_dir, task):
+        return "original_qrl_cannot_resume_partial_replay_use_fresh_task_id"
     return ""
 
 
@@ -1701,7 +2095,204 @@ def pause_for_identity_issue(
 
 def task_terminal(status: dict[str, str], retry_failed: bool) -> bool:
     state = status.get("state", "PENDING")
-    return state == "DONE" or state == "PAUSED" or (state == "FAILED" and not retry_failed)
+    return state in {"DONE", "PAUSED", "EARLY_STOPPED"} or (state == "FAILED" and not retry_failed)
+
+
+def plateau_pid_is_running(pid: str) -> bool:
+    """Treat an exited, unreaped orphan as stopped, even if /proc remains."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat[stat.rfind(")") + 2:][:1] not in {"Z", "X"}
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def stop_qrl_reproduction_plateaus(
+    config: dict[str, str], tasks: list[Task], status_dir: Path,
+    active: dict[str, ActiveJob], dry_run: bool,
+    *, hard_limits_only: bool = False,
+) -> None:
+    """Stop only the explicitly configured, identity-checked reproduction runs.
+
+    Running processes have no checkpoints. Their existing validation records
+    remain available, but a signal cannot run the usual independent final test.
+    """
+    rule_path = ROOT / "runs/qrl_queue/qrl_reproduction_plateau.json"
+    if not rule_path.is_file():
+        return
+    try:
+        rule = json.loads(rule_path.read_text())
+        if rule.get("enabled") is not True:
+            return
+        patience = int(rule["patience_env_steps"])
+        target_steps = rule["tasks"]
+        hard_steps = rule.get("hard_stop_env_steps", {})
+        if (patience <= 0 or not isinstance(target_steps, dict)
+                or not isinstance(hard_steps, dict)):
+            raise ValueError("invalid plateau rule")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        print(f"[{timestamp()}] WARNING: invalid QRL plateau rule: {exc}", flush=True)
+        return
+
+    for task in tasks:
+        is_hard_limit = task.task_id in hard_steps
+        if not is_hard_limit and (hard_limits_only or task.task_id not in target_steps):
+            continue
+        status = read_status(status_dir, task.task_id)
+        pid = status.get("pid", "")
+        if (status.get("state") != "RUNNING" or not pid.isdigit()
+                or status.get("task_fingerprint") != task_fingerprint(task)):
+            continue
+        try:
+            output_dir = Path(status["output_dir"])
+            if output_dir.name != task.task_id:
+                continue
+            if is_hard_limit:
+                evidence = validation_at_or_after(
+                    output_dir / "eval.log", target_steps=int(hard_steps[task.task_id]),
+                )
+            else:
+                evidence = plateau_from_eval_log(
+                    output_dir / "eval.log", min_steps=int(target_steps[task.task_id]),
+                    patience_steps=patience,
+                )
+        except (KeyError, ValueError, TypeError):
+            continue
+        if evidence is None or output_finished_for_task(output_dir, task):
+            continue
+
+        # Never trust a stale PID or target a different process after PID reuse.
+        try:
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            target_arg = f"output_folder={task.task_id}".encode()
+            if target_arg not in args or not is_queue_user_process(pid):
+                continue
+        except OSError:
+            continue
+        job = active.get(task.task_id)
+        if job is not None and (str(job.proc.pid) != pid or job.proc.poll() is not None):
+            continue
+        if is_hard_limit:
+            print(
+                f"[{timestamp()}] QRL_STEP_LIMIT {task.task_id} "
+                f"target={evidence['target_env_steps']} "
+                f"validation_step={evidence['trigger_validation_env_steps']}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[{timestamp()}] QRL_PLATEAU {task.task_id} "
+                f"steps={evidence['stop_env_steps']} best={evidence['best_validation_success']:.3f} "
+                f"best_step={evidence['best_validation_env_steps']} patience={patience}",
+                flush=True,
+            )
+        if dry_run:
+            continue
+        latest = read_status(status_dir, task.task_id)
+        if latest.get("state") != "RUNNING" or latest.get("pid") != pid:
+            continue
+        grace = max(10.0, termination_grace_seconds(config))
+        result = (terminate_process(job.proc, grace) if job is not None
+                  else terminate_pid(pid, config, grace))
+        if job is None and result == "kill_timeout" and not plateau_pid_is_running(pid):
+            result = "terminated:zombie"
+        if not (result.startswith("terminated") or result.startswith("killed:")
+                or result == "killed"):
+            print(f"[{timestamp()}] WARNING: QRL plateau stop failed: {result}", flush=True)
+            continue
+        if job is None and plateau_pid_is_running(pid):
+            print(f"[{timestamp()}] WARNING: QRL plateau PID still exists: {pid}", flush=True)
+            continue
+        if output_finished_for_task(output_dir, task):
+            if job is not None:
+                mark_finished(config, job, job.proc.returncode)
+                active.pop(task.task_id, None)
+            continue
+        extra = {key: str(value) for key, value in evidence.items()}
+        extra.update({
+            "error": ("requested_step_limit_early_stop" if is_hard_limit
+                      else "validation_plateau_early_stop"),
+            "previous_pid": pid,
+            "previous_gpu": status.get("gpu", ""),
+            "output_dir": str(output_dir),
+            "log_file": status.get("log_file", ""),
+            "terminate_result": result,
+            "independent_final_test": "not_performed",
+            "note": ("validation_logs_retained_training_may_advance_after_validation"
+                     if is_hard_limit else "existing_validation_logs_retained_no_checkpoint"),
+        })
+        write_status(status_dir, task, "EARLY_STOPPED", extra)
+        active.pop(task.task_id, None)
+        print(f"[{timestamp()}] EARLY_STOPPED {task.task_id} {result}", flush=True)
+
+
+def sync_task_checkpoints(
+    config: dict[str, str], tasks: list[Task], status_dir: Path,
+) -> bool:
+    """Back up committed checkpoints and remove verified completed copies."""
+    if not remote_checkpoint_sync_enabled(config):
+        return False
+    sync_limit = max(
+        1,
+        as_int(cfg(config, "REMOTE_CHECKPOINT_SYNC_MAX_PER_PASS", "2"), 2),
+    )
+    delete_completed = as_bool(
+        cfg(config, "REMOTE_CHECKPOINT_DELETE_COMPLETED_LOCAL", "0")
+    )
+    attempts = 0
+    pending = False
+    for task in tasks:
+        status = read_status(status_dir, task.task_id)
+        state = status.get("state", "PENDING")
+        if state == "RUNNING":
+            continue
+        output_dir = task_output_dir(config, task)
+        checkpoint_files = task_checkpoint_files(output_dir)
+        if not checkpoint_files:
+            continue
+
+        verified_full_result = bool(
+            state == "DONE"
+            and remote_result_sync_marker_is_current(
+                config, task, output_dir,
+            )
+        )
+        verified_checkpoints = checkpoint_sync_marker_is_current(
+            config, task, output_dir,
+        )
+        if not verified_full_result and not verified_checkpoints:
+            if attempts >= sync_limit:
+                pending = True
+                continue
+            attempts += 1
+            try:
+                verified_checkpoints = sync_task_checkpoints_to_remote(
+                    config, task, output_dir,
+                )
+            except (OSError, ValueError) as exc:
+                verified_checkpoints = False
+                print(
+                    f"[{timestamp()}] WARNING: remote checkpoint sync failed for "
+                    f"{task.task_id}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if not verified_checkpoints:
+                pending = True
+                continue
+
+        if (
+            state == "DONE"
+            and delete_completed
+            and not task_preserves_checkpoints_after_completion(task)
+            and final_evaluation_complete(task, output_dir)
+        ):
+            if not cleanup_completed_task_checkpoints(
+                task, output_dir, force=True,
+            ):
+                pending = True
+    return pending
 
 
 def sync_finished_outputs(
@@ -1740,7 +2331,7 @@ def sync_finished_outputs(
             if status.get("state") != "PAUSED" or status.get("error") != issue:
                 pause_for_identity_issue(status_dir, task, output_dir, issue)
             continue
-        if output_finished(output_dir) and status.get("state") != "DONE":
+        if output_finished_for_task(output_dir, task) and status.get("state") != "DONE":
             write_status(status_dir, task, "DONE", {
                 "exit_code": status.get("exit_code", "0"),
                 "output_dir": str(output_dir),
@@ -1775,7 +2366,11 @@ def sync_finished_outputs(
                     # copy has been verified. The next scheduler pass retries.
                     remote_sync_pending = True
                     continue
-            cleanup_completed_task_checkpoints(task, output_dir)
+            if (
+                not remote_checkpoint_sync_enabled(config)
+                or task_checkpoints_remotely_verified(config, task, output_dir)
+            ):
+                cleanup_completed_task_checkpoints(task, output_dir)
     return remote_sync_pending
 
 
@@ -2145,21 +2740,25 @@ def choose_pending(
         # Completion evidence is authoritative across scheduler restarts. A
         # stale PENDING/FAILED state must not launch a second run for a task
         # that was already recorded as complete.
-        if status.get("completion_evidence") and status.get("task_fingerprint") == task_fingerprint(task):
+        output_dir = task_output_dir(config, task)
+        if (
+            status.get("completion_evidence")
+            and status.get("task_fingerprint") == task_fingerprint(task)
+            and output_finished_for_task(output_dir, task)
+        ):
             write_status(status_dir, task, "DONE", {
                 "exit_code": status.get("exit_code", "0"),
-                "output_dir": status.get("output_dir", str(task_output_dir(config, task))),
+                "output_dir": status.get("output_dir", str(output_dir)),
                 "completed_from_status": "1",
                 "completion_evidence": status.get("completion_evidence", ""),
             })
             print(f"[{timestamp()}] SKIP_COMPLETED_STATUS {task.task_id}", flush=True)
             continue
-        output_dir = task_output_dir(config, task)
         issue = task_identity_issue(status, output_dir, task)
         if issue:
             pause_for_identity_issue(status_dir, task, output_dir, issue)
             continue
-        if output_finished(output_dir):
+        if output_finished_for_task(output_dir, task):
             write_status(status_dir, task, "DONE", {
                 "exit_code": status.get("exit_code", "0"),
                 "output_dir": str(output_dir),
@@ -2253,11 +2852,27 @@ def command_env(config: dict[str, str], gpu: str) -> dict[str, str]:
 
 
 def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[str], dict[str, str], Path, Path]:
-    qrl_dir = resolve_path(cfg(config, "QRL_OFFICIAL_DIR", "."))
+    execution = task_execution_options(task)
+    native_qrl = task_uses_native_qrl(task)
+    qrl_dir = resolve_path(execution.get(TASK_CODE_REPO_ARG, cfg(config, "QRL_OFFICIAL_DIR", ".")))
+    revision = execution.get(TASK_CODE_REVISION_ARG)
+    if native_qrl and (TASK_CODE_REPO_ARG not in execution or not revision):
+        raise ValueError("Original QRL tasks require an explicit code repository and revision")
+    if revision:
+        actual = git_output(["rev-parse", "HEAD"], cwd=qrl_dir).strip()
+        if actual != revision:
+            raise ValueError(f"Task source revision mismatch: expected {revision}, found {actual}")
+        dirty = git_output(["status", "--porcelain", "--untracked-files=no"], cwd=qrl_dir).strip()
+        if dirty:
+            raise ValueError(f"Task source repository has modified tracked files: {qrl_dir}")
     python_bin = resolve_executable(cfg(config, "QRL_PYTHON_BIN", ".venv/bin/python"))
     output_dir = task_output_dir(config, task)
     output_dir.mkdir(parents=True, exist_ok=True)
-    env = command_env(config, gpu)
+    env = command_env({**config, "QRL_OFFICIAL_DIR": str(qrl_dir)}, gpu)
+    if native_qrl:
+        env["PYTHONPATH"] = os.pathsep.join((
+            str(qrl_dir), str(qrl_dir / "third_party/torch-quasimetric"),
+        ))
     extra = task_training_args(task)
     resume_enabled = bool_arg_value(
         extra,
@@ -2271,9 +2886,9 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
         f"output_folder={task.task_id}",
         f"overwrite_output={cfg(config, 'OVERWRITE_OUTPUT', 'False')}",
     ]
-    if as_bool(cfg(config, "RESUME_IF_POSSIBLE", "1")):
+    if not native_qrl and as_bool(cfg(config, "RESUME_IF_POSSIBLE", "1")):
         common.append("resume_if_possible=True")
-    if task.mode == "online":
+    if task.mode == "online" and not native_qrl:
         save_replay_buffer = bool_arg_value(
             extra,
             "save_replay_buffer",
@@ -2296,6 +2911,10 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
             *common,
             *extra,
         ]
+        if native_qrl and as_bool(execution.get(TASK_LOGS_ONLY_ARG, 'false')):
+            # Execute the pinned, untouched original sources, suppressing only
+            # their checkpoint serialization through an external launcher.
+            cmd[1:3] = [str(ROOT / 'tools/run_native_qrl_logs_only.py')]
     elif task.mode == "offline":
         cmd = [
             str(python_bin), "-m", "offline.main",
@@ -2308,6 +2927,24 @@ def build_command(config: dict[str, str], task: Task, gpu: str) -> tuple[list[st
     else:
         raise ValueError(f"unsupported mode: {task.mode}")
     return cmd, env, qrl_dir, output_dir
+
+
+def archive_logs_only_attempt(task: Task, output_dir: Path, status: dict[str, str]) -> Path | None:
+    """Preserve a failed logs-only attempt before an exact, fresh restart."""
+    if not as_bool(task_execution_options(task).get(TASK_LOGS_ONLY_ARG, 'false')):
+        return None
+    if not output_started(output_dir) or output_finished_for_task(output_dir, task):
+        return None
+    if status.get('state') == 'RUNNING':
+        raise RuntimeError('Refusing to archive a running training attempt')
+    if task_manifest_fingerprint(output_dir) != task_fingerprint(task):
+        raise RuntimeError('Refusing to archive output belonging to another task definition')
+    if status.get('pid') and is_queue_user_process(status['pid']):
+        raise RuntimeError('Refusing to archive output with a live training process')
+    archive = output_dir.with_name(output_dir.name + f'__attempt_{time.time_ns()}')
+    output_dir.rename(archive)
+    print(f'[{timestamp()}] ARCHIVE_LOGS_ONLY_ATTEMPT {task.task_id} path={archive}', flush=True)
+    return archive
 
 
 def launch_task(
@@ -2325,7 +2962,7 @@ def launch_task(
     if issue:
         pause_for_identity_issue(status_dir, task, output_dir, issue)
         return None
-    if output_finished(output_dir):
+    if output_finished_for_task(output_dir, task):
         write_status(status_dir, task, "DONE", {
             "exit_code": "0",
             "output_dir": str(output_dir),
@@ -2334,6 +2971,7 @@ def launch_task(
         })
         print(f"[{timestamp()}] SKIP_FINISHED_OUTPUT {task.task_id}", flush=True)
         return None
+    archive_logs_only_attempt(task, output_dir, status)
     cmd, env, cwd, output_dir = build_command(config, task, gpu)
     write_task_manifest(output_dir, task)
     log_file = log_dir / f"{task.task_id}_{time.strftime('%Y%m%d-%H%M%S')}.log"
@@ -2357,7 +2995,7 @@ def launch_task(
 
 def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> None:
     status_dir = resolve_path(cfg(config, "STATUS_DIR", "runs/qrl_queue/status"))
-    finished = output_finished(job.output_dir)
+    finished = output_finished_for_task(job.output_dir, job.task)
     previous = read_status(status_dir, job.task.task_id)
     interrupted_exit_codes = {130, -signal.SIGINT, -signal.SIGTERM}
     if not finished and exit_code in interrupted_exit_codes:
@@ -2393,6 +3031,13 @@ def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> Non
         "output_dir": str(job.output_dir),
         "completion_evidence": completion_evidence(job.output_dir),
     })
+    if not finished and exit_code != 0 and requeue_disk_full_status(
+        config,
+        job.task,
+        status_dir,
+        transient_status,
+    ):
+        return
     if not finished and exit_code != 0 and requeue_transient_status(
         config,
         job.task,
@@ -2421,7 +3066,8 @@ def mark_finished(config: dict[str, str], job: ActiveJob, exit_code: int) -> Non
         flush=True,
     )
     if state == "DONE":
-        cleanup_completed_task_checkpoints(job.task, job.output_dir)
+        if not remote_checkpoint_sync_enabled(config):
+            cleanup_completed_task_checkpoints(job.task, job.output_dir)
 
 
 def main() -> int:
@@ -2476,6 +3122,9 @@ def main() -> int:
             dry_run = as_bool(cfg(config, "DRY_RUN", "0"))
             stop_on_failure = as_bool(cfg(config, "STOP_ON_FAILURE", "0"))
             requeue_existing_cuda_oom_failures(config, tasks, status_dir, dry_run)
+            requeue_existing_disk_full_failures(
+                config, tasks, status_dir, dry_run,
+            )
             requeue_existing_transient_failures(config, tasks, status_dir, dry_run)
             pending_before_scheduling = any(
                 read_status(status_dir, task.task_id).get("state", "PENDING")
@@ -2499,8 +3148,14 @@ def main() -> int:
                 )
 
             if args.sync_only:
-                remote_sync_pending = sync_finished_outputs(
+                checkpoint_sync_pending = sync_task_checkpoints(
                     config, tasks, status_dir,
+                )
+                result_sync_pending = sync_finished_outputs(
+                    config, tasks, status_dir,
+                )
+                remote_sync_pending = (
+                    checkpoint_sync_pending or result_sync_pending
                 )
                 terminal = bool(tasks) and not remote_sync_pending and all(
                     task_terminal(read_status(status_dir, task.task_id), retry_failed)
@@ -2514,7 +3169,7 @@ def main() -> int:
                         queue_terminal=terminal,
                         pending_was_present=pending_before_scheduling,
                     )
-                return 0
+                return 1 if remote_sync_pending else 0
 
             evict_disallowed_active_jobs(config, active, status_dir, allowed_gpus, dry_run)
 
@@ -2536,6 +3191,7 @@ def main() -> int:
                         )
                     return exit_code
 
+            stop_qrl_reproduction_plateaus(config, tasks, status_dir, active, dry_run)
             apps = gpu_compute_apps()
             update_running_gpu_memory_peaks(tasks, status_dir, apps, dry_run=dry_run)
             legal_pids = legal_running_gpu_pids(tasks, status_dir, allowed_gpus, apps)
@@ -2548,11 +3204,15 @@ def main() -> int:
                 if gpu not in gpu_states:
                     print(f"[{timestamp()}] WARNING: cannot query GPU {gpu}; treating as busy.", flush=True)
 
-            remote_sync_pending = sync_finished_outputs(
-                config, tasks, status_dir,
-            )
             running_by_gpu = reconcile_running_statuses(
                 config, tasks, status_dir, allowed_gpus, apps, dry_run)
+            checkpoint_sync_pending = sync_task_checkpoints(
+                config, tasks, status_dir,
+            )
+            result_sync_pending = sync_finished_outputs(
+                config, tasks, status_dir,
+            )
+            remote_sync_pending = checkpoint_sync_pending or result_sync_pending
             active_task_ids = {job.task.task_id for job in active.values()}
             running_queue_pids: set[str] = set()
             for task in tasks:
@@ -2564,7 +3224,34 @@ def main() -> int:
                         running_queue_pids.add(pid)
 
             deferred_task_ids: set[str] = set()
-            while True:
+            minimum_free_gib = max(
+                0.0, as_float(cfg(config, "MIN_FREE_DISK_GIB", "0"), 0.0)
+            )
+            free_gib = (
+                available_disk_gib(results_root(config))
+                if minimum_free_gib > 0 else None
+            )
+            scheduling_blocked = bool(
+                checkpoint_sync_pending
+                and as_bool(cfg(
+                    config,
+                    "REMOTE_CHECKPOINT_SYNC_BLOCK_SCHEDULING_WHILE_PENDING",
+                    "0",
+                ))
+            )
+            if free_gib is not None and free_gib < minimum_free_gib:
+                scheduling_blocked = True
+                print(
+                    f"[{timestamp()}] LOW_DISK_SPACE free={free_gib:.1f}GiB "
+                    f"required={minimum_free_gib:.1f}GiB; new launches paused",
+                    flush=True,
+                )
+            elif scheduling_blocked:
+                print(
+                    f"[{timestamp()}] CHECKPOINT_SYNC_BACKLOG; new launches paused",
+                    flush=True,
+                )
+            while not scheduling_blocked:
                 candidates = []
                 for gpu in allowed_gpus:
                     if gpu not in gpu_states or gpu_in_start_cooldown(config, gpu, gpu_launched_at):
@@ -2671,6 +3358,7 @@ def main() -> int:
                 status_dir,
                 as_float(cfg(config, "POLL_SECONDS", "30"), 30.0),
                 dry_run,
+                active=active,
             )
     finally:
         lock.release()

@@ -226,7 +226,7 @@ class ExtendedOnlineTaskGeneratorTest(unittest.TestCase):
         environments = {environment.name: environment for environment in ENVIRONMENTS}
         expected = {
             'dog_fetch': (210, 38, 3, 1000),
-            'HandReach-v2': (63, 20, 15, 50),
+            'HandReach-v3': (63, 20, 15, 50),
             'HandManipulateBlockRotateZ_BooleanTouchSensors-v1': (
                 158, 20, 9, 100,
             ),
@@ -250,7 +250,7 @@ class ExtendedOnlineTaskGeneratorTest(unittest.TestCase):
         cqrl = load_model_size_preset('cqrl', 'm')
         legacy = load_model_size_preset('go_qrl', 'm')
         self.assertEqual(cqrl.model_size, 'CQRL-M')
-        self.assertEqual(legacy.model_size, 'GO-QRL-M')
+        self.assertEqual(legacy.model_size, 'CQRL-M')
         self.assertEqual(
             cqrl.quasimetric_critic.model.encoder,
             legacy.quasimetric_critic.model.encoder,

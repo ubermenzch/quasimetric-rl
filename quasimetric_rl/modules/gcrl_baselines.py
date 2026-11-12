@@ -21,6 +21,10 @@ FETCH_MANIPULATION_ENVIRONMENTS = frozenset({
     ('gcrl', 'FetchSlide'),
     ('gcrl', 'FetchPickAndPlace'),
 })
+CRL_ANT_MAZE_ENVIRONMENTS = frozenset({
+    ('gymnasium_robotics', 'AntMaze_UMaze-v5'),
+    ('gymnasium_robotics', 'AntMaze_BigMaze_DGR-v5'),
+})
 TD_INFONCE_REFERENCE_REVISION = '18f4e7e5872da9c3653f57661d01b4fbce85b50e'
 CRL_REFERENCE_REVISION = 'ec7c3d346277b737bc2decffcd1b533d4b7ec105'
 SCALING_CRL_REFERENCE_REVISION = '17acb519ddc4325c8662b1f8c68ed6a5f31857fc'
@@ -38,9 +42,11 @@ def resolve_baseline_goal_dims(
     success_goal_dims = tuple(int(dim) for dim in success_goal_dims)
     _validate_goal_dims(success_goal_dims, state_dim)
 
-    # The original 2022 CRL configuration defaults to start_index=0 and
-    # end_index=-1, including the complete future state in every environment.
+    # Official CRL uses end_index=2 for AntMaze and the complete future state
+    # elsewhere (start_index=0, end_index=-1 by default).
     if algorithm == 'crl':
+        if (env_kind, env_name) in CRL_ANT_MAZE_ENVIRONMENTS:
+            return success_goal_dims
         return tuple(range(state_dim))
     if algorithm == 'scaling_crl':
         return success_goal_dims
@@ -295,6 +301,8 @@ class GCRLBaselinesConf:
             )
         state_dim = env_spec.observation_shape.numel()
         action_dim = env_spec.action_shape.numel()
+        if isinstance(env_spec.action_space, gym.spaces.Discrete) and algorithm not in ('gcsl', 'gcbc'):
+            raise TypeError('Native discrete actions are currently supported only by GCSL')
         _validate_goal_dims(goal_dims, state_dim)
         actor_log_std_bounds = None
         actor_min_std = None
@@ -548,6 +556,18 @@ class FactorizedDiscretizedActionDistribution:
         return self._categorical.log_prob(labels).sum(dim=-1)
 
 
+class NativeDiscreteActionDistribution(torch.distributions.Categorical):
+    """Use the greedy category for the policy's deterministic-action API."""
+
+    @property
+    def mean(self):
+        return self.logits.argmax(dim=-1)
+
+    @property
+    def mode(self):
+        return self.mean
+
+
 class GoalConditionedPolicy(Module):
     def __init__(
             self, *, env_spec: EnvSpec, goal_dim: int,
@@ -561,7 +581,10 @@ class GoalConditionedPolicy(Module):
         super().__init__()
         state_dim = env_spec.observation_shape.numel()
         self.action_output = env_spec.make_action_output_distn()
-        if action_granularity is None:
+        self.num_discrete_actions = (
+            env_spec.action_space.n if isinstance(env_spec.action_space, gym.spaces.Discrete) else None
+        )
+        if action_granularity is None or self.num_discrete_actions is not None:
             output_size = self.action_output.input_size
             action_table = None
             action_bins = None
@@ -620,6 +643,8 @@ class GoalConditionedPolicy(Module):
         self.min_std = min_std
 
     def sample_uniform_action(self) -> torch.Tensor:
+        if self.num_discrete_actions is not None:
+            return torch.randint(self.num_discrete_actions, (), device=next(self.parameters()).device)
         if self.action_table is not None:
             index = torch.randint(
                 self.action_table.shape[0], (), device=self.action_table.device,
@@ -642,6 +667,8 @@ class GoalConditionedPolicy(Module):
             self, observation: torch.Tensor,
             goal: torch.Tensor) -> torch.distributions.Distribution:
         features = self.backbone(torch.cat([observation, goal], dim=-1))
+        if self.num_discrete_actions is not None:
+            return NativeDiscreteActionDistribution(logits=features)
         if self.action_table is not None:
             return DiscretizedActionDistribution(features, self.action_table)
         if self.action_bins is not None:

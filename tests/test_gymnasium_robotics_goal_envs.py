@@ -14,7 +14,7 @@ from quasimetric_rl.data.online import gymnasium_robotics as robotics
 
 
 REQUESTED_TASKS = {
-    'HandReach-v2',
+    'HandReach-v3',
     'HandManipulateBlockRotateZ-v1',
     'HandManipulateEggRotate-v1',
     'HandManipulatePenRotate-v1',
@@ -151,7 +151,7 @@ class TaskSpecificationTest(unittest.TestCase):
                     )
 
     def test_official_family_dimensions_and_horizons_are_pinned(self):
-        reach = robotics.TASK_SPECS['HandReach-v2']
+        reach = robotics.TASK_SPECS['HandReach-v3']
         self.assertEqual(
             (reach['state_dim'], reach['action_dim'], reach['episode_length']),
             (63, 20, 50),
@@ -208,7 +208,7 @@ class TaskSpecificationTest(unittest.TestCase):
 
     def test_native_goal_indices_match_official_observation_layouts(self):
         self.assertEqual(
-            robotics.TASK_SPECS['HandReach-v2']['native_goal_indices'],
+            robotics.TASK_SPECS['HandReach-v3']['native_goal_indices'],
             tuple(range(48, 63)),
         )
         for name in NON_TOUCH_MANIPULATION_TASKS:
@@ -289,20 +289,50 @@ class TaskSpecificationTest(unittest.TestCase):
             max_episode_steps=1000,
         )
 
-    def test_hand_reach_v2_does_not_silently_change_protocol(self):
+    def test_hand_reach_v3_does_not_fall_back_to_defective_v2(self):
         fake_gymnasium = SimpleNamespace(
             register_envs=mock.Mock(),
-            make=mock.Mock(side_effect=LookupError('v2 is not registered')),
+            make=mock.Mock(side_effect=LookupError('v3 is not registered')),
         )
         with mock.patch.dict(sys.modules, {
             'gymnasium': fake_gymnasium,
             'gymnasium_robotics': SimpleNamespace(),
         }):
-            with self.assertRaisesRegex(RuntimeError, 'HandReach-v2'):
-                robotics._make_backend('HandReach-v2')
+            with self.assertRaisesRegex(RuntimeError, 'HandReach-v3'):
+                robotics._make_backend('HandReach-v3')
         fake_gymnasium.make.assert_called_once_with(
-            'HandReach-v2', max_episode_steps=50,
+            'HandReach-v3', max_episode_steps=50,
         )
+
+    def test_hand_reach_v3_uses_explicit_version_gated_backport(self):
+        fake_backend = object()
+        fake_gymnasium = SimpleNamespace(
+            register_envs=mock.Mock(),
+            make=mock.Mock(side_effect=LookupError('v3 is not registered')),
+        )
+        with mock.patch.dict(sys.modules, {
+            'gymnasium': fake_gymnasium,
+            'gymnasium_robotics': SimpleNamespace(),
+        }), mock.patch.object(
+            robotics,
+            '_make_hand_reach_v3_backport',
+            return_value=(fake_backend, 'HandReach-v3-backport'),
+        ) as make_backport:
+            backend, backend_id = robotics._make_backend('HandReach-v3')
+
+        self.assertIs(backend, fake_backend)
+        self.assertEqual(backend_id, 'HandReach-v3-backport')
+        make_backport.assert_called_once_with()
+        fake_gymnasium.make.assert_called_once_with(
+            'HandReach-v3', max_episode_steps=50,
+        )
+
+    def test_hand_reach_backport_rejects_other_package_versions(self):
+        with mock.patch.object(
+            robotics.importlib.metadata, 'version', return_value='1.3.0',
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'restricted.*1.3.1'):
+                robotics._make_hand_reach_v3_backport()
 
     def test_new_ant_maze_names_fall_back_to_legacy_registry_ids(self):
         fake_backend = object()
@@ -328,6 +358,32 @@ class TaskSpecificationTest(unittest.TestCase):
 
 
 class GoalMappingTest(unittest.TestCase):
+    def test_hand_reach_reset_guard_rejects_state_drift_and_zero_goal(self):
+        spec = robotics.TASK_SPECS['HandReach-v3']
+        raw_goal = np.ones(spec['raw_goal_size'], dtype=np.float32)
+        backend = FakeGoalEnv(
+            observation=native_observation(spec, raw_goal),
+            achieved=raw_goal,
+            desired=raw_goal,
+            action_dim=spec['action_dim'],
+        )
+        backend.data = SimpleNamespace(qpos=np.zeros(2), qvel=np.zeros(2))
+        backend.initial_qpos = np.zeros(2)
+        backend.initial_qvel = np.zeros(2)
+        env = robotics.GymnasiumRoboticsGoalEnv(
+            'HandReach-v3', backend_env=backend,
+        )
+
+        env._validate_hand_reach_reset(backend._observation())
+        backend.data.qpos[0] = 0.01
+        with self.assertRaisesRegex(RuntimeError, 'qpos max error'):
+            env._validate_hand_reach_reset(backend._observation())
+        backend.data.qpos[:] = 0.0
+        zero_observation = backend._observation()
+        zero_observation['achieved_goal'][:] = 0.0
+        with self.assertRaisesRegex(RuntimeError, 'all-zero'):
+            env._validate_hand_reach_reset(zero_observation)
+
     def test_every_task_produces_same_shaped_qrl_goal_observations(self):
         for name, spec in robotics.TASK_SPECS.items():
             raw_goal = np.zeros(spec['raw_goal_size'], dtype=np.float32)

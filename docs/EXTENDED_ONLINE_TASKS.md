@@ -6,6 +6,11 @@ are deliberately pruned: easy is preferred to hard, Medium to Large, and
 `stack_2` to `stack_4`. Different objects, control modes, and sensor modalities
 remain because they test distinct partial-goal structures.
 
+The adapters also register `point_mass_hard` and `finger_turn_hard` for
+targeted follow-up experiments. They are intentionally excluded from the
+curated matrix; the one-seed CQRL/1-L follow-up is defined in
+`configs/extended_online_cqrl1_l_dmc_hard_1seed.tsv`.
+
 Every adapter returns fixed-length legacy Gym API episodes and same-shaped
 `observation`, `achieved_goal`, and `desired_goal` vectors. Task coordinates
 form a prefix of the full state and are registered in
@@ -34,13 +39,15 @@ while retaining its quaternion and the rest of qpos, qvel, and activations.
 `ball_in_cup_catch` uses ball displacement in the moving cup-target frame, so
 the desired goal is zero. Stacker uses the XY position of the box nearest the
 fixed target. Because stacker has no native binary success API, this repository
-defines success as `reward >= 0.95`.
+defines success as box closeness of at least `0.95` under dm_control's native
+tolerance function. Its shaped reward remains unchanged and additionally
+includes dm_control's hand-clearance factor.
 
 ### Gymnasium-Robotics Shadow Hand (10)
 
 | Name | State | Action | Goal | Horizon |
 | --- | ---: | ---: | ---: | ---: |
-| `HandReach-v2` | 63 | 20 | 15 | 50 |
+| `HandReach-v3` | 63 | 20 | 15 | 50 |
 | `HandManipulateBlockRotateZ-v1` | 66 | 20 | 9 | 100 |
 | `HandManipulateEggRotate-v1` | 66 | 20 | 9 | 100 |
 | `HandManipulatePenRotate-v1` | 66 | 20 | 9 | 100 |
@@ -59,7 +66,10 @@ Use `env.kind=gymnasium_robotics`. Quaternion goals are mapped to a
 sign-invariant 3x3 rotation matrix. The adapter removes fingertip coordinates
 48--62 from HandReach and native quaternion coordinates 57--60 from each
 rotation task. Object position and all touch channels remain non-goal state.
-`HandReach-v2` never silently falls back to a later environment version.
+New installs pin Gymnasium-Robotics 1.3.2 for `HandReach-v3`, which restores the
+configured initial hand pose during reset. Already-provisioned 1.3.1 environments
+use the repository's version-gated v3 reset backport; its backend ID records that
+fact. Neither path can run the defective v2 reset protocol.
 
 ### Gymnasium-Robotics mazes (5)
 
@@ -131,7 +141,7 @@ when they are absent.
 ## Training matrix
 
 `tools/generate_extended_online_tasks.py` covers QRL, TD-InfoNCE, GCSL,
-C-Learning, CRL, and CQRL/Inner0, Inner1, Inner4, and Inner8. Its default
+C-Learning, CRL, and CQRL/0, CQRL/1, CQRL/4, and CQRL/8. Its default
 protocol selects one primary capacity and budget per environment:
 
 | Native horizon | Default capacity | Requested steps | Checkpoint interval |

@@ -377,6 +377,40 @@ scheduler stopped, process newly marked completed tasks once with:
   --config configs/qrl_queue.env --sync-only
 ```
 
+### Remote checkpoint backup
+
+To keep metrics and logs local while backing up only top-level checkpoint
+files, configure the existing `REMOTE_RESULTS_SYNC_HOST`, user, root, key, and
+known-hosts fields, then enable:
+
+```text
+REMOTE_RESULTS_SYNC_ENABLED=0
+REMOTE_CHECKPOINT_SYNC_ENABLED=1
+REMOTE_CHECKPOINT_SYNC_MAX_PER_PASS=16
+REMOTE_CHECKPOINT_DELETE_COMPLETED_LOCAL=1
+REMOTE_CHECKPOINT_SYNC_BLOCK_SCHEDULING_WHILE_PENDING=1
+MIN_FREE_DISK_GIB=100
+```
+
+The runner transfers every committed top-level `*.pth` file for non-running
+tasks and verifies each remote file size before recording the backup. Partial
+task checkpoints stay local for resume. A completed task's local checkpoints
+are deleted only after remote verification and complete final-evaluation
+evidence; logs, metrics, manifests, TensorBoard data, and evaluation summaries
+stay local. While a backup backlog exists, or free space is below
+`MIN_FREE_DISK_GIB`, new training launches remain paused.
+
+With the scheduler stopped, migrate the whole current backlog in one pass:
+
+```bash
+REMOTE_CHECKPOINT_SYNC_MAX_PER_PASS=1000 \
+  .venv/bin/python tools/run_qrl_queue.py \
+  --config configs/qrl_queue.env --sync-only
+```
+
+The command exits nonzero if any eligible checkpoint still lacks a verified
+remote copy. It is idempotent and can be rerun after an interrupted transfer.
+
 `tools/diagnose_qrl_goal_bias.py` is an optional cross-project analysis tool,
 not a training requirement. It needs the companion `scaling-crl` checkout; set
 `SCALING_CRL_ROOT` to that checkout when using the diagnostic.

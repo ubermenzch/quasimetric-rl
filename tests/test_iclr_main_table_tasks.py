@@ -13,6 +13,7 @@ from tools.generate_iclr_main_table_tasks import (
     baseline_model_size,
     extra_arg_map,
     generate_all_tasks,
+    gcsl_uses_factorized_actions,
     local_groups,
     partition_tasks,
     task_group,
@@ -78,7 +79,7 @@ class ICLRMainTableTasksTest(unittest.TestCase):
             self.assertEqual(args['resume_if_possible'], 'true')
             self.assertNotIn('queue.delete_checkpoints_after_completion', args)
 
-    def test_uses_environment_specific_gcsl_l_presets(self):
+    def test_high_dimensional_gcsl_uses_official_factorized_policy(self):
         gcsl = next(
             algorithm for algorithm in ALGORITHMS if algorithm.key == 'gcsl'
         )
@@ -89,19 +90,30 @@ class ICLRMainTableTasksTest(unittest.TestCase):
         }
         self.assertEqual(levels, {
             'fetchslide': 'l',
-            'pusher_v4': 'l_pusher',
-            'antnavigate_v4': 'l_antnavigate',
+            'pusher_v4': 'l',
+            'antnavigate_v4': 'l',
         })
         gcsl_tasks = {
             task.env_name: extra_arg_map(task)
             for task in self.tasks
             if task_group(task)[0] == 'gcsl' and task.seed == '1000'
         }
-        self.assertEqual(gcsl_tasks['Pusher-v4']['+gcsl_model_size'], 'l_pusher')
-        self.assertEqual(
-            gcsl_tasks['AntNavigate-v4']['+gcsl_model_size'],
-            'l_antnavigate',
-        )
+        for environment in ('Pusher-v4', 'AntNavigate-v4'):
+            self.assertEqual(gcsl_tasks[environment]['+gcsl_model_size'], 'l')
+            self.assertEqual(
+                gcsl_tasks[environment][
+                    'agent.baselines.gcbc.action_discretization'
+                ],
+                'factorized',
+            )
+        pusher = next(env for env in ENVIRONMENTS if env.name == 'Pusher-v4')
+        ant = next(env for env in ENVIRONMENTS if env.name == 'AntNavigate-v4')
+        self.assertTrue(gcsl_uses_factorized_actions(pusher))
+        self.assertTrue(gcsl_uses_factorized_actions(ant))
+        for task in self.tasks:
+            if task.env_name in ('Pusher-v4', 'AntNavigate-v4') and (
+                    task_group(task)[0] == 'gcsl'):
+                self.assertIn('_factorized_', task.task_id)
 
     def test_append_is_idempotent(self):
         local = partition_tasks(self.tasks, 'local_2x')

@@ -13,6 +13,7 @@ import yaml
 import logging
 import socket
 import subprocess
+from tools.git_metadata import git_output
 import tempfile
 
 import hydra
@@ -49,16 +50,13 @@ class BaseConf(abc.ABC):
         mode=hydra.types.RunMode.RUN,  # sigh: https://github.com/facebookresearch/hydra/issues/2262
     )
 
-    base_git_dir: str = subprocess.check_output(
-        r'git rev-parse --show-toplevel'.split(),
-        cwd=os.path.dirname(__file__), encoding='utf-8').strip()
-    git_commit: str = subprocess.check_output(
-        r'git rev-parse HEAD'.split(),
-        cwd=os.path.dirname(__file__), encoding='utf-8').strip()
+    base_git_dir: str = git_output(
+        ['rev-parse', '--show-toplevel'], cwd=os.path.dirname(__file__)).strip()
+    git_commit: str = git_output(
+        ['rev-parse', 'HEAD'], cwd=os.path.dirname(__file__)).strip()
     git_status: Tuple[str] = tuple(
-        l.strip() for l in subprocess.check_output(
-            r'git status --short'.split(),
-            cwd=os.path.dirname(__file__), encoding='utf-8').strip().split('\n')
+        l.strip() for l in git_output(
+            ['status', '--short'], cwd=os.path.dirname(__file__)).strip().split('\n')
         )
 
     overwrite_output: bool = False

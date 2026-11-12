@@ -10,9 +10,9 @@ from quasimetric_rl.data.env_spec import EnvSpec
 from quasimetric_rl.model_size import (
     QRL_MODEL_SIZE_LEVELS,
     SCALING_CRL_MODEL_SIZE_LEVELS,
-    go_qrl_agent_parameter_count,
+    cqrl_agent_parameter_count,
     load_model_size_preset,
-    match_go_qrl_split_encoder,
+    match_cqrl_split_encoder,
     qrl_agent_parameter_count,
     scaling_crl_agent_parameter_count,
     select_qrl_model_size,
@@ -27,12 +27,12 @@ from quasimetric_rl.modules.utils import ResidualBlock, ResidualMLP
 class QRLModelSizePresetTest(unittest.TestCase):
     EXPECTED = {
         's': dict(
-            qrl_name='QRL-S', go_name='GO-QRL-S', latent=128, width=512,
+            qrl_name='QRL-S', go_name='CQRL-S', latent=128, width=512,
             qrl_params=2_112_261, go_params=2_206_469,
             goal_arch=(350, 396), non_goal_arch=(404, 350),
         ),
         'm': dict(
-            qrl_name='QRL-M', go_name='GO-QRL-M', latent=256, width=768,
+            qrl_name='QRL-M', go_name='CQRL-M', latent=256, width=768,
             qrl_params=4_150_533, go_params=4_439_301,
             goal_arch=(518, 609), non_goal_arch=(596, 543),
         ),
@@ -198,7 +198,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 for gradient in gradients
             ))
 
-    def test_go_qrl_presets_match_qrl_encoder_budget(self):
+    def test_cqrl_presets_match_qrl_encoder_budget(self):
         env_spec = EnvSpec(
             observation_space=gym.spaces.Box(
                 -np.inf, np.inf, shape=(4,), dtype=np.float32,
@@ -210,7 +210,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
         for level in ('s', 'm'):
             with self.subTest(level=level):
                 expected = self.EXPECTED[level]
-                conf = self.make_conf('go_qrl', level)
+                conf = self.make_conf('cqrl', level)
                 conf.quasimetric_critic.model.encoder.goal_dims = (0, 1)
                 self.assertEqual(conf.model_size, expected['go_name'])
                 agent, _ = conf.make(env_spec=env_spec, total_optim_steps=1)
@@ -222,7 +222,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     expected['non_goal_arch'],
                 )
                 encoder_count = sum(parameter.numel() for parameter in encoder.parameters())
-                plan = match_go_qrl_split_encoder(
+                plan = match_cqrl_split_encoder(
                     4, 2, expected['latent'], (expected['width'],) * 2,
                 )
                 self.assertEqual(encoder_count, plan.qrl_encoder_parameters)
@@ -233,42 +233,42 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 )
                 self.assertEqual(parameter_count, expected['go_params'])
                 self.assertEqual(
-                    go_qrl_agent_parameter_count(4, 2, 2, level),
+                    cqrl_agent_parameter_count(4, 2, 2, level),
                     expected['go_params'],
                 )
 
-    def test_go_qrl_l_is_plain_and_larger_tiers_follow_the_residual_scale(self):
+    def test_cqrl_l_is_residual_and_larger_tiers_follow_the_residual_scale(self):
         expected = {
-            'xl': ('GO-QRL-XL', 8, 4096, 128, 40_756_153, 731, 729),
-            'xxl': ('GO-QRL-XXL', 16, 8192, 256, 78_613_803, 727, 727),
-            'xxxl': ('GO-QRL-XXXL', 32, 16384, 512, 154_331_932, 725, 726),
+            'xl': ('CQRL-XL', 8, 4096, 128, 40_756_153, 731, 729),
+            'xxl': ('CQRL-XXL', 16, 8192, 256, 78_613_803, 727, 727),
+            'xxxl': ('CQRL-XXXL', 32, 16384, 512, 154_331_932, 725, 726),
         }
 
-        conf = self.make_conf('go_qrl', 'l')
+        conf = self.make_conf('cqrl', 'l')
         encoder = conf.quasimetric_critic.model.encoder
         quasimetric = conf.quasimetric_critic.model.quasimetric_model
         dynamics = conf.quasimetric_critic.model.latent_dynamics
         actor = conf.actor.model
-        self.assertEqual(conf.model_size, 'GO-QRL-L')
+        self.assertEqual(conf.model_size, 'CQRL-L')
         self.assertEqual(encoder.kind, 'split')
         self.assertEqual(actor.input_mode, 'split_latent')
         self.assertEqual(encoder.latent_size, 512)
-        self.assertEqual(tuple(encoder.arch), (1160,) * 4)
-        self.assertEqual(tuple(quasimetric.projector_arch), (1160,) * 4)
-        self.assertEqual(tuple(dynamics.arch), (1160,) * 4)
-        self.assertEqual(tuple(actor.arch), (1160,) * 4)
-        self.assertEqual(encoder.mlp_kind, 'plain')
-        self.assertEqual(quasimetric.projector_mlp_kind, 'plain')
-        self.assertEqual(dynamics.mlp_kind, 'plain')
-        self.assertEqual(actor.mlp_kind, 'plain')
-        self.assertEqual(quasimetric.projector_activation, 'relu')
+        self.assertEqual(tuple(encoder.arch), (1024,) * 4)
+        self.assertEqual(tuple(quasimetric.projector_arch), (1024,) * 4)
+        self.assertEqual(tuple(dynamics.arch), (1024,) * 4)
+        self.assertEqual(tuple(actor.arch), (1024,) * 4)
+        self.assertEqual(encoder.mlp_kind, 'residual')
+        self.assertEqual(quasimetric.projector_mlp_kind, 'residual')
+        self.assertEqual(dynamics.mlp_kind, 'residual')
+        self.assertEqual(actor.mlp_kind, 'residual')
+        self.assertEqual(quasimetric.projector_activation, 'silu')
         self.assertEqual(
             quasimetric.quasimetric_head_spec,
             'iqe(dim=2048,components=64)',
         )
-        plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
-        self.assertEqual(tuple(encoder.goal_arch), (837,) * 4)
-        self.assertEqual(tuple(encoder.non_goal_arch), (837,) * 4)
+        plan = encoder.resolve_cqrl_branches(state_dim=4, goal_dim=2)
+        self.assertEqual(tuple(encoder.goal_arch), (737,) * 4)
+        self.assertEqual(tuple(encoder.non_goal_arch), (735,) * 4)
         self.assertLessEqual(
             abs(
                 plan.goal_encoder_parameters
@@ -278,8 +278,8 @@ class QRLModelSizePresetTest(unittest.TestCase):
             0.001,
         )
         self.assertEqual(
-            go_qrl_agent_parameter_count(4, 2, 2, 'l'),
-            21_824_679,
+            cqrl_agent_parameter_count(4, 2, 2, 'l'),
+            21_830_093,
         )
 
         for level, (
@@ -287,7 +287,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 goal_width, non_goal_width,
         ) in expected.items():
             with self.subTest(level=level):
-                conf = self.make_conf('go_qrl', level)
+                conf = self.make_conf('cqrl', level)
                 encoder = conf.quasimetric_critic.model.encoder
                 quasimetric = conf.quasimetric_critic.model.quasimetric_model
                 dynamics = conf.quasimetric_critic.model.latent_dynamics
@@ -324,7 +324,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 self.assertTrue(torch.isfinite(x.grad).all())
                 self.assertTrue(torch.isfinite(y.grad).all())
 
-                plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
+                plan = encoder.resolve_cqrl_branches(state_dim=4, goal_dim=2)
                 self.assertEqual(tuple(encoder.goal_arch), (goal_width,) * depth)
                 self.assertEqual(
                     tuple(encoder.non_goal_arch), (non_goal_width,) * depth,
@@ -336,12 +336,12 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 ) / plan.qrl_encoder_parameters
                 self.assertLessEqual(encoder_relative_error, 0.001)
                 self.assertEqual(
-                    go_qrl_agent_parameter_count(4, 2, 2, level),
+                    cqrl_agent_parameter_count(4, 2, 2, level),
                     parameter_count,
                 )
 
-    def test_go_qrl_l_actual_model_trains_and_matches_parameter_count(self):
-        conf = self.make_conf('go_qrl', 'l')
+    def test_cqrl_l_actual_model_trains_and_matches_parameter_count(self):
+        conf = self.make_conf('cqrl', 'l')
         conf.quasimetric_critic.model.encoder.goal_dims = (0, 1)
         env_spec = EnvSpec(
             observation_space=gym.spaces.Box(
@@ -356,7 +356,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
             for parameter in agent.parameters()
             if parameter.requires_grad
         )
-        self.assertEqual(actual, go_qrl_agent_parameter_count(4, 2, 2, 'l'))
+        self.assertEqual(actual, cqrl_agent_parameter_count(4, 2, 2, 'l'))
 
         batch_size = 4
         observations = torch.randn(batch_size, 4)
@@ -371,20 +371,20 @@ class QRLModelSizePresetTest(unittest.TestCase):
         )
         result = losses(agent, data, optimize=True)
         self.assertTrue(torch.isfinite(result.loss))
-        go_qrl_modules = (
+        cqrl_modules = (
             agent.critics[0].encoder,
             agent.critics[0].quasimetric_model.projector,
             agent.critics[0].latent_dynamics,
             agent.actor,
         )
-        self.assertFalse(any(
+        self.assertTrue(any(
             isinstance(
                 child, (ResidualBlock, torch.nn.LayerNorm, torch.nn.SiLU),
             )
-            for module in go_qrl_modules
+            for module in cqrl_modules
             for child in module.modules()
         ))
-        for module in go_qrl_modules:
+        for module in cqrl_modules:
             gradients = [parameter.grad for parameter in module.parameters()]
             self.assertTrue(any(gradient is not None for gradient in gradients))
             self.assertTrue(all(
@@ -392,14 +392,22 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 for gradient in gradients
             ))
 
-    def test_go_qrl_l_residual_backup_preserves_original_preset(self):
-        conf = self.make_conf('go_qrl', 'l_residual')
+    def test_cqrl_l_residual_compatibility_name_matches_default(self):
+        default = load_model_size_preset('cqrl', 'l')
+        explicit = load_model_size_preset('cqrl', 'l_residual')
+        explicit.model_size = default.model_size
+        self.assertEqual(
+            OmegaConf.to_container(explicit),
+            OmegaConf.to_container(default),
+        )
+
+        conf = self.make_conf('cqrl', 'l_residual')
         encoder = conf.quasimetric_critic.model.encoder
         quasimetric = conf.quasimetric_critic.model.quasimetric_model
         dynamics = conf.quasimetric_critic.model.latent_dynamics
         actor = conf.actor.model
 
-        self.assertEqual(conf.model_size, 'GO-QRL-L-Residual')
+        self.assertEqual(conf.model_size, 'CQRL-L-Residual')
         self.assertEqual(encoder.kind, 'split')
         self.assertEqual(actor.input_mode, 'split_latent')
         self.assertEqual(encoder.latent_size, 512)
@@ -416,7 +424,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
         self.assertEqual(actor.mlp_kind, 'residual')
         self.assertEqual(quasimetric.projector_activation, 'silu')
 
-        plan = encoder.resolve_go_qrl_branches(state_dim=4, goal_dim=2)
+        plan = encoder.resolve_cqrl_branches(state_dim=4, goal_dim=2)
         self.assertEqual(tuple(encoder.goal_arch), (737,) * 4)
         self.assertEqual(tuple(encoder.non_goal_arch), (735,) * 4)
         self.assertLessEqual(
@@ -428,16 +436,16 @@ class QRLModelSizePresetTest(unittest.TestCase):
             0.001,
         )
         self.assertEqual(
-            go_qrl_agent_parameter_count(4, 2, 2, 'l_residual'),
+            cqrl_agent_parameter_count(4, 2, 2, 'l_residual'),
             21_830_093,
         )
 
-    def test_go_qrl_goal_branch_respects_parameter_floor(self):
+    def test_cqrl_goal_branch_respects_parameter_floor(self):
         for level, latent, width in (
                 ('s', 128, 512), ('m', 256, 768), ('l', 512, 1024)):
             for state_dim, goal_dim in ((113, 2), (40, 2), (40, 4)):
                 with self.subTest(level=level, state_dim=state_dim, goal_dim=goal_dim):
-                    plan = match_go_qrl_split_encoder(
+                    plan = match_cqrl_split_encoder(
                         state_dim, goal_dim, latent, (width, width),
                         min_goal_ratio=0.125,
                     )
@@ -451,11 +459,38 @@ class QRLModelSizePresetTest(unittest.TestCase):
                         plan.qrl_encoder_parameters,
                     )
 
-    def test_go_qrl_parameter_floor_holds_at_exact_dimension_boundary(self):
+    def test_residual_cqrl_matches_quantized_dog_fetch_budget(self):
+        plan = match_cqrl_split_encoder(
+            state_dim=210,
+            goal_dim=3,
+            latent_size=512,
+            reference_arch=(1024,) * 4,
+            mlp_kind='residual',
+            residual_block_size=4,
+        )
+
+        self.assertEqual(plan.goal_arch, (362,) * 4)
+        self.assertEqual(plan.non_goal_arch, (967,) * 4)
+        self.assertEqual(plan.goal_latent_size, 57)
+        self.assertEqual(plan.non_goal_latent_size, 455)
+        self.assertGreaterEqual(
+            plan.goal_encoder_parameters * 8,
+            plan.non_goal_encoder_parameters,
+        )
+        self.assertLessEqual(
+            abs(
+                plan.goal_encoder_parameters
+                + plan.non_goal_encoder_parameters
+                - plan.qrl_encoder_parameters
+            ) / plan.qrl_encoder_parameters,
+            0.001,
+        )
+
+    def test_cqrl_parameter_floor_holds_at_exact_dimension_boundary(self):
         for level, latent, width in (
                 ('s', 128, 512), ('m', 256, 768), ('l', 512, 1024)):
             with self.subTest(level=level):
-                plan = match_go_qrl_split_encoder(
+                plan = match_cqrl_split_encoder(
                     state_dim=9,
                     goal_dim=1,
                     latent_size=latent,
@@ -468,7 +503,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                     plan.non_goal_encoder_parameters,
                 )
 
-    def test_go_qrl_ceil_goal_latent_uses_effective_branch_ratio(self):
+    def test_cqrl_ceil_goal_latent_uses_effective_branch_ratio(self):
         cases = (
             # 128 * 16 / 37 = 55.35..., so the goal branch receives 56 dims.
             (37, 16, 56, False, 16 / 37),
@@ -481,7 +516,7 @@ class QRLModelSizePresetTest(unittest.TestCase):
                 expected_floor, target_share,
         ) in cases:
             with self.subTest(state_dim=state_dim, goal_dim=goal_dim):
-                plan = match_go_qrl_split_encoder(
+                plan = match_cqrl_split_encoder(
                     state_dim=state_dim,
                     goal_dim=goal_dim,
                     latent_size=128,

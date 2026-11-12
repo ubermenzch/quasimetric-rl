@@ -1,7 +1,7 @@
 import unittest
 from collections import Counter, defaultdict
 
-from tools.generate_go_qrl_dynamics_sweep_tasks import (
+from tools.generate_cqrl_dynamics_sweep_tasks import (
     COMPLETED_CONTROL_ENVIRONMENTS,
     ENVIRONMENTS,
     TRAINING_SEEDS,

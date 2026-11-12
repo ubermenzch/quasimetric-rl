@@ -1,4 +1,4 @@
-# Scaling-CRL-M: official four-layer residual architecture at GO-QRL-M capacity.
+# Scaling-CRL-M: official four-layer residual architecture at CQRL-M capacity.
 model_size: Scaling-CRL-M
 baselines:
   scaling_crl:

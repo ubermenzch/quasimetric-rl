@@ -32,6 +32,10 @@ class EvalEpisodeResult:
     timestep_is_success: torch.Tensor
     is_success: torch.Tensor
     hitting_time: torch.Tensor
+    initial_is_success: Optional[torch.Tensor] = None
+    timestep_goal_distance: Optional[torch.Tensor] = None
+    reference_final_goal_distance: Optional[torch.Tensor] = None
+    reference_final_is_success: Optional[torch.Tensor] = None
 
     @classmethod
     def from_timestep_reward_is_success(cls, timestep_reward: torch.Tensor, timestep_is_success: torch.Tensor) -> Self:
@@ -78,6 +82,10 @@ class InteractionConf:
     )
 
     exploration_eps: float = attrs.field(default=0.3, validator=attrs.validators.ge(0))
+    original_qrl_evaluation: bool = False
+    qrl_goal_marker: bool = False
+    # Original-paper adapters may condition on coordinates other than success.
+    baseline_goal_dims: Optional[Tuple[int, ...]] = None
 
 
 @attrs.define(kw_only=True)
@@ -300,6 +308,7 @@ class Trainer(object):
         self.algorithm = agent_conf.algorithm
 
         self.exploration_eps = interaction_conf.exploration_eps
+        self.original_qrl_evaluation = interaction_conf.original_qrl_evaluation
         self.total_env_steps = interaction_conf.total_env_steps
 
         if self.algorithm == 'td_infonce':
@@ -453,8 +462,29 @@ class Trainer(object):
             if agent_conf.algorithm != 'qrl'
             else None
         )
+        if interaction_conf.baseline_goal_dims is not None:
+            if replay.kind != 'paper_validation' or agent_conf.algorithm == 'qrl':
+                raise ValueError('baseline_goal_dims is reserved for baseline paper-validation tasks')
+            baseline_goal_dims = tuple(interaction_conf.baseline_goal_dims)
+        self.goal_marker_dims = None
+        model_env_spec = replay.env_spec
+        if interaction_conf.qrl_goal_marker:
+            if (agent_conf.algorithm != 'qrl' or agent_conf.actor is None
+                    or agent_conf.actor.model.input_mode != 'raw'
+                    or agent_conf.quasimetric_critic.model.encoder.kind != 'standard'
+                    or agent_conf.goal_set_distance.enabled
+                    or agent_conf.actor.losses.min_dist.latent_goal_mode != 'none'
+                    or agent_conf.actor.losses.behavior_cloning.weight != 0):
+                raise ValueError('QRL goal markers require a raw-input QRL actor, standard encoder, and no other goal-set objective')
+            from quasimetric_rl.modules.goal_marker import augmented_env_spec
+            self.goal_marker_dims = tuple(replay.goal_set_dims)
+            state_dim = int(replay.env_spec.observation_shape[0])
+            if (not self.goal_marker_dims or len(set(self.goal_marker_dims)) != len(self.goal_marker_dims)
+                    or min(self.goal_marker_dims) < 0 or max(self.goal_marker_dims) >= state_dim):
+                raise ValueError('Invalid goal coordinates for QRL goal markers')
+            model_env_spec = augmented_env_spec(replay.env_spec)
         self.agent, self.losses = agent_conf.make(
-            env_spec=replay.env_spec,
+            env_spec=model_env_spec,
             total_optim_steps=total_optim_steps,
             profiler=profiler,
             baseline_goal_dims=baseline_goal_dims,
@@ -466,11 +496,28 @@ class Trainer(object):
                 else None
             ),
         )
+        if self.goal_marker_dims is not None:
+            self.agent.goal_marker_dims = self.goal_marker_dims
+            self.losses.actor_loss.min_dist.goal_marker_dims = self.goal_marker_dims
+            for critic_loss in self.losses.critic_losses:
+                critic_loss.global_push.goal_marker_dims = self.goal_marker_dims
+            logging.info('QRL goal-set marker enabled: goal_dims=%s, marker target fraction=0.05',
+                         self.goal_marker_dims)
         self.agent.to(device)
         self.losses.to(device)
         if self.training_optimizations.compile_heavy_modules:
             self._compile_heavy_modules()
         self.scheduler_horizon = total_optim_steps
+        if (getattr(self.losses, 'actor_loss', None) is not None
+                and self.losses.actor_loss.min_dist.latent_goal_probe_replay):
+            self.losses.actor_loss.min_dist.set_replay_reference_provider(
+                replay.sample_observation_reference, seed=candidate_seed,
+            )
+        if (getattr(self.losses, 'actor_loss', None) is not None
+                and self.losses.actor_loss.min_dist.replay_goal_candidates):
+            self.losses.actor_loss.min_dist.set_replay_candidate_provider(
+                replay.sample_goal_conditioned_observations, seed=candidate_seed,
+            )
         if getattr(self.losses, 'goal_set_distance_loss', None) is not None:
             self.losses.goal_set_distance_loss.set_observation_bounds_provider(replay.observation_bounds)
             self.losses.goal_set_distance_loss.set_candidate_state_provider(
@@ -564,6 +611,9 @@ class Trainer(object):
                     self.batch_size,
                     max_transitions=self.replay_sample_max_transitions,
                 )
+            if self.goal_marker_dims is not None:
+                from quasimetric_rl.modules.goal_marker import augment_replay_batch
+                batch = augment_replay_batch(batch, self.replay, self.goal_marker_dims)
         with self._record('data/to_device'):
             return batch.to(self.device)
 
@@ -609,7 +659,10 @@ class Trainer(object):
                     adistn = self.agent.act(obs, goal)
             if eval or self.algorithm in ('gcbc', 'gcsl'):
                 with self._record('env/action_to_cpu'):
-                    a = adistn.mean.float().cpu().numpy()[0]
+                    if isinstance(space, gym.spaces.Discrete):
+                        a = int(adistn.mean[0].item())
+                    else:
+                        a = adistn.mean.float().cpu().numpy()[0]
             else:
                 with self._record('env/action_sample'):
                     a_t = adistn.sample()
@@ -635,20 +688,24 @@ class Trainer(object):
         if num_episodes <= 0:
             raise ValueError(f'num_episodes must be positive, got {num_episodes}')
 
-        rng_state = utils.rng_state_dict()
+        original_protocol = getattr(self, 'original_qrl_evaluation', False)
+        rng_state = None if original_protocol else utils.rng_state_dict()
         env = None
         try:
             episode_seed_start = self.eval_seed if seed is None else int(seed)
             with self._record('eval/make_env'):
                 env = self.make_evaluate_env(episode_seed_start)
             rollouts = []
+            initial_successes = []
             with self._record('eval/rollouts'):
                 for episode_idx in tqdm(range(num_episodes), desc='evaluate'):
-                    env.seed(episode_seed_start + episode_idx)
+                    if not original_protocol:
+                        env.seed(episode_seed_start + episode_idx)
                     rollouts.append(self.collect_rollout(eval=True, store=False, env=env))
+                    initial_successes.append(getattr(env, 'initial_is_success', None))
             with self._record('eval/aggregate'):
                 mrollouts = MultiEpisodeData.cat(rollouts)
-                return EvalEpisodeResult.from_timestep_reward_is_success(
+                result = EvalEpisodeResult.from_timestep_reward_is_success(
                     mrollouts.rewards.reshape(
                         num_episodes, env.episode_length,
                     ),
@@ -656,10 +713,27 @@ class Trainer(object):
                         num_episodes, env.episode_length,
                     ),
                 )
+                if all(value is not None for value in initial_successes):
+                    result.initial_is_success = torch.tensor(initial_successes, dtype=torch.bool)
+                if getattr(env, 'is_paper_validation', False) is True:
+                    states = mrollouts.all_observations.reshape(
+                        num_episodes, env.episode_length + 1, -1,
+                    )
+                    goals = mrollouts.observation_infos['desired_goals'].reshape_as(states)
+                    result.timestep_goal_distance = env.goal_distance(states, goals)
+                    # GCSL records states before actions; its final state is s[T-1].
+                    if self.replay.name.startswith('GCSL'):
+                        from quasimetric_rl.data.online.paper_validation import SPECS
+                        result.reference_final_goal_distance = result.timestep_goal_distance[:, -2]
+                        result.reference_final_is_success = (
+                            result.reference_final_goal_distance < SPECS[self.replay.name][5]
+                        )
+                return result
         finally:
             if env is not None:
                 env.close()
-            utils.load_rng_state(rng_state)
+            if rng_state is not None:
+                utils.load_rng_state(rng_state)
 
     def iter_training_data(self, *, start_cycle_sample: int = 0) -> Iterator[Tuple[int, bool, BatchData, InfoT]]:
         r"""
@@ -704,14 +778,17 @@ class Trainer(object):
         if self.replay.num_episodes_realized < num_prefill_episodes:
             with self._record('env/make_collect_env'):
                 env = self.make_collect_env()  # always make fresh collect env before collecting. GCRL envs don't like reusing.
-            with self._record('env/prefill'):
-                for _ in tqdm(
-                        range(self.replay.num_episodes_realized, num_prefill_episodes),
-                        desc='prefill'):
-                    if self.algorithm == 'scaling_crl':
-                        self.collect_rollout(env=env)
-                    else:
-                        self.collect_random_rollout(env=env)
+            try:
+                with self._record('env/prefill'):
+                    for _ in tqdm(
+                            range(self.replay.num_episodes_realized, num_prefill_episodes),
+                            desc='prefill'):
+                        if self.algorithm == 'scaling_crl':
+                            self.collect_rollout(env=env)
+                        else:
+                            self.collect_random_rollout(env=env)
+            finally:
+                env.close()
         else:
             logging.info(
                 f"Skipping prefill because replay already has "
@@ -724,17 +801,20 @@ class Trainer(object):
         while self.replay.num_transitions_realized < total_env_steps:
             with self._record('env/make_collect_env'):
                 env = self.make_collect_env()
-            with self._record('env/rollout_cycle'):
-                for _ in range(self.num_rollouts_per_cycle):
-                    if (
-                            self.replay.num_transitions_realized
-                            < self.random_policy_env_steps):
-                        self.collect_random_rollout(env=env)
-                    else:
-                        self.collect_rollout(env=env)
+            try:
+                with self._record('env/rollout_cycle'):
+                    for _ in range(self.num_rollouts_per_cycle):
+                        if (
+                                self.replay.num_transitions_realized
+                                < self.random_policy_env_steps):
+                            self.collect_random_rollout(env=env)
+                        else:
+                            self.collect_rollout(env=env)
 
-                    if self.replay.num_transitions_realized >= total_env_steps:
-                        break
+                        if self.replay.num_transitions_realized >= total_env_steps:
+                            break
+            finally:
+                env.close()
 
             yield from yield_data()
 

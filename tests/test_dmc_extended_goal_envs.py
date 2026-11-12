@@ -12,7 +12,9 @@ from quasimetric_rl.data.online.dmc import DMCGoalEnv, TASK_SPECS
 
 EXTENDED_DMC_SPECS = {
     'point_mass_easy': (4, 2, (0, 1)),
+    'point_mass_hard': (4, 2, (0, 1)),
     'finger_turn_easy': (9, 2, (0, 1)),
+    'finger_turn_hard': (9, 2, (0, 1)),
     'manipulator_insert_ball': (40, 5, (0, 1)),
     'manipulator_insert_peg': (40, 5, (0, 1, 2, 3)),
     'dog_fetch': (210, 38, (0, 1, 2)),
@@ -207,7 +209,9 @@ class ExtendedDMCGoalEnvTest(unittest.TestCase):
     def test_all_tasks_are_registered_with_expected_suite_names(self):
         expected_suite_tasks = {
             'point_mass_easy': ('point_mass', 'easy'),
+            'point_mass_hard': ('point_mass', 'hard'),
             'finger_turn_easy': ('finger', 'turn_easy'),
+            'finger_turn_hard': ('finger', 'turn_hard'),
             'manipulator_insert_ball': ('manipulator', 'insert_ball'),
             'manipulator_insert_peg': ('manipulator', 'insert_peg'),
             'dog_fetch': ('dog', 'fetch'),
@@ -261,6 +265,34 @@ class ExtendedDMCGoalEnvTest(unittest.TestCase):
             observation['observation'][:2], [0.01, 0.02],
         )
         np.testing.assert_allclose(observation['desired_goal'][:2], [0.0, 0.0])
+
+    def test_stacker_success_uses_represented_box_goal_not_shaped_reward(self):
+        backend = _fake_backend('stacker_stack_2', 0)
+        backend._reward = 0.0
+        backend._observation['box_pos'][-1, :2] = [0.0, 0.0]
+        env = DMCGoalEnv(
+            'stacker_stack_2', environment_factory=lambda seed: backend,
+        )
+
+        _, reward, _, info = env.step(np.zeros(5, dtype=np.float32))
+
+        self.assertEqual(reward, 0.0)
+        self.assertTrue(info['is_success'])
+        self.assertEqual(info['goal_distance'], 0.0)
+
+    def test_stacker_shaped_reward_cannot_override_missed_box_goal(self):
+        backend = _fake_backend('stacker_stack_2', 0)
+        backend._reward = 1.0
+        backend._observation['box_pos'][:, :2] = [[0.2, 0.0], [0.3, 0.0]]
+        env = DMCGoalEnv(
+            'stacker_stack_2', environment_factory=lambda seed: backend,
+        )
+
+        _, reward, _, info = env.step(np.zeros(5, dtype=np.float32))
+
+        self.assertEqual(reward, 1.0)
+        self.assertFalse(info['is_success'])
+        self.assertAlmostEqual(info['goal_distance'], 0.2)
 
     def test_dog_removes_only_named_ball_translation_from_qpos(self):
         env = self.make_env('dog_fetch')

@@ -10,12 +10,15 @@ from tools.run_qrl_queue import GpuState
 from tools.run_qrl_queue import Task as RunnerTask
 from tools.run_qrl_queue import command_env
 from tools.run_qrl_queue import cleanup_completed_task_checkpoints
+from tools.run_qrl_queue import choose_pending
 from tools.run_qrl_queue import ensure_task_submission_statuses
 from tools.run_qrl_queue import gpu_accepts_more_jobs
 from tools.run_qrl_queue import kill_illegal_user_gpu_jobs
 from tools.run_qrl_queue import mark_finished
 from tools.run_qrl_queue import output_finished
+from tools.run_qrl_queue import output_finished_for_task
 from tools.run_qrl_queue import output_started
+from tools.run_qrl_queue import QueueLock
 from tools.run_qrl_queue import read_status
 from tools.run_qrl_queue import reconcile_running_statuses
 from tools.run_qrl_queue import requeue_cuda_oom_status
@@ -39,6 +42,19 @@ from tools.watch_qrl_queue import task_variant
 
 
 class QueueTaskClassificationTest(unittest.TestCase):
+    def test_queue_lock_replaces_stale_metadata_after_acquiring_lock(self):
+        with TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "queue.lock"
+            lock_path.write_text("pid=1\nstarted_at=stale\n")
+            lock = QueueLock(lock_path)
+
+            self.assertTrue(lock.acquire())
+            metadata = lock_path.read_text()
+            lock.release()
+
+            self.assertNotIn("pid=1\n", metadata)
+            self.assertEqual(metadata.count("pid="), 1)
+
     def test_manifest_temp_file_does_not_mark_output_as_started(self):
         with TemporaryDirectory() as directory:
             output_dir = Path(directory)
@@ -63,6 +79,57 @@ class QueueTaskClassificationTest(unittest.TestCase):
                 "checkpoint_env00200000_opt00190000_final.pth"
             ))
             self.assertTrue(output_finished(output_dir))
+
+    def test_older_online_completion_is_resumable_for_larger_target(self):
+        with TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            (output_dir / "checkpoint_env00100000_opt00090000_final.pth").touch()
+            task = RunnerTask(
+                "task_alpha", "online", "reacher_hard", "1000", "200000",
+            )
+
+            self.assertFalse(output_finished_for_task(output_dir, task))
+            self.assertTrue(
+                output_finished_for_task(
+                    output_dir,
+                    RunnerTask(
+                        "task_alpha", "online", "reacher_hard", "1000", "100000",
+                    ),
+                )
+            )
+
+    def test_stale_completion_evidence_does_not_block_online_continuation(self):
+        task = RunnerTask(
+            "task_alpha", "online", "reacher_hard", "1000", "200000",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "results" / task.task_id
+            status_dir = root / "status"
+            output_dir.mkdir(parents=True)
+            (output_dir / "checkpoint_env00100000_opt00090000_final.pth").touch()
+            (output_dir / "COMPLETE").touch()
+            write_task_manifest(output_dir, task)
+            write_status(
+                status_dir,
+                task,
+                "PENDING",
+                {
+                    "output_dir": str(output_dir),
+                    "completion_evidence": "COMPLETE",
+                },
+            )
+
+            selected = choose_pending(
+                {"RESULTS_ROOT": str(root / "results")},
+                [task],
+                set(),
+                status_dir,
+                retry_failed=False,
+            )
+
+            self.assertEqual(selected, task)
+            self.assertEqual(read_status(status_dir, task.task_id)["state"], "PENDING")
 
     def test_command_env_limits_all_cpu_thread_pools(self):
         env = command_env({"CPU_THREADS_PER_TASK": "4"}, "2")
@@ -378,14 +445,14 @@ class QueueTaskClassificationTest(unittest.TestCase):
                         **common,
                     )
                     self.assertEqual(
-                        task_variant(task), f"CQRL+Inner{inner_steps}"
+                        task_variant(task), f"CQRL/{inner_steps}"
                     )
                     self.assertEqual(task_critic_count(task), "1")
 
     def test_cqrl_task_id_is_recognized_without_expanded_preset_arguments(self):
         task = WatcherTask(
             task_id=(
-                "extended_v1_CQRL-Inner4-M_point_mass_easy_online_s1000"
+                "extended_v1_CQRL-4-M_point_mass_easy_online_s1000"
             ),
             mode="online",
             env_name="point_mass_easy",
@@ -394,8 +461,49 @@ class QueueTaskClassificationTest(unittest.TestCase):
             extra_args="+cqrl_model_size=m",
         )
 
-        self.assertEqual(task_variant(task), "CQRL+Inner4")
+        self.assertEqual(task_variant(task), "CQRL/4")
         self.assertEqual(task_critic_count(task), "1")
+
+    def test_cqrl_nondefault_inner_lr_has_a_monitor_label(self):
+        task = WatcherTask(
+            task_id="extended_v1_CQRL-1-L-LR1_point_mass_easy_online_s1001",
+            mode="online",
+            env_name="point_mass_easy",
+            seed="1001",
+            steps="500000",
+            extra_args=(
+                "+cqrl_model_size=l "
+                "agent.actor.losses.min_dist.latent_goal_mode=max "
+                "agent.actor.losses.min_dist.latent_goal_steps=1 "
+                "agent.actor.losses.min_dist.latent_goal_lr=0.01"
+            ),
+        )
+
+        self.assertEqual(task_variant(task), "CQRL/1")
+        task.extra_args = task.extra_args.replace(
+            "latent_goal_lr=0.01", "latent_goal_lr=1",
+        )
+        self.assertEqual(task_variant(task), "CQRL/1+InnerLR1")
+
+    def test_cqrl_min1_nondefault_inner_lr_has_a_monitor_label(self):
+        task = WatcherTask(
+            task_id=(
+                "extended_v1_CQRL+Min1-L-InnerLR1_"
+                "point_mass_easy_online_s1001"
+            ),
+            mode="online",
+            env_name="point_mass_easy",
+            seed="1001",
+            steps="500000",
+            extra_args=(
+                "+cqrl_model_size=l "
+                "agent.actor.losses.min_dist.latent_goal_mode=min "
+                "agent.actor.losses.min_dist.latent_goal_steps=1 "
+                "agent.actor.losses.min_dist.latent_goal_lr=1"
+            ),
+        )
+
+        self.assertEqual(task_variant(task), "CQRL+Min1+InnerLR1")
 
     def test_plain_qrl_model_size_is_not_classified_as_cqrl(self):
         task = WatcherTask(
@@ -433,7 +541,7 @@ class QueueTaskClassificationTest(unittest.TestCase):
 
         self.assertEqual(task_critic_count(task), "2")
 
-    def test_go_qrl_variant_is_derived_from_task_arguments(self):
+    def test_legacy_cqrl_variant_is_derived_from_task_arguments(self):
         task = WatcherTask(
             task_id=(
                 "official_qrl_1q_SplitLatentMax8_RMSBase1q_bc0_100k_"
@@ -454,14 +562,14 @@ class QueueTaskClassificationTest(unittest.TestCase):
             ),
         )
         self.assertEqual(task_display_name(task), "official_qrl_RMSBase1q_offlinegoals")
-        self.assertEqual(task_variant(task), "GO-QRL+Max8")
+        self.assertEqual(task_variant(task), "CQRL+Max8")
         self.assertEqual(task_checkpoint_interval(task), "10k")
 
         task.extra_args += (
             " agent.actor.losses.min_dist.latent_goal_search=bounded_residual"
             " agent.actor.losses.min_dist.latent_goal_residual_radius=1.0"
         )
-        self.assertEqual(task_variant(task), "GO-QRL+Max8+BR1")
+        self.assertEqual(task_variant(task), "CQRL+Max8+BR1")
 
     def test_dynamics_factorial_variants_are_distinct(self):
         cases = (
@@ -502,7 +610,7 @@ class QueueTaskClassificationTest(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(
-                    task_variant(task), f"GO-QRL+Max4/{code}:{label}"
+                    task_variant(task), f"CQRL+Max4/{code}:{label}"
                 )
                 self.assertEqual(task_critic_count(task), "1")
 
@@ -526,7 +634,7 @@ class QueueTaskClassificationTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            task_variant(task), "GO-QRL+Max4/S1-Hybrid-Leaky"
+            task_variant(task), "CQRL+Max4/S1-Hybrid-Leaky"
         )
 
     def test_zero_inner_steps_are_labeled_inner0(self):
@@ -542,9 +650,9 @@ class QueueTaskClassificationTest(unittest.TestCase):
                 "agent.actor.losses.min_dist.latent_goal_steps=0"
             ),
         )
-        self.assertEqual(task_variant(task), "GO-QRL+Inner0")
+        self.assertEqual(task_variant(task), "CQRL/0")
 
-    def test_layernorm_go_qrl_variant_has_a_distinct_monitor_label(self):
+    def test_layernorm_cqrl_variant_has_a_distinct_monitor_label(self):
         task = WatcherTask(
             task_id="official_qrl_1q_SplitLatentMin8_LayerNorm_M_s1000",
             mode="online",
@@ -561,14 +669,14 @@ class QueueTaskClassificationTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(task_variant(task), "GO-QRL+Min8+LN")
+        self.assertEqual(task_variant(task), "CQRL+Min8+LN")
         self.assertEqual(
             task_display_name(task),
             "official_qrl_LayerNorm_M",
         )
 
         task.extra_args += " agent.actor.losses.min_dist.latent_goal_optim=rmsg"
-        self.assertEqual(task_variant(task), "GO-QRL+Min8+LN+RMSG")
+        self.assertEqual(task_variant(task), "CQRL+Min8+LN+RMSG")
 
     def test_versioned_layernorm_variant_is_composed_from_task_modules(self):
         task = WatcherTask(
@@ -590,9 +698,9 @@ class QueueTaskClassificationTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(task_variant(task), "GO-QRL+Max4+LNv1+RMSG")
+        self.assertEqual(task_variant(task), "CQRL+Max4+LNv1+RMSG")
 
-    def test_residual_go_qrl_variant_has_a_distinct_monitor_label(self):
+    def test_residual_cqrl_variant_has_a_distinct_monitor_label(self):
         task = WatcherTask(
             task_id="official_qrl_1q_SplitLatentMax4_Residual_M_s1000",
             mode="online",
@@ -609,13 +717,13 @@ class QueueTaskClassificationTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(task_variant(task), "GO-QRL+Max4+Res")
+        self.assertEqual(task_variant(task), "CQRL+Max4+Res")
         self.assertEqual(
             task_display_name(task),
             "official_qrl_Residual_M",
         )
 
-    def test_basic_go_qrl_variant_uses_mode_and_inner_steps(self):
+    def test_basic_cqrl_variant_uses_mode_and_inner_steps(self):
         task = WatcherTask(
             task_id="official_qrl_1q_SplitLatentMin8_M_s1000",
             mode="online",
@@ -632,7 +740,7 @@ class QueueTaskClassificationTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(task_variant(task), "GO-QRL+Min8")
+        self.assertEqual(task_variant(task), "CQRL+Min8")
 
     def test_parameter_count_uses_task_metadata_and_compact_units(self):
         self.assertEqual(compact_parameter_count(842_100), "842.1k")

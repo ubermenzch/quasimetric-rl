@@ -16,8 +16,19 @@ TASK_SPECS = {
         domain='point_mass', task='easy', goal_dims=(0, 1),
         state_dim=4, action_dim=2,
     ),
+    # The hard point-mass variant has the same partial-goal state contract;
+    # keep it available for targeted follow-up runs without adding it to the
+    # curated 34-environment matrix.
+    'point_mass_hard': dict(
+        domain='point_mass', task='hard', goal_dims=(0, 1),
+        state_dim=4, action_dim=2,
+    ),
     'finger_turn_easy': dict(
         domain='finger', task='turn_easy', goal_dims=(0, 1),
+        state_dim=9, action_dim=2,
+    ),
+    'finger_turn_hard': dict(
+        domain='finger', task='turn_hard', goal_dims=(0, 1),
         state_dim=9, action_dim=2,
     ),
     'swimmer6': dict(domain='swimmer', task='swimmer6', goal_dims=(0, 1)),
@@ -54,6 +65,7 @@ TASK_SPECS = {
 }
 
 DMC_EPISODE_LENGTH = 1000
+STACKER_SUCCESS_CLOSENESS = 0.95
 
 
 class DMCGoalEnv(gym.Env):
@@ -297,9 +309,20 @@ class DMCGoalEnv(gym.Env):
             radius = float(physics.named.model.geom_size['target', 0])
             return distance <= radius
         if domain == 'stacker':
-            # dm_control exposes only a shaped reward for stacker. A 0.95
-            # threshold is an explicit binary evaluation convention.
-            return reward >= 0.95
+            # The goal API represents the native "any box at the target" set
+            # with the nearest box position.  The native shaped reward also
+            # requires the hand to move away, which is not part of that goal;
+            # using it for binary success makes goal attainment and evaluation
+            # disagree.  Retain dm_control's box-closeness shape and threshold,
+            # but apply it directly to the represented goal distance.
+            from dm_control.utils import rewards
+            box_size = float(
+                physics.named.model.geom_size['target', 0]
+            )
+            box_is_close = rewards.tolerance(
+                distance, margin=2 * box_size,
+            )
+            return bool(box_is_close >= STACKER_SUCCESS_CLOSENESS)
         if domain == 'ball_in_cup':
             return bool(physics.in_target())
         return reward >= 1.0 - 1e-7
@@ -324,6 +347,13 @@ class DMCGoalEnv(gym.Env):
             timestep = self._env.reset()
         self._elapsed_steps = 0
         state, self._goal_values = self._state_and_goal(timestep.observation)
+        get_reward = getattr(getattr(self._env, 'task', None), 'get_reward', None)
+        self.initial_is_success = None
+        if callable(get_reward):
+            distance = float(np.linalg.norm(state[list(self.goal_dims)] - self._goal_values))
+            self.initial_is_success = bool(self._is_success(
+                float(get_reward(self._env.physics)), distance,
+            ))
         return self._pack(state)
 
     def step(self, action):

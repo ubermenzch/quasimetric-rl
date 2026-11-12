@@ -543,9 +543,15 @@ class PandaGoalEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options=None):
         if seed is not None:
             self.seed(seed)
-        raw_observation, _ = self._backend_reset(options=options)
+        raw_observation, info = self._backend_reset(options=options)
         self._elapsed_steps = 0
-        state, _, self._goal_values = self._state_and_goals(raw_observation)
+        state, achieved, self._goal_values = self._state_and_goals(raw_observation)
+        can_check = 'is_success' in info or callable(
+            getattr(getattr(self.backend, 'task', None), 'is_success', None)
+        )
+        self.initial_is_success = self._is_success(
+            achieved, self._goal_values, info,
+        ) if can_check else None
         return self._pack(state)
 
     def _is_success(

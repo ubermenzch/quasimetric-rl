@@ -32,12 +32,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def package_version(name: str, expected: str) -> str:
+def package_version(name: str, expected: str | tuple[str, ...]) -> str:
     try:
         actual = importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError as exc:
         raise RuntimeError(f'Required simulator package is missing: {name}') from exc
-    if actual != expected:
+    expected_versions = (expected,) if isinstance(expected, str) else expected
+    if actual not in expected_versions:
         raise RuntimeError(
             f'{name} version mismatch: expected {expected}, got {actual}'
         )
@@ -90,6 +91,25 @@ def smoke_environment(
             f'PASS: {family}/{name}, observation={observation_shape}'
             f'{backend_suffix}'
         )
+    finally:
+        env.close()
+
+
+def validate_hand_reach_reset(name: str, factory: Callable[[str], Any]) -> None:
+    """Reject the all-zero reset regression from the previous backend."""
+    env = factory(name)
+    try:
+        env.seed(12345)
+        observation = env.reset()
+        achieved_goal = np.asarray(observation['achieved_goal'])[
+            list(env.goal_dims)
+        ]
+        if np.allclose(achieved_goal, 0.0, rtol=0.0, atol=1e-8):
+            raise RuntimeError(
+                f'{name} reset to an all-zero achieved goal; the corrected '
+                'HandReach-v3 initial-state protocol is not active'
+            )
+        print(f'PASS: gymnasium_robotics/{name}, reset-state integrity')
     finally:
         env.close()
 
@@ -147,7 +167,7 @@ def main() -> None:
         print(
             f'gymnasium={package_version("gymnasium", "1.0.0")}, '
             'gymnasium-robotics='
-            f'{package_version("gymnasium-robotics", "1.3.1")}, '
+            f'{package_version("gymnasium-robotics", ("1.3.1", "1.3.2"))}, '
             f'mujoco={package_version("mujoco", "2.3.6")}'
         )
         from quasimetric_rl.data.online.gymnasium_robotics import (
@@ -158,6 +178,7 @@ def main() -> None:
             smoke_environment(
                 'gymnasium_robotics', name, create_robotics_env,
             )
+        validate_hand_reach_reset('HandReach-v3', create_robotics_env)
 
     if args.suite in ('all', 'panda-gym'):
         print(

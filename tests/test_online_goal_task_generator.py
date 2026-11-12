@@ -109,7 +109,7 @@ class OnlineGoalTaskGeneratorTest(unittest.TestCase):
     def test_split_variants_have_expected_completion_method(self):
         tasks = generate_tasks()
         for task in tasks:
-            if '_GO-QRL+' not in task.task_id:
+            if '_CQRL+' not in task.task_id:
                 continue
             args = task.extra_args.split()
             self.assertIn('agent.actor.losses.min_dist.latent_goal_steps=4', args)
@@ -134,10 +134,10 @@ class OnlineGoalTaskGeneratorTest(unittest.TestCase):
     def test_all_variants_use_m_model_size(self):
         self.assertEqual(MODEL_SIZE_LEVEL, 'm')
         for task in generate_tasks():
-            is_go_qrl = '_GO-QRL+' in task.task_id
-            if is_go_qrl:
+            is_cqrl = '_CQRL+' in task.task_id
+            if is_cqrl:
                 self.assertIn('-M_', task.task_id)
-                self.assertIn('+go_qrl_model_size=m', task.extra_args.split())
+                self.assertIn('+cqrl_model_size=m', task.extra_args.split())
             else:
                 self.assertIn('_Base-M_', task.task_id)
                 self.assertIn('+qrl_model_size=m', task.extra_args.split())

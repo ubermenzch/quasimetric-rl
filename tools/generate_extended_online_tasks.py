@@ -28,7 +28,7 @@ from quasimetric_rl.data.online.panda_gym import (
     TASK_SPECS as PANDA_TASK_SPECS,
 )
 from quasimetric_rl.model_size import (
-    go_qrl_agent_parameter_count,
+    cqrl_agent_parameter_count,
     qrl_agent_parameter_count,
 )
 from quasimetric_rl.modules.gcrl_baselines import resolve_baseline_goal_dims
@@ -60,7 +60,7 @@ DMC_TASKS = (
 )
 
 SHADOW_HAND_TASKS = (
-    'HandReach-v2',
+    'HandReach-v3',
     'HandManipulateBlockRotateZ-v1',
     'HandManipulateEggRotate-v1',
     'HandManipulatePenRotate-v1',
@@ -124,10 +124,10 @@ ALGORITHMS = (
     Algorithm('gcsl', 'GCSL', baseline='gcsl'),
     Algorithm('c_learning', 'C-Learning', baseline='c_learning'),
     Algorithm('crl', 'CRL', baseline='crl'),
-    Algorithm('cqrl_inner0', 'CQRL/Inner0', inner_steps=0),
-    Algorithm('cqrl_inner1', 'CQRL/Inner1', inner_steps=1),
-    Algorithm('cqrl_inner4', 'CQRL/Inner4', inner_steps=4),
-    Algorithm('cqrl_inner8', 'CQRL/Inner8', inner_steps=8),
+    Algorithm('cqrl_inner0', 'CQRL/0', inner_steps=0),
+    Algorithm('cqrl_inner1', 'CQRL/1', inner_steps=1),
+    Algorithm('cqrl_inner4', 'CQRL/4', inner_steps=4),
+    Algorithm('cqrl_inner8', 'CQRL/8', inner_steps=8),
 )
 
 QRL_COMMON_ARGS = (
@@ -268,8 +268,8 @@ def step_label(total_steps: int) -> str:
 
 
 def gcsl_uses_factorized_actions(environment: Environment) -> bool:
-    """Avoid the exponential 3**action_dim head on high-DoF robots."""
-    return environment.action_dim >= 7
+    """Match official GCSL's independent-policy threshold."""
+    return 3 ** environment.action_dim > 100
 
 
 @lru_cache(maxsize=None)
@@ -283,7 +283,7 @@ def parameter_count(
             environment.state_dim, environment.action_dim, model_size,
         )
     if algorithm.inner_steps is not None:
-        return go_qrl_agent_parameter_count(
+        return cqrl_agent_parameter_count(
             environment.state_dim,
             environment.action_dim,
             environment.goal_dim,

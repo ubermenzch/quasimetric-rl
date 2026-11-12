@@ -215,7 +215,7 @@ def elapsed_hours(status: dict[str, str]) -> float | None:
     if start is None:
         return None
     end = time.time()
-    if state in {"DONE", "FAILED", "PAUSED"}:
+    if state in {"DONE", "FAILED", "PAUSED", "EARLY_STOPPED"}:
         end = parse_timestamp(status.get("finished_at", "")) or parse_timestamp(status.get("updated_at", "")) or end
     return max(0.0, (end - start) / 3600.0)
 
@@ -227,9 +227,26 @@ def same_path(left: Path, right: Path) -> bool:
         return str(left) == str(right)
 
 
-def task_log_files(log_dir: Path, task: Task, queue_started: float | None) -> list[Path]:
+def index_task_logs(log_dir: Path) -> dict[str, list[Path]]:
+    """Scan shared logs once per refresh and group attempts by exact task ID."""
+    logs: dict[str, list[Path]] = {}
+    for path in log_dir.glob("*.log"):
+        task_id, separator, timestamp = path.stem.rpartition("_")
+        if separator and re.fullmatch(r"\d{8}-\d{6}", timestamp):
+            logs.setdefault(task_id, []).append(path)
+    return logs
+
+
+def task_log_files(
+    log_dir: Path,
+    task: Task,
+    queue_started: float | None,
+    log_index: dict[str, list[Path]] | None = None,
+) -> list[Path]:
+    if log_index is None:
+        log_index = index_task_logs(log_dir)
     paths = []
-    for path in log_dir.glob(f"{task.task_id}_*.log"):
+    for path in log_index.get(task.task_id, []):
         started = log_start_timestamp(path)
         if queue_started is not None and started is not None and started < queue_started - 60:
             continue
@@ -253,12 +270,13 @@ def history_elapsed_hours(
     status: dict[str, str],
     log_dir: Path,
     queue_started: float | None,
+    log_index: dict[str, list[Path]] | None = None,
 ) -> float | None:
     current_log = Path(status.get("log_file", "")) if status.get("log_file") else None
     running = status.get("state") == "RUNNING"
     total = 0.0
     found = False
-    for path in task_log_files(log_dir, task, queue_started):
+    for path in task_log_files(log_dir, task, queue_started, log_index):
         elapsed = attempt_elapsed_hours(path, current_log, running)
         if elapsed is None:
             continue
@@ -319,29 +337,43 @@ def estimated_eta_hours(
 
 
 def nvidia_smi(gpus: str) -> str:
+    gpu_ids = [gpu for gpu in re.split(r"[\s,]+", gpus.strip()) if gpu]
+    if not gpu_ids:
+        return "No GPUs configured"
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "-i",
+                ",".join(gpu_ids),
+                "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return "nvidia-smi timed out after 5 seconds"
+    except OSError as exc:
+        return f"nvidia-smi failed: {exc}"
+
     rows = []
-    for gpu in gpus.split():
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "-i",
-                    gpu,
-                    "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=5,
-            )
-        except Exception:
+    for parts in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
+        if len(parts) != 5 or not parts[0].strip().isdigit():
             continue
-        if result.returncode == 0 and result.stdout.strip():
-            idx, name, used, total, util = [part.strip() for part in result.stdout.strip().split(",", 4)]
-            rows.append(f"GPU{idx} {name} mem={used}/{total} MiB util={util}%")
-    return "\n".join(rows) if rows else "nvidia-smi failed"
+        idx, name, used, total, util = [part.strip() for part in parts]
+        rows.append(f"GPU{idx} {name} mem={used}/{total} MiB util={util}%")
+    if rows:
+        # The command may return valid CSV with a nonzero exit status. Keep
+        # the available GPU data and report the status instead of discarding it.
+        if result.returncode:
+            rows.append(f"nvidia-smi exit={result.returncode} (using returned GPU data)")
+        return "\n".join(rows)
+    detail = " ".join((result.stderr.strip() or result.stdout.strip()).splitlines())
+    return f"nvidia-smi failed (exit={result.returncode}): {detail or 'no GPU data returned'}"
 
 
 def latest_eval(output_dir: Path) -> dict[str, str]:
@@ -665,6 +697,8 @@ def compact_count(value: str) -> str:
 def model_size_preset_critic_count(family: str, level: str) -> str:
     if family == "base":
         family = "qrl"
+    elif family == "go_qrl":
+        family = "cqrl"
     path = ROOT / "configs" / "model_size" / family / f"{level.lower()}.yaml"
     try:
         lines = path.read_text(errors="replace").splitlines()
@@ -682,8 +716,8 @@ def task_critic_count(task: Task) -> str:
     if value:
         return value
     for group, family in (
-        ("+cqrl_model_size", "go_qrl"),
-        ("+go_qrl_model_size", "go_qrl"),
+        ("+cqrl_model_size", "cqrl"),
+        ("+go_qrl_model_size", "cqrl"),
         ("+qrl_model_size", "qrl"),
         ("+base_model_size", "base"),
     ):
@@ -706,6 +740,8 @@ def task_checkpoint_interval(task: Task) -> str:
 
 
 def task_checkpoint_display(task: Task, output_dir: Path) -> str:
+    if extra_arg_value(task.extra_args, 'queue.logs_only').lower() == 'true':
+        return 'off'
     if (output_dir / CHECKPOINTS_DELETED_MARKER).is_file():
         return "deleted"
     return task_checkpoint_interval(task)
@@ -779,14 +815,14 @@ def task_dynamics_factorial_variant(task: Task) -> str:
         }[id_match.group(4).lower()]
 
     goal_variant = re.search(
-        r"GO-QRL(?:\+|-)(?:Max|Min)\d+",
+        r"(?:GO-QRL|CQRL)(?:\+|-)(?:Max|Min)\d+",
         task.task_id,
         re.IGNORECASE,
     )
     if goal_variant:
         prefix = re.sub(
-            r"^GO-QRL-",
-            "GO-QRL+",
+            r"^(?:GO-QRL|CQRL)[+-]",
+            "CQRL+",
             goal_variant.group(0),
             flags=re.IGNORECASE,
         )
@@ -798,9 +834,9 @@ def task_dynamics_factorial_variant(task: Task) -> str:
             task.extra_args, "agent.actor.losses.min_dist.latent_goal_steps"
         )
         prefix = (
-            f"GO-QRL+{mode.capitalize()}{steps}"
+            f"CQRL+{mode.capitalize()}{steps}"
             if mode in {"max", "min"} and steps
-            else "GO-QRL"
+            else "CQRL"
         )
 
     labels = [label for label in (separate_label, distance_label, activation_label) if label]
@@ -811,6 +847,23 @@ def task_dynamics_factorial_variant(task: Task) -> str:
 
 
 def task_variant(task: Task) -> str:
+    for variant, label in (
+            ('QRL-Mask', 'QRL+Mask'), ('QRL-GoalOnly', 'QRL+GoalOnly'),
+            ('QRL-GoalMarker', 'QRL+GoalMarker'),
+            ('AQRL-ReplayMin8', 'AQRL+ReplayMin8'),
+            ('AQRL-ReplayMin32', 'AQRL+ReplayMin32')):
+        if task.task_id.startswith(f'iclr_rebuttal_v1_{variant}-L_'):
+            return label
+    if task.task_id.startswith("iclr_rebuttal_v1_AQRL-Displacement-"):
+        return "AQRL+Move32"
+    if task.task_id.startswith("iclr_rebuttal_v1_AQRLRepo-QRLOriginalConfig_"):
+        return "QRL-OrigCfg/AQRL"
+    if task.task_id.startswith("iclr_rebuttal_v1_OriginalRepo-QRLOriginalConfig_"):
+        return "QRL-OrigSrc"
+    if task.task_id.startswith("iclr_rebuttal_v1_QRL-AQRLBackbone-L_"):
+        return "QRL+AQRLBackbone"
+    if task.task_id.startswith("iclr_rebuttal_v1_AQRL0-NoMSE-L_"):
+        return "AQRL/0-NoMSE"
     algorithm = extra_arg_value(task.extra_args, "agent.algorithm")
     baseline_labels = {
         "td_infonce": "TD-InfoNCE",
@@ -866,6 +919,9 @@ def task_variant(task: Task) -> str:
     latent_goal_optim = extra_arg_value(
         task.extra_args, "agent.actor.losses.min_dist.latent_goal_optim"
     )
+    latent_goal_lr = extra_arg_value(
+        task.extra_args, "agent.actor.losses.min_dist.latent_goal_lr"
+    )
     branch_normalization = extra_arg_value(
         task.extra_args, "agent.quasimetric_critic.model.encoder.branch_normalization"
     )
@@ -875,13 +931,13 @@ def task_variant(task: Task) -> str:
     )
     cqrl_model_size = extra_arg_value(task.extra_args, "+cqrl_model_size")
     named_cqrl_variant = re.search(
-        r"(?:^|_)CQRL(?:\+|-)Inner(\d+)(?:_|-|\+|$)",
+        r"(?:^|_)(?:GO-QRL|CQRL)(?:\+|-)(?:Inner)?(\d+)(?:_|-|\+|$)",
         task.task_id,
         re.IGNORECASE,
     )
     is_cqrl = bool(cqrl_model_size or named_cqrl_variant)
     named_latent_variant = re.search(
-        r"_(GO-QRL(?:\+|-)(?:Max|Min)\d+|SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|-|\+|$)",
+        r"_((?:GO-QRL|CQRL)(?:\+|-)(?:Max|Min)\d+|SplitLatent(?:Max|Min)\d+|SplitZero|LatentBase)(?:_|-|\+|$)",
         task.task_id,
     )
     if not encoder_kind and (
@@ -889,7 +945,7 @@ def task_variant(task: Task) -> str:
         or extra_arg_value(task.extra_args, "+go_qrl_model_size")
         or (
             named_latent_variant
-            and named_latent_variant.group(1).startswith("GO-QRL")
+            and named_latent_variant.group(1).startswith(("GO-QRL", "CQRL"))
         )
     ):
         encoder_kind = "split"
@@ -901,16 +957,29 @@ def task_variant(task: Task) -> str:
             if is_cqrl:
                 if not latent_goal_steps and named_cqrl_variant:
                     latent_goal_steps = named_cqrl_variant.group(1)
-                modules = ["CQRL"]
-                if latent_goal_steps:
-                    modules.append(f"Inner{latent_goal_steps}")
+                if latent_goal_steps == "0":
+                    modules = ["CQRL/0"]
+                elif latent_goal_mode == "min" and latent_goal_steps:
+                    modules = [f"CQRL+Min{latent_goal_steps}"]
+                else:
+                    modules = [
+                        f"CQRL/{latent_goal_steps}"
+                        if latent_goal_steps else "CQRL"
+                    ]
             else:
                 mode_label = (
                     "Inner0"
                     if latent_goal_steps == "0"
                     else f"{latent_goal_mode.capitalize()}{latent_goal_steps}"
                 )
-                modules = ["GO-QRL", mode_label]
+                modules = ["CQRL", mode_label]
+            if latent_goal_lr:
+                try:
+                    latent_goal_lr_label = f"{float(latent_goal_lr):g}"
+                except ValueError:
+                    latent_goal_lr_label = latent_goal_lr
+                if latent_goal_lr_label != "0.01":
+                    modules.append(f"InnerLR{latent_goal_lr_label}")
             if latent_goal_search == "residual":
                 modules.append("Res")
             if branch_normalization == "layernorm":
@@ -923,13 +992,13 @@ def task_variant(task: Task) -> str:
         elif is_cqrl:
             variant = "CQRL"
             if named_cqrl_variant:
-                variant += f"+Inner{named_cqrl_variant.group(1)}"
+                variant += f"/{named_cqrl_variant.group(1)}"
         elif named_latent_variant and (
                 named_latent_variant.group(1).startswith("SplitLatent")
-                or named_latent_variant.group(1).startswith("GO-QRL")):
+                or named_latent_variant.group(1).startswith(("GO-QRL", "CQRL"))):
             variant = named_latent_variant.group(1)
-            variant = re.sub(r'^SplitLatent(Max|Min)', r'GO-QRL+\1', variant)
-            variant = re.sub(r'^GO-QRL-', 'GO-QRL+', variant)
+            variant = re.sub(r'^SplitLatent(Max|Min)', r'CQRL+\1', variant)
+            variant = re.sub(r'^(?:GO-QRL|CQRL)[+-]', 'CQRL+', variant)
         else:
             variant = "SplitZero"
         if latent_goal_search == "bounded_residual":
@@ -1058,6 +1127,16 @@ def render(
     gpus = cfg(config, "GPU_IDS", "0 1 2 3")
     print(time.strftime("%Y-%m-%d %H:%M:%S"))
     print(nvidia_smi(gpus))
+    statuses = {task.task_id: read_status(status_dir, task.task_id) for task in tasks}
+    log_dirs = {log_dir}
+    log_dirs.update(
+        Path(status["log_file"]).parent for status in statuses.values()
+        if status.get("log_file")
+    )
+    log_index: dict[str, list[Path]] = {}
+    for directory in sorted(log_dirs):
+        for task_id, paths in index_task_logs(directory).items():
+            log_index.setdefault(task_id, []).extend(paths)
 
     rows = []
     counts: dict[str, int] = {}
@@ -1065,7 +1144,7 @@ def render(
     queue_eta = 0.0
     active_eta_task_ids: set[str] = set()
     for idx, task in enumerate(tasks, start=1):
-        status = read_status(status_dir, task.task_id)
+        status = statuses[task.task_id]
         state = status.get("state", "PENDING")
         pid = status.get("pid", "")
         alive = pid_alive(pid)
@@ -1080,7 +1159,9 @@ def render(
         else:
             progress = offline_progress(output_dir, task, status)
         run_elapsed = elapsed_hours(status)
-        history_elapsed = history_elapsed_hours(task, status, log_dir, queue_started)
+        history_elapsed = history_elapsed_hours(
+            task, status, log_dir, queue_started, log_index
+        )
         display_elapsed = history_elapsed if history_elapsed is not None else run_elapsed
         if display_elapsed is not None:
             total_elapsed += display_elapsed
@@ -1196,14 +1277,18 @@ def main() -> int:
     watch = args.watch
     if watch is None:
         watch = float(cfg(config, "WATCH_SECONDS", cfg(config, "POLL_SECONDS", "30")))
-    while True:
-        if args.clear_screen:
-            print("\033[2J\033[H", end="")
-        render(config, recent_progress)
-        if watch <= 0:
-            return 0
-        time.sleep(watch)
-        print()
+    try:
+        while True:
+            if args.clear_screen:
+                print("\033[2J\033[H", end="")
+            render(config, recent_progress)
+            if watch <= 0:
+                return 0
+            time.sleep(watch)
+            print()
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+        return 130
 
 
 if __name__ == "__main__":

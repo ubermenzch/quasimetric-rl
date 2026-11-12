@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from quasimetric_rl.model_size import (
-    go_qrl_agent_parameter_count,
+    cqrl_agent_parameter_count,
     qrl_agent_parameter_count,
 )
 from quasimetric_rl.modules.gcrl_baselines import resolve_baseline_goal_dims
@@ -92,8 +92,8 @@ ENVIRONMENTS = (
 
 ALGORITHMS = (
     Algorithm('qrl', 'QRL'),
-    Algorithm('go_max4', 'GO-QRL+Max4-Hybrid', goal_mode='max'),
-    Algorithm('go_min4', 'GO-QRL+Min4-Hybrid', goal_mode='min'),
+    Algorithm('cqrl_max4', 'CQRL+Max4-Hybrid', goal_mode='max'),
+    Algorithm('cqrl_min4', 'CQRL+Min4-Hybrid', goal_mode='min'),
     Algorithm('td_infonce', 'TD-InfoNCE', baseline='td_infonce'),
     Algorithm('gcsl', 'GCSL', baseline='gcsl'),
     Algorithm('c_learning', 'C-Learning', baseline='c_learning'),
@@ -103,11 +103,11 @@ ALGORITHMS = (
 # These table cells already have five-seed results and must not be rerun.
 COMPLETED_GROUPS = frozenset({
     ('qrl', 'fetchpickandplace'),
-    ('go_max4', 'fetchslide'),
-    ('go_max4', 'fetchpickandplace'),
-    ('go_max4', 'pusher_v4'),
-    ('go_max4', 'antnavigate_v4'),
-    ('go_min4', 'fetchpickandplace'),
+    ('cqrl_max4', 'fetchslide'),
+    ('cqrl_max4', 'fetchpickandplace'),
+    ('cqrl_max4', 'pusher_v4'),
+    ('cqrl_max4', 'antnavigate_v4'),
+    ('cqrl_min4', 'fetchpickandplace'),
 })
 
 # A group is indivisible: all five training seeds run on the same server.
@@ -116,9 +116,9 @@ COMPLETED_GROUPS = frozenset({
 REMOTE_GROUPS = frozenset({
     ('qrl', 'fetchpush'),
     ('qrl', 'fetchslide'),
-    ('go_max4', 'maze2d_large'),
-    ('go_min4', 'reacher_hard'),
-    ('go_min4', 'pusher_v4'),
+    ('cqrl_max4', 'maze2d_large'),
+    ('cqrl_min4', 'reacher_hard'),
+    ('cqrl_min4', 'pusher_v4'),
     ('td_infonce', 'fetchpickandplace'),
     ('td_infonce', 'antnavigate_v4'),
     ('gcsl', 'fetchslide'),
@@ -155,7 +155,7 @@ QRL_COMMON_ARGS = (
     'interaction.exploration_eps=0',
 )
 
-GO_QRL_HYBRID_ARGS = (
+CQRL_HYBRID_ARGS = (
     'agent.quasimetric_critic.losses.separate_latent_dynamics=false',
     'agent.quasimetric_critic.losses.latent_dynamics.distance=iqe_mse',
     'agent.quasimetric_critic.losses.latent_dynamics.mse_weight=1.0',
@@ -202,13 +202,12 @@ def extra_arg_map(task: Task) -> dict[str, str]:
 
 
 def baseline_model_size(algorithm: Algorithm, environment: Environment) -> str:
-    if algorithm.baseline != 'gcsl' or environment.model_size != 'l':
-        return environment.model_size
-    if environment.key == 'pusher_v4':
-        return 'l_pusher'
-    if environment.key == 'antnavigate_v4':
-        return 'l_antnavigate'
-    return 'l'
+    return environment.model_size
+
+
+def gcsl_uses_factorized_actions(environment: Environment) -> bool:
+    """Match official GCSL's independent-policy threshold."""
+    return 3 ** environment.action_dim > 100
 
 
 def parameter_count(algorithm: Algorithm, environment: Environment) -> int:
@@ -218,7 +217,7 @@ def parameter_count(algorithm: Algorithm, environment: Environment) -> int:
             environment.model_size,
         )
     if algorithm.goal_mode is not None:
-        return go_qrl_agent_parameter_count(
+        return cqrl_agent_parameter_count(
             environment.state_dim, environment.action_dim,
             environment.goal_dim, environment.model_size,
         )
@@ -236,6 +235,12 @@ def parameter_count(algorithm: Algorithm, environment: Environment) -> int:
         environment.action_dim,
         conditioning_goal_dim,
         model_size_level=baseline_model_size(algorithm, environment),
+        gcsl_action_discretization=(
+            'factorized'
+            if algorithm.baseline == 'gcsl'
+            and gcsl_uses_factorized_actions(environment)
+            else 'joint'
+        ),
     )
 
 
@@ -245,24 +250,33 @@ def algorithm_args(
         return (f'+qrl_model_size={environment.model_size}', *QRL_COMMON_ARGS)
     if algorithm.goal_mode is not None:
         return (
-            f'+go_qrl_model_size={environment.model_size}',
+            f'+cqrl_model_size={environment.model_size}',
             *QRL_COMMON_ARGS,
-            *GO_QRL_HYBRID_ARGS,
+            *CQRL_HYBRID_ARGS,
             f'agent.actor.losses.min_dist.latent_goal_mode={algorithm.goal_mode}',
         )
     assert algorithm.baseline is not None
     level = baseline_model_size(algorithm, environment)
-    return (
+    args = [
         f'agent.algorithm={algorithm.baseline}',
         f'+{MODEL_SIZE_FAMILIES[algorithm.baseline]}_model_size={level}',
         'batch_size=256',
         'interaction.exploration_eps=0',
-    )
+    ]
+    if (
+            algorithm.baseline == 'gcsl'
+            and gcsl_uses_factorized_actions(environment)):
+        args.append('agent.baselines.gcbc.action_discretization=factorized')
+    return tuple(args)
 
 
 def task_version_tag(algorithm: Algorithm, environment: Environment) -> str:
     if algorithm.baseline == 'crl':
         return 'originalcrl2022_'
+    if (
+            algorithm.baseline == 'gcsl'
+            and gcsl_uses_factorized_actions(environment)):
+        return 'factorized_'
     if (
         algorithm.baseline is not None
         and environment.key in {

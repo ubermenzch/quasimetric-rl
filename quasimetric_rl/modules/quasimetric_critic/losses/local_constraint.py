@@ -59,13 +59,32 @@ class LocalConstraintLoss(CriticLossBase):
         # lagrange multiplier is minimax training, so grad_mul -1
         lagrange_mult = grad_mul(lagrange_mult, -1)
 
-        sq_deviation = (dist - self.step_cost).relu().square().mean()
+        squared = (dist - self.step_cost).relu().square()
+        info = dict(dist=dist.mean(), lagrange_mult=lagrange_mult)
+        if data.goal_marker_sources is not None:
+            if data.goal_marker_targets is None:
+                raise ValueError('Goal-marker sources require matching targets')
+            count = data.goal_marker_sources.shape[0]
+            info['goal_marker_transitions'] = count
+            if count:
+                critic = critic_batch_info.critic
+                source_z = critic.encoder(data.goal_marker_sources)
+                marker_z = critic.encoder(data.goal_marker_targets)
+                marker_dist = critic.quasimetric_model(source_z, marker_z)
+                marker_squared = (marker_dist - self.step_cost).relu().square()
+                sq_deviation = (squared.sum() + marker_squared.sum()) / (squared.numel() + marker_squared.numel())
+                info['goal_marker_dist'] = marker_dist.mean()
+            else:
+                sq_deviation = squared.mean()
+        else:
+            sq_deviation = squared.mean()
         violation = (sq_deviation - self.epsilon ** 2)
         loss = violation * lagrange_mult
+        info.update(sq_deviation=sq_deviation, violation=violation)
 
         return LossResult(
             loss=loss,
-            info=dict(dist=dist.mean(), sq_deviation=sq_deviation, violation=violation, lagrange_mult=lagrange_mult),
+            info=info,
         )
 
     def extra_repr(self) -> str:

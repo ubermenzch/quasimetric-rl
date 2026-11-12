@@ -75,6 +75,37 @@ def make_batch(state_dim, action_dim, batch_size=8):
 
 
 class GCRLBaselineShapeTest(unittest.TestCase):
+    def test_native_discrete_gcsl_classification_and_checkpoint(self):
+        env_spec = make_env_spec(8, 1)
+        env_spec.action_space = gym.spaces.Discrete(4)
+        conf = small_baseline_conf('gcsl')
+        agent, losses = conf.make(env_spec=env_spec, total_optim_steps=2,
+                                  baseline_goal_dims=(0, 1, 4, 6, 7))
+        batch = make_batch(8, 1)
+        batch.actions = torch.arange(8, dtype=torch.int64) % 4
+        dist = agent.act(batch.observations, batch.future_observations)
+        self.assertEqual(dist.logits.shape, (8, 4))
+        self.assertEqual(dist.mean.dtype, torch.int64)
+        torch.testing.assert_close(dist.mean, dist.logits.argmax(-1))
+        expected = torch.nn.functional.cross_entropy(dist.logits, batch.actions)
+        result = losses(agent, batch, optimize=False)
+        torch.testing.assert_close(result.loss, expected)
+        before = [p.detach().clone() for p in agent.actor.parameters()]
+        result = losses(agent, batch, optimize=True)
+        self.assertTrue(torch.isfinite(result.loss))
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, agent.actor.parameters())))
+        restored, _ = conf.make(env_spec=env_spec, total_optim_steps=2,
+                                baseline_goal_dims=(0, 1, 4, 6, 7))
+        restored.load_state_dict(agent.state_dict())
+        torch.testing.assert_close(restored.act(batch.observations, batch.future_observations).mean,
+                                   agent.act(batch.observations, batch.future_observations).mean)
+        uniform = [int(agent.actor.sample_uniform_action()) for _ in range(200)]
+        self.assertEqual(set(uniform), {0, 1, 2, 3})
+        for algorithm in ('crl', 'td_infonce', 'scaling_crl', 'c_learning'):
+            with self.assertRaises((TypeError, ValueError)):
+                small_baseline_conf(algorithm).make(env_spec=env_spec, total_optim_steps=2,
+                                                   baseline_goal_dims=(0, 1))
+
     def test_all_algorithms_accept_all_seven_environment_shapes(self):
         for environment, (state_dim, action_dim, goal_dims) in ENVIRONMENT_SHAPES.items():
             env_spec = make_env_spec(state_dim, action_dim)
@@ -123,7 +154,7 @@ class GCRLBaselineShapeTest(unittest.TestCase):
                     )
                     self.assertEqual(actual, expected)
 
-    def test_original_crl_uses_complete_state_outside_fetch_manipulation(self):
+    def test_original_crl_uses_complete_state_outside_antmaze(self):
         self.assertEqual(
             resolve_baseline_goal_dims(
                 'crl',
@@ -144,6 +175,20 @@ class GCRLBaselineShapeTest(unittest.TestCase):
             ),
             (0, 1),
         )
+
+    def test_original_crl_uses_xy_goal_for_antmaze(self):
+        for environment in ('AntMaze_UMaze-v5', 'AntMaze_BigMaze_DGR-v5'):
+            with self.subTest(environment=environment):
+                self.assertEqual(
+                    resolve_baseline_goal_dims(
+                        'crl',
+                        env_kind='gymnasium_robotics',
+                        env_name=environment,
+                        state_dim=107,
+                        success_goal_dims=(0, 1),
+                    ),
+                    (0, 1),
+                )
 
     def test_online_trainer_does_not_use_fetch_success_projection_for_baselines(self):
         expected_by_algorithm = {
@@ -179,6 +224,32 @@ class GCRLBaselineShapeTest(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(trainer.agent.goal_dims, expected)
+
+    def test_online_trainer_uses_xy_goal_for_antmaze_crl(self):
+        replay = SimpleNamespace(
+            kind='gymnasium_robotics',
+            name='AntMaze_UMaze-v5',
+            episode_length=700,
+            num_episodes_realized=0,
+            transition_history_length=0,
+            future_observation_discount=0.99,
+            goal_set_dims=(0, 1),
+            env_spec=make_env_spec(107, 8),
+        )
+        trainer = Trainer(
+            agent_conf=small_baseline_conf('crl'),
+            device=torch.device('cpu'),
+            replay=replay,
+            batch_size=8,
+            interaction_conf=InteractionConf(
+                total_env_steps=400_000,
+                num_eval_episodes=1,
+                num_test_episodes=1,
+                validation_seed=1000,
+                test_seed=2_000_000,
+            ),
+        )
+        self.assertEqual(trainer.agent.goal_dims, (0, 1))
 
     def test_td_target_networks_are_frozen(self):
         env_spec = make_env_spec(10, 4)

@@ -1,0 +1,201 @@
+{
+  "review_date": "2026-09-08",
+  "scope": "10 accepted ICLR 2026 main-conference papers; purposive sample related to NQRL, not a systematic survey",
+  "verification": "Acceptance and official PDF links verified against the ICLR 2026 proceedings. Section lists describe reading coverage; some section names are abbreviated.",
+  "papers": [
+    {
+      "id": "01_mqe",
+      "title": "Scaling Goal-conditioned Reinforcement Learning with Multistep Quasimetric Distances",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/eddc0fab5a42f8d8de6eb5566cd9f1d3-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/eddc0fab5a42f8d8de6eb5566cd9f1d3-Paper-Conference.pdf",
+      "reading_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/eddc0fab5a42f8d8de6eb5566cd9f1d3-Paper-Conference.pdf",
+      "reading_version": "ICLR 2026 proceedings PDF",
+      "setting": "Offline goal-conditioned RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "4 Multistep Quasimetric Estimation",
+        "5 Experiments",
+        "6 Conclusion"
+      ],
+      "pdf_filename": "01_mqe.pdf"
+    },
+    {
+      "id": "02_dual_goal",
+      "title": "Dual Goal Representations",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/f8cd7eb180deb5c6ec876de2b442fa72-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/f8cd7eb180deb5c6ec876de2b442fa72-Paper-Conference.pdf",
+      "reading_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/f8cd7eb180deb5c6ec876de2b442fa72-Paper-Conference.pdf",
+      "reading_version": "ICLR 2026 proceedings PDF",
+      "setting": "Offline goal-conditioned RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "3 Dual Goal Representations",
+        "4 Practical Instantiation",
+        "6 Experiments",
+        "7 Closing Remarks"
+      ],
+      "pdf_filename": "02_dual_goal.pdf"
+    },
+    {
+      "id": "03_emergent_exploration",
+      "title": "Demystifying The Mechanisms Behind Emergent Exploration in Goal-Conditioned RL",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/cbaffeeda13dbd8bf9489feb3f198ff4-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/cbaffeeda13dbd8bf9489feb3f198ff4-Paper-Conference.pdf",
+      "reading_url": "https://arxiv.org/html/2510.14129v1",
+      "reading_version": "Author manuscript, arXiv v1 (2025-10-15); acceptance verified separately",
+      "setting": "Online goal-conditioned exploration",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "4 Reward curriculum analysis",
+        "5 Experiments",
+        "6 Conclusion"
+      ],
+      "pdf_filename": "03_emergent_exploration.pdf"
+    },
+    {
+      "id": "04_occupancy_reward",
+      "title": "Occupancy Reward Shaping: Improving Credit Assignment for Offline Goal-Conditioned Reinforcement Learning",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/5683583b88da51c79d2eb263f295286e-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/5683583b88da51c79d2eb263f295286e-Paper-Conference.pdf",
+      "reading_url": "https://arxiv.org/html/2604.20627v1",
+      "reading_version": "Author manuscript, arXiv v1 (2026-04-22); acceptance verified separately",
+      "setting": "Offline goal-conditioned RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "3.2 Motivation",
+        "4 Occupancy Reward Shaping",
+        "5 Experiments",
+        "6 Conclusion"
+      ],
+      "pdf_filename": "04_occupancy_reward.pdf"
+    },
+    {
+      "id": "05_hecrl",
+      "title": "Hierarchical Entity-centric Reinforcement Learning with Factored Subgoal Diffusion",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/de2bc3eed995c24307e8011161ac1438-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/de2bc3eed995c24307e8011161ac1438-Paper-Conference.pdf",
+      "reading_url": "https://arxiv.org/html/2602.02722v1",
+      "reading_version": "Author manuscript, arXiv v1 (2026-02-02); acceptance verified separately",
+      "setting": "Offline goal-conditioned RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "3 Hierarchical Entity-centric RL",
+        "4 Experiments",
+        "5 Conclusion"
+      ],
+      "pdf_filename": "05_hecrl.pdf"
+    },
+    {
+      "id": "06_scorer",
+      "title": "Stackelberg Coupling of Online Representation Learning and Reinforcement Learning",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/050f729db878738a9d44d4a7f995bf36-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/050f729db878738a9d44d4a7f995bf36-Paper-Conference.pdf",
+      "reading_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/050f729db878738a9d44d4a7f995bf36-Paper-Conference.pdf",
+      "reading_version": "ICLR 2026 proceedings PDF; preferred over earlier arXiv version",
+      "setting": "Online value-based RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "4 Stackelberg Coupled Representation and Reinforcement Learning",
+        "5 Experiments",
+        "6 Conclusion"
+      ],
+      "pdf_filename": "06_scorer.pdf"
+    },
+    {
+      "id": "07_ego_foresight",
+      "title": "Ego-Foresight: Self-supervised Learning of Agent-Aware Representations for Improved RL",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/7504142a20a3e1fe9dd7de42f475828c-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/7504142a20a3e1fe9dd7de42f475828c-Paper-Conference.pdf",
+      "reading_url": "https://arxiv.org/html/2407.01570v4",
+      "reading_version": "Author manuscript, arXiv v4 (2026-04-01); acceptance verified separately",
+      "setting": "Online visual RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "3 Approach",
+        "4 Experiments & Results",
+        "6 Conclusions"
+      ],
+      "pdf_filename": "07_ego_foresight.pdf"
+    },
+    {
+      "id": "08_spectral_bellman",
+      "title": "Spectral Bellman Method: Unifying Representation and Exploration in RL",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/58a5aafe8df63a20a7f6d7840100067c-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/58a5aafe8df63a20a7f6d7840100067c-Paper-Conference.pdf",
+      "reading_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/58a5aafe8df63a20a7f6d7840100067c-Paper-Conference.pdf",
+      "reading_version": "ICLR 2026 proceedings PDF",
+      "setting": "Online value-based RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "3 Spectral Bellman Method",
+        "4 Q-learning with SBM",
+        "5 Experiments",
+        "7 Conclusion"
+      ],
+      "pdf_filename": "08_spectral_bellman.pdf"
+    },
+    {
+      "id": "09_qflex",
+      "title": "Scalable Exploration for High-Dimensional Continuous Control via Value-Guided Flow",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/5a05d477fef5a43c805d3377700efa40-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/5a05d477fef5a43c805d3377700efa40-Paper-Conference.pdf",
+      "reading_url": "https://arxiv.org/html/2601.19707v1",
+      "reading_version": "Author manuscript, arXiv v1 (2026-01-27); acceptance verified separately",
+      "setting": "Online continuous-control RL",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "4 High-dimensional exploration diagnosis",
+        "5 Q-guided flow policy",
+        "6 Experiment",
+        "7 Conclusion"
+      ],
+      "pdf_filename": "09_qflex.pdf"
+    },
+    {
+      "id": "10_identifiable_skills",
+      "title": "Skill Learning via Policy Diversity Yields Identifiable Representations for Reinforcement Learning",
+      "conference": "ICLR 2026",
+      "track": "Conference",
+      "landing_url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/247a729f6b08f91a9b27de6d8e38980b-Abstract-Conference.html",
+      "pdf_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/247a729f6b08f91a9b27de6d8e38980b-Paper-Conference.pdf",
+      "reading_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/247a729f6b08f91a9b27de6d8e38980b-Paper-Conference.pdf",
+      "reading_version": "ICLR 2026 proceedings PDF",
+      "setting": "Skill learning and representation identifiability",
+      "sections_examined": [
+        "Abstract",
+        "1 Introduction",
+        "4 Identifiability analysis",
+        "5 Experiments",
+        "6 Discussion"
+      ],
+      "pdf_filename": "10_identifiable_skills.pdf"
+    }
+  ]
+}

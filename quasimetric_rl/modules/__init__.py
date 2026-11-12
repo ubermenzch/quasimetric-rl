@@ -6,6 +6,7 @@ import attrs
 import torch
 
 from . import actor, quasimetric_critic, gcrl_baselines
+from .actor.model import RAW_ACTOR_INPUT_MODES
 from . import goal_set_distance as goal_set_distance_module
 from .quasimetric_critic.models.encoder import SplitEncoder
 
@@ -29,15 +30,20 @@ class QRLAgent(Module):
         self.critics = torch.nn.ModuleList(critics)
         self.add_module('goal_set_distance', goal_set_distance)
         self.goal_set_dims = goal_set_dims
+        self.goal_marker_dims = None
 
     def act(self, obs: torch.Tensor, goal: torch.Tensor) -> torch.distributions.Distribution:
         if self.actor is None:
             raise RuntimeError("This agent has no actor.")
+        if self.goal_marker_dims is not None:
+            from .goal_marker import append_real_indicator, make_goal_marker
+            obs = append_real_indicator(obs)
+            goal = make_goal_marker(append_real_indicator(goal), self.goal_marker_dims)
         if self.goal_set_dims is not None:
             padded_goal = torch.zeros_like(goal)
             padded_goal[..., list(self.goal_set_dims)] = goal[..., list(self.goal_set_dims)]
             goal = padded_goal
-        if self.actor.input_mode == 'raw':
+        if self.actor.input_mode in RAW_ACTOR_INPUT_MODES:
             return self.actor(obs, goal)
         if self.actor.input_mode not in ('latent', 'split_latent'):
             raise ValueError(f"Unknown actor input_mode: {self.actor.input_mode!r}")
@@ -236,12 +242,13 @@ class QRLConf:
         default=None,
         validator=attrs.validators.optional(
             attrs.validators.in_((
-                'QRL-S', 'QRL-M', 'QRL-L', 'QRL-XL', 'QRL-XXL', 'QRL-XXXL',
-                'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L', 'GO-QRL-L-Residual',
-                'GO-QRL-XL',
-                'GO-QRL-XXL', 'GO-QRL-XXXL',
-                'CQRL-S', 'CQRL-M', 'CQRL-L', 'CQRL-L-Residual',
+            'QRL-S', 'QRL-M', 'QRL-L', 'QRL-L-AQRLBackbone',
+            'QRL-XL', 'QRL-XXL', 'QRL-XXXL',
+                'CQRL-S', 'CQRL-M', 'CQRL-M-Residual', 'CQRL-L', 'CQRL-L-Residual',
                 'CQRL-XL', 'CQRL-XXL', 'CQRL-XXXL',
+                # Accepted only when loading pre-CQRL configs/checkpoints.
+                'GO-QRL-S', 'GO-QRL-M', 'GO-QRL-L', 'GO-QRL-L-Residual',
+                'GO-QRL-XL', 'GO-QRL-XXL', 'GO-QRL-XXXL',
                 'TD-InfoNCE-M', 'TD-InfoNCE-L',
                 'CRL-M', 'CRL-L',
                 'GCSL-M', 'GCSL-L', 'GCSL-L-Pusher',
@@ -310,6 +317,11 @@ class QRLConf:
             )
         if actor_input_mode == 'split_latent' and encoder_conf.kind != 'split':
             raise ValueError('agent.actor.model.input_mode=split_latent requires encoder.kind=split')
+        if self.actor is not None and self.actor.losses.min_dist.replay_goal_candidates:
+            if (self.num_critics != 1 or encoder_conf.kind != 'split'
+                    or actor_input_mode != 'split_latent' or self.goal_set_distance.enabled):
+                raise ValueError('Replay goal selection requires one split critic, '
+                                 'a split_latent actor, and no goal-set objective')
         if encoder_conf.kind == 'split' and self.goal_set_distance.enabled:
             raise ValueError('SplitEncoder cannot be combined with GoalSetDistance')
         if latent_goal_mode != 'none':

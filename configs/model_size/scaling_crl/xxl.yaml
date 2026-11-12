@@ -1,4 +1,4 @@
-# Scaling-CRL-XXL: official 32-layer residual architecture at GO-QRL-XXL capacity.
+# Scaling-CRL-XXL: official 32-layer residual architecture at CQRL-XXL capacity.
 model_size: Scaling-CRL-XXL
 baselines:
   scaling_crl:

@@ -7,8 +7,11 @@ the original online protocol and its previously generated experiment matrices.
 For the extended DMC adapters, point-mass and dog fetch use fixed backend
 world-frame targets, and ball-in-cup uses a fixed zero goal in the moving cup
 frame. Stacker selects the box nearest the fixed episode target as its achieved
-goal and uses repository-defined `reward >= 0.95` success semantics because
-dm_control does not expose a native binary success signal for that task.
+goal. Because dm_control does not expose a native binary success signal for
+that task, this repository defines success as box closeness of at least `0.95`
+under dm_control's native tolerance function. The native shaped reward is still
+returned, but its additional hand-clearance factor is not part of binary goal
+attainment.
 
 The online replay collector requires fixed-length episodes and dictionary
 observations with same-shaped `observation`, `achieved_goal`, and
@@ -34,7 +37,7 @@ be used by both QRL and vector-observation CQRL agents.
 | `online_maze` | `maze2d-medium` | 600 | `[0,1]` | D4RL Maze2D v1 |
 | `online_maze` | `maze2d-large` | 800 | `[0,1]` | D4RL Maze2D v1 |
 
-These dimensions define task success and GO-QRL's task-goal branch. They are
+These dimensions define task success and CQRL's task-goal branch. They are
 not a universal conditioning projection for the reference baselines. In the
 three Fetch object-manipulation tasks, TD-InfoNCE and C-Learning condition on the
 full state, and GCSL conditions on gripper plus object position. Original
@@ -60,10 +63,10 @@ source tools/qrl_env.sh
   keep_only_latest_checkpoint=false
 ```
 
-## GO-QRL
+## CQRL
 
 The online entry point automatically obtains `encoder.goal_dims` from the
-selected environment. The following runs GO-QRL+Max4+LN+RMSG with four steps
+selected environment. The following runs CQRL+Max4+LN+RMSG with four steps
 of RMS-normalized latent-goal gradient ascent:
 
 ```bash
@@ -71,7 +74,7 @@ source tools/qrl_env.sh
 .venv/bin/python -m online.main \
   env.kind=dmc \
   env.name=reacher_easy \
-  +go_qrl_model_size=m \
+  +cqrl_model_size=m \
   agent.quasimetric_critic.model.encoder.branch_normalization=layernorm \
   agent.actor.losses.min_dist.latent_goal_mode=max \
   agent.actor.losses.min_dist.latent_goal_steps=4 \
@@ -90,7 +93,7 @@ source tools/qrl_env.sh
 ```
 
 Use `agent.actor.losses.min_dist.latent_goal_mode=min` for
-GO-QRL+Min4+LN+RMSG. Basic GO-QRL uses `branch_normalization=none` and
+CQRL+Min4+LN+RMSG. Basic CQRL uses `branch_normalization=none` and
 `latent_goal_optim=sgd`; no current scheme uses residual search. An explicit
 `encoder.goal_dims` remains available as an override.
 
@@ -153,8 +156,8 @@ Queue tasks still use `mode=online`. Since the queue defaults online tasks to
 The complete 5-scheme x 5-seed x 11-environment M-size matrix is generated in
 `configs/qrl_tasks_online_goal_envs_5variants_5seeds_200k.tsv` and appended to
 the active queue by `tools/generate_online_goal_env_tasks.py`. The schemes are
-Base, GO-QRL+Max4, GO-QRL+Min4, GO-QRL+Max4+LN+RMSG, and
-GO-QRL+Min4+LN+RMSG.
+Base, CQRL+Max4, CQRL+Min4, CQRL+Max4+LN+RMSG, and
+CQRL+Min4+LN+RMSG.
 
 TD-InfoNCE, CRL, GCSL, and C-Learning use the same online collection,
 checkpoint validation, and best-checkpoint test protocol. Their implementation

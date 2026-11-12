@@ -33,12 +33,20 @@ class BatchData(TensorCollectionAttrsMixin):  # TensorCollectionAttrsMixin has s
     timeouts: torch.Tensor
 
     future_observations: torch.Tensor  # sampled!
+    # Sampling metadata only; none of these fields enter a learning objective.
+    future_steps: Optional[torch.Tensor] = None
+    replay_episode_indices: Optional[torch.Tensor] = None
+    replay_timesteps: Optional[torch.Tensor] = None
 
     # H input state frames followed by the final prediction target. The final
     # input frame is the sampled current state; earlier frames are its history.
     history_observations: Optional[torch.Tensor] = None  # [B, H + 1, *obs_shape]
     history_actions: Optional[torch.Tensor] = None  # [B, H, *action_shape]
     history_mask: Optional[torch.Tensor] = None  # [B, H], True for valid in-episode transitions
+
+    # Synthetic goal-set edges, present only for the QRL marker baseline.
+    goal_marker_sources: Optional[torch.Tensor] = None
+    goal_marker_targets: Optional[torch.Tensor] = None
 
     @property
     def device(self) -> torch.device:
@@ -405,6 +413,24 @@ class Dataset:
             grid['count'] = coordinates.shape[0]
         return grid
 
+    def sample_observation_reference(self, *, num_samples: int, seed: int,
+                                     device=None) -> torch.Tensor:
+        """Uniform replay reference sample without replacing or editing states.
+
+        Use a separate generator so diagnostics do not change training samples.
+        This is a sampled reference bank, not the entire replay buffer.
+        """
+        available = self.num_observations_available
+        if available <= 0 or num_samples <= 0:
+            raise ValueError('A replay reference requires available states and a positive size')
+        observations = self.raw_data.all_observations[:available]
+        generator = torch.Generator(device=observations.device)
+        generator.manual_seed(int(seed))
+        index = torch.randperm(available, generator=generator,
+                               device=observations.device)[:min(num_samples, available)]
+        reference = observations.index_select(0, index)
+        return reference.to(device=device) if device is not None else reference
+
     def sample_goal_conditioned_observations(
             self, raw_goal_states: torch.Tensor, *, goal_dims: Tuple[int, ...],
             num_samples: int, radius: float, seed: int,
@@ -570,6 +596,9 @@ class Dataset:
             actions=self.raw_data.actions[indices],
             next_observations=nobs,
             future_observations=future_observations,
+            future_steps=deltas + 1,
+            replay_episode_indices=eindices,
+            replay_timesteps=tindices,
             history_observations=history_observations,
             history_actions=history_actions,
             history_mask=history_mask,

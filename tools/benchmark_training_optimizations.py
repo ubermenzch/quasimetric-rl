@@ -34,7 +34,7 @@ if Path(sys.prefix).resolve() != VENV_ROOT.resolve():
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.generate_go_qrl_hybrid_scale_tasks import (  # noqa: E402
+from tools.generate_cqrl_hybrid_scale_tasks import (  # noqa: E402
     extra_arg_map,
     generate_all_tasks,
     task_scale,

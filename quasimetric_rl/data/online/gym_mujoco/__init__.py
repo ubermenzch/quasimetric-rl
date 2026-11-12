@@ -175,7 +175,11 @@ class GymMujocoGoalEnv(gym.Env):
         raw_observation, _ = self._backend_reset()
         self._elapsed_steps = 0
         self._goal_values = self._sample_goal()
-        return self._pack(self._state(raw_observation))
+        state = self._state(raw_observation)
+        self.initial_is_success = bool(np.linalg.norm(
+            state[list(self.goal_dims)] - self._goal_values
+        ) < self._success_radius())
+        return self._pack(state)
 
     def step(self, action):
         result = self._env.step(np.asarray(action, dtype=self._env.action_space.dtype))

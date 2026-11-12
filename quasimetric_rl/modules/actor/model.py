@@ -12,7 +12,8 @@ from ...data.env_spec.input_encoding import InputEncoding
 from ...data.env_spec.act_distn import ActionOutputConverter
 
 
-ACTOR_INPUT_MODES = ('raw', 'latent', 'split_latent')
+RAW_ACTOR_INPUT_MODES = ('raw', 'masked', 'goal_only')
+ACTOR_INPUT_MODES = (*RAW_ACTOR_INPUT_MODES, 'latent', 'split_latent')
 
 
 class Actor(nn.Module):
@@ -30,6 +31,9 @@ class Actor(nn.Module):
         input_mode: str = attrs.field(
             default='raw', validator=attrs.validators.in_(ACTOR_INPUT_MODES)
         )
+        goal_dims: Optional[Tuple[int, ...]] = attrs.field(
+            default=None, converter=lambda dims: None if dims is None else tuple(dims),
+        )
 
         def make(
                 self, *, env_spec: EnvSpec, latent_size: Optional[int] = None,
@@ -40,6 +44,7 @@ class Actor(nn.Module):
                 input_mode=self.input_mode,
                 latent_size=latent_size,
                 goal_latent_size=goal_latent_size,
+                goal_dims=self.goal_dims,
                 mlp_kind=self.mlp_kind,
                 residual_block_size=self.residual_block_size,
             )
@@ -54,7 +59,8 @@ class Actor(nn.Module):
             self, *, env_spec: EnvSpec, arch: Tuple[int, ...],
             input_mode: str, latent_size: Optional[int] = None,
             goal_latent_size: Optional[int] = None, mlp_kind: str = 'plain',
-            residual_block_size: int = 4, **kwargs):
+            residual_block_size: int = 4,
+            goal_dims: Optional[Tuple[int, ...]] = None, **kwargs):
         super().__init__(**kwargs)
         self.observation_shape = env_spec.observation_shape
         self.input_mode = input_mode
@@ -63,6 +69,21 @@ class Actor(nn.Module):
         self.action_output = env_spec.make_action_output_distn()
         if input_mode == 'raw':
             backbone_input_size = self.observation_encoding.output_size * 2  # add goal
+        elif input_mode in ('masked', 'goal_only'):
+            if len(self.observation_shape) != 1:
+                raise ValueError('Masked and goal-only actors require vector states')
+            state_size = self.observation_shape[0]
+            if (not goal_dims or len(set(goal_dims)) != len(goal_dims)
+                    or min(goal_dims) < 0 or max(goal_dims) >= state_size):
+                raise ValueError('Masked and goal-only actors require valid goal_dims')
+            self.goal_dims = tuple(goal_dims)
+            mask = torch.zeros(state_size)
+            mask[list(self.goal_dims)] = 1
+            self.register_buffer('goal_mask', mask, persistent=False)
+            backbone_input_size = (
+                3 * state_size if input_mode == 'masked'
+                else state_size + len(self.goal_dims)
+            )
         elif input_mode in ('latent', 'split_latent'):
             if latent_size is None:
                 raise ValueError(f"{input_mode} actor input_mode requires latent_size")
@@ -89,6 +110,14 @@ class Actor(nn.Module):
         if self.input_mode == 'raw':
             og = torch.stack([o, g], dim=-len(self.observation_shape) - 1)
             actor_input = self.observation_encoding(og).flatten(-2, -1)
+        elif self.input_mode == 'masked':
+            # Apply the same goal transform during training and inference.
+            # torch.where also removes nonfinite values in unspecified slots.
+            mask = self.goal_mask.to(dtype=g.dtype).expand_as(g)
+            masked_goal = torch.where(mask.bool(), g, torch.zeros_like(g))
+            actor_input = torch.cat([o, masked_goal, mask], dim=-1)
+        elif self.input_mode == 'goal_only':
+            actor_input = torch.cat([o, g[..., list(self.goal_dims)]], dim=-1)
         else:
             actor_input = torch.cat([o, g], dim=-1)
         features = self.backbone(actor_input)

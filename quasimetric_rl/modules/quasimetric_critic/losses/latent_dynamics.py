@@ -59,6 +59,12 @@ class LatentDynamicsLoss(CriticLossBase):
         if self.distance == 'iqe':
             return sq_dists
         if self.distance == 'iqe_mse':
+            # Disabled supervision must not propagate 0 * inf/NaN when its
+            # diagnostic error diverges (in particular in IQE-only ablations).
+            if self.mse_weight == 0:
+                return self.iqe_weight * sq_dists
+            if self.iqe_weight == 0:
+                return self.mse_weight * mse
             return self.iqe_weight * sq_dists + self.mse_weight * mse
         raise ValueError(f'unknown latent dynamics distance: {self.distance!r}')
 

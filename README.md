@@ -102,7 +102,7 @@ To reproduce the online `gcrl`  experiments in paper, you can use commands simil
 
 Additional goal-conditioned Gym MuJoCo and DeepMind Control environments are
 listed in [`docs/ONLINE_GOAL_ENVS.md`](docs/ONLINE_GOAL_ENVS.md), including the
-goal dimensions required by GO-QRL agents.
+goal dimensions required by NQRL agents.
 Reward-free TD-InfoNCE, CRL, Scaling-CRL, GCSL, and C-Learning methods are described
 in [`docs/GCRL_BASELINES.md`](docs/GCRL_BASELINES.md).
 

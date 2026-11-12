@@ -92,6 +92,9 @@ class OnlineMazeGoalEnv(gym.Env):
         state = self._state(self._env.reset())
         self._goal_values = self._sample_nontrivial_goal(state)
         self._elapsed_steps = 0
+        self.initial_is_success = bool(np.linalg.norm(
+            state[list(self.goal_dims)] - self._goal_values
+        ) <= SUCCESS_RADIUS)
         return self._pack(state)
 
     def step(self, action):

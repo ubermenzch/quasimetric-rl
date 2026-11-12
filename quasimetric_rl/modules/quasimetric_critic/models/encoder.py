@@ -59,12 +59,15 @@ class Encoder(nn.Module):
         min_goal_parameter_ratio: float = attrs.field(
             default=0.125, validator=attrs.validators.gt(0),
         )
+        split_max_relative_budget_error: float = attrs.field(
+            default=0.0025, validator=attrs.validators.gt(0),
+        )
         branch_normalization: str = attrs.field(
             default='none',
             validator=attrs.validators.in_(SPLIT_BRANCH_NORMALIZATIONS),
         )
 
-        def resolve_go_qrl_branches(self, *, state_dim: int, goal_dim: int):
+        def resolve_cqrl_branches(self, *, state_dim: int, goal_dim: int):
             """Resolve this preset's concrete branch widths for one task."""
             if self.kind != 'split' or self.split_parameterization == 'manual':
                 return None
@@ -72,13 +75,14 @@ class Encoder(nn.Module):
                 raise ValueError(
                     f'Expected 0 < goal_dim < state_dim, got {goal_dim}, {state_dim}'
                 )
-            from ....model_size import match_go_qrl_split_encoder
-            plan = match_go_qrl_split_encoder(
+            from ....model_size import match_cqrl_split_encoder
+            plan = match_cqrl_split_encoder(
                 state_dim=state_dim,
                 goal_dim=goal_dim,
                 latent_size=self.latent_size,
                 reference_arch=self.arch,
                 min_goal_ratio=self.min_goal_parameter_ratio,
+                max_relative_budget_error=self.split_max_relative_budget_error,
                 mlp_kind=self.mlp_kind,
                 residual_block_size=self.residual_block_size,
             )
@@ -88,6 +92,13 @@ class Encoder(nn.Module):
             self.non_goal_latent_size = plan.non_goal_latent_size
             return plan
 
+        def resolve_go_qrl_branches(self, *, state_dim: int, goal_dim: int):
+            """Compatibility alias for pre-CQRL callers."""
+            return self.resolve_cqrl_branches(
+                state_dim=state_dim,
+                goal_dim=goal_dim,
+            )
+
         def resolve_split_parameterization(self, *, env_spec: EnvSpec):
             if self.kind != 'split' or self.split_parameterization == 'manual':
                 return None
@@ -95,9 +106,9 @@ class Encoder(nn.Module):
                 raise ValueError('SplitEncoder requires encoder.goal_dims')
             if len(env_spec.observation_shape) != 1:
                 raise ValueError(
-                    'Automatic GO-QRL branch matching requires vector observations'
+                    'Automatic CQRL branch matching requires vector observations'
                 )
-            return self.resolve_go_qrl_branches(
+            return self.resolve_cqrl_branches(
                 state_dim=int(env_spec.observation_shape[0]),
                 goal_dim=len(self.goal_dims),
             )

@@ -14,9 +14,10 @@ from pathlib import Path
 import hydra
 import hydra.types
 import hydra.core.config_store
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 import torch
+from tools.rebuttal_diagnostics import RunDiagnostics
 import torch.backends.cudnn
 import torch.multiprocessing
 
@@ -30,6 +31,7 @@ from quasimetric_rl.data.base import GOAL_SET_DIMS_REGISTRY
 from quasimetric_rl.model_size import register_model_size_presets
 
 from .trainer import Trainer, InteractionConf, TrainingOptimizationsConf
+from .dynamics_diagnostics import DynamicsDiagnostics, DynamicsDiagnosticsConf
 
 
 class TrainingInterrupted(Exception):
@@ -208,6 +210,7 @@ class Conf(BaseConf):
     batch_size: int = attrs.field(default=256, validator=attrs.validators.gt(0))
     interaction: InteractionConf = InteractionConf()
     training_optimizations: TrainingOptimizationsConf = TrainingOptimizationsConf()
+    dynamics_diagnostics: DynamicsDiagnosticsConf = DynamicsDiagnosticsConf()
 
     log_steps: int = attrs.field(default=250, validator=attrs.validators.gt(0))
     eval_steps: Optional[int] = attrs.field(
@@ -218,6 +221,8 @@ class Conf(BaseConf):
     keep_only_best_and_final_checkpoints: bool = False
     save_replay_buffer: bool = True
     save_final_replay_buffer: bool = True
+    logs_only: bool = False
+    collect_rebuttal_diagnostics: bool = False
     timing: utils.TimingConf = utils.TimingConf()
 
 
@@ -252,7 +257,7 @@ def summarize_evaluation(
         episode_length + 1,
         result.hitting_time + 1,
     )
-    return {
+    summary = {
         'split': split,
         'seed': int(seed),
         'seed_end': int(seed) + num_episodes - 1,
@@ -262,8 +267,45 @@ def summarize_evaluation(
         'success_count': success_count,
         'succ_rate': success_count / num_episodes,
         'hitting_time': hitting_time.to(torch.float64).mean().item(),
+        'success_state_step_fraction': result.timestep_is_success.to(
+            torch.float64,
+        ).mean(dim=-1).mean().item(),
+        'successful_episode_first_arrival_steps': (
+            (result.hitting_time[result.is_success] + 1).to(torch.float64).mean().item()
+            if success_count else None
+        ),
         'epi_return': result.episode_return.to(torch.float64).mean().item(),
     }
+    arrival_mean = summary['successful_episode_first_arrival_steps']
+    valid_seed = success_count > 0 and arrival_mean > 1
+    summary.update(
+        first_arrival_filter='seed_mean_above_one',
+        first_arrival_seed_valid=valid_seed,
+        first_step_success_count=int((result.is_success & (result.hitting_time == 0)).sum().item()),
+        valid_success_count=success_count if valid_seed else 0,
+        valid_successful_episode_first_arrival_steps=arrival_mean if valid_seed else None,
+    )
+    initial = getattr(result, 'initial_is_success', None)
+    if initial is not None:
+        if initial.dtype != torch.bool or initial.shape != result.is_success.shape:
+            raise ValueError('Initial success flags must match the evaluated episodes')
+        summary['initial_success_count'] = int(initial.sum().item())
+    distance = getattr(result, 'timestep_goal_distance', None)
+    if distance is not None:
+        summary.update(
+            initial_goal_distance=distance[:, 0].double().mean().item(),
+            final_goal_distance=distance[:, -1].double().mean().item(),
+            minimum_goal_distance=distance[:, 1:].amin(-1).double().mean().item(),
+            mean_goal_distance=distance[:, 1:].double().mean().item(),
+            final_success_rate=result.timestep_is_success[:, -1].double().mean().item(),
+        )
+    reference_distance = getattr(result, 'reference_final_goal_distance', None)
+    if reference_distance is not None:
+        summary.update(
+            reference_final_goal_distance=reference_distance.double().mean().item(),
+            reference_final_success_rate=result.reference_final_is_success.double().mean().item(),
+        )
+    return summary
 
 
 def validation_sort_key(summary: Mapping[str, Any]) -> tuple:
@@ -297,6 +339,24 @@ def select_best_validation(summaries: Sequence[Mapping[str, Any]]) -> dict:
     if not candidates:
         raise RuntimeError('No checkpoint-bound validation results are available')
     return dict(max(candidates, key=validation_sort_key))
+
+
+class InMemoryBestAgent:
+    """Keep the usual validation-selected model without writing a checkpoint."""
+    def __init__(self):
+        self.state = None
+        self.validation = None
+
+    def consider(self, agent, summary):
+        if validation_improves(summary, self.validation):
+            self.state = {key: value.detach().cpu().clone()
+                          for key, value in agent.state_dict().items()}
+            self.validation = dict(summary)
+
+    def load(self, agent):
+        if self.state is None:
+            raise RuntimeError('No validation-selected model is available in memory')
+        agent.load_state_dict(self.state)
 
 
 def deployment_agent_checkpoint_state(
@@ -525,6 +585,8 @@ def retain_only_online_best_and_final_checkpoints(
 @hydra.main(version_base=None, config_name="config")
 def train(dict_cfg: DictConfig):
     cfg: Conf = Conf.from_DictConfig(dict_cfg)
+    if cfg.logs_only and cfg.resume_if_possible:
+        raise ValueError('logs_only training cannot resume without checkpoints')
     resolve_split_encoder_goal_dims(cfg)
     if cfg.eval_steps is not None and cfg.eval_steps != cfg.save_steps:
         raise ValueError(
@@ -537,6 +599,10 @@ def train(dict_cfg: DictConfig):
             "Online phased training needs an explicit replay/collection policy."
         )
     writer = cfg.setup_for_experiment()  # checking & setup logging
+    diagnostics = (
+        RunDiagnostics(cfg.output_dir, protocol=OmegaConf.to_container(dict_cfg, resolve=True))
+        if getattr(cfg, 'collect_rebuttal_diagnostics', False) else None
+    )
     completion_marker_existed = os.path.exists(cfg.completion_file)
     profiler = cfg.timing.make(output_dir=cfg.output_dir, device=cfg.device.make())
 
@@ -555,9 +621,19 @@ def train(dict_cfg: DictConfig):
             candidate_seed=cfg.seed,
         )
     requested_total_env_steps = trainer.total_env_steps
+    dynamics_diagnostics = None
 
     val_results: List[dict] = []
     val_summaries: List[dict] = []
+    memory_best = InMemoryBestAgent()
+    if diagnostics is not None:
+        diagnostics.record_runtime(trainer)
+    if diagnostics is not None and getattr(trainer.losses, 'actor_loss', None) is not None:
+        trainer.losses.actor_loss.min_dist.set_diagnostic_sink(
+            lambda kind, update, arrays: diagnostics.record_probe(
+                kind, update, arrays, env_steps=int(trainer.replay.num_transitions_realized),
+            )
+        )
     step_counter = StepsCounter(
         alert_intervals=dict(
             log=cfg.log_steps,
@@ -574,6 +650,8 @@ def train(dict_cfg: DictConfig):
         return desc
 
     def save(env_steps, optim_steps, *, suffix=None, extra=None):
+        if cfg.logs_only:
+            return None
         with profiler.record('checkpoint/save'):
             desc = checkpoint_desc(env_steps, optim_steps, suffix)
             utils.mkdir(cfg.output_dir)
@@ -724,6 +802,11 @@ def train(dict_cfg: DictConfig):
             f.write('\n')
         os.replace(tmppath, path)
 
+    if cfg.env.kind == 'paper_validation':
+        protocol_metadata = trainer.replay.env.protocol_metadata()
+        if protocol_metadata is not None:
+            write_json(os.path.join(cfg.output_dir, 'paper_validation_protocol.json'), protocol_metadata)
+
     def eval(
             env_steps, optim_steps, *, split, seed, num_episodes,
             summary_extra=None):
@@ -738,6 +821,20 @@ def train(dict_cfg: DictConfig):
             episode_length=trainer.replay.episode_length,
         )
         summary.update(summary_extra or {})
+        if diagnostics is not None:
+            diagnostics.record_evaluation(result, summary)
+        if dynamics_diagnostics is not None:
+            dynamics_diagnostics.save_evaluation(result, summary)
+        if split == 'test':
+            write_json(os.path.join(cfg.output_dir, 'test_episodes.json'), {
+                'test_summary': summary,
+                'initial_is_success': (result.initial_is_success.tolist()
+                                       if result.initial_is_success is not None else None),
+                'first_arrival_steps': [
+                    int(step) + 1 if int(step) >= 0 else None
+                    for step in result.hitting_time.tolist()
+                ],
+            })
         raw_result = dict(
             env_steps=env_steps,
             optim_steps=optim_steps,
@@ -750,6 +847,14 @@ def train(dict_cfg: DictConfig):
             val_results.append(raw_result)
         for key in ('succ_rate', 'hitting_time', 'epi_return'):
             writer.add_scalar(f'{split}/{key}', summary[key], env_steps)
+        for key in ('success_state_step_fraction', 'successful_episode_first_arrival_steps',
+                    'initial_success_count', 'first_step_success_count', 'valid_success_count',
+                    'valid_successful_episode_first_arrival_steps',
+                    'initial_goal_distance', 'final_goal_distance',
+                    'minimum_goal_distance', 'mean_goal_distance', 'final_success_rate',
+                    'reference_final_goal_distance', 'reference_final_success_rate'):
+            if summary.get(key) is not None:
+                writer.add_scalar(f'{split}/{key}', summary[key], env_steps)
         log_name = 'eval.log' if split == 'validation' else 'test.log'
         with open(os.path.join(cfg.output_dir, log_name), 'a') as f:
             print(json.dumps(summary, sort_keys=True), file=f)
@@ -775,6 +880,13 @@ def train(dict_cfg: DictConfig):
                 else f'agent_checkpoint_{desc}.pth'
             ),
         }
+        if cfg.logs_only:
+            summary_extra.update(checkpoint='in_memory', agent_checkpoint='in_memory',
+                                 checkpoint_storage='logs_only')
+        if dynamics_diagnostics is not None:
+            summary_extra['dynamics_diagnostics'] = dynamics_diagnostics.record(
+                env_steps, optim_steps, checkpoint=True, writer=writer,
+            )
         previous_best = (
             select_best_validation(val_summaries)
             if val_summaries else None
@@ -787,9 +899,12 @@ def train(dict_cfg: DictConfig):
             num_episodes=trainer.num_eval_episodes,
             summary_extra=summary_extra,
         )
-        if cfg.keep_only_best_and_final_checkpoints:
+        if cfg.keep_only_best_and_final_checkpoints and not cfg.logs_only:
             summary = selected_best_validation_summary(summary)
         val_summaries.append(summary)
+        if cfg.logs_only:
+            memory_best.consider(trainer.agent, summary)
+            return None
         if not cfg.keep_only_best_and_final_checkpoints:
             utils.atomic_torch_save(
                 {
@@ -834,8 +949,11 @@ def train(dict_cfg: DictConfig):
             best = select_best_validation(val_summaries)
         if agent_path is None:
             agent_path = os.path.join(cfg.output_dir, best['agent_checkpoint'])
-        state = torch.load(agent_path, map_location='cpu', weights_only=False)
-        trainer.agent.load_state_dict(state['agent'])
+        if cfg.logs_only:
+            memory_best.load(trainer.agent)
+        else:
+            state = torch.load(agent_path, map_location='cpu', weights_only=False)
+            trainer.agent.load_state_dict(state['agent'])
         test_summary_extra = {
             'selected_checkpoint': best['checkpoint'],
             'selected_agent_checkpoint': best['agent_checkpoint'],
@@ -853,7 +971,9 @@ def train(dict_cfg: DictConfig):
         selected_path = os.path.join(
             cfg.output_dir, SELECTED_BEST_AGENT_FILENAME,
         )
-        if save_selected:
+        if cfg.logs_only:
+            selected_path = 'in_memory'
+        if save_selected and not cfg.logs_only:
             utils.atomic_torch_save(
                 {
                     'agent': trainer.agent.state_dict(),
@@ -912,8 +1032,17 @@ def train(dict_cfg: DictConfig):
     # Training loop
     optim_steps = start_optim_steps
     try:
+        if cfg.dynamics_diagnostics.enabled:
+            dynamics_diagnostics = DynamicsDiagnostics(
+                cfg.dynamics_diagnostics, trainer, cfg.output_dir,
+                start_env_steps=start_env_steps, start_optim_steps=start_optim_steps,
+                experiment_conf=cfg,
+            )
         if start_optim_steps == 0:
             profiler.log(writer=writer, step=0, step_name='env_steps', extra=dict(optim_steps=0))
+            if getattr(cfg.interaction, 'original_qrl_evaluation', False):
+                # Match the original source's pre-training validation at step 0.
+                validate_and_save(0, 0)
         if trainer.total_env_steps > 0:
             for local_optim_steps, (local_env_steps, next_iter_new_env_step, data, data_info) in enumerate(
                     trainer.iter_training_data(start_cycle_sample=next_cycle_sample), start=1):
@@ -925,6 +1054,8 @@ def train(dict_cfg: DictConfig):
                     iter_t0 = time.time()
                     train_info = trainer.train_step(data)
                     iter_time = time.time() - iter_t0
+                if dynamics_diagnostics is not None:
+                    dynamics_diagnostics.observe_training_step(train_info)
                 next_cycle_sample = int(data_info.get('cycle_sample', 0)) + 1
 
                 # bookkeep
@@ -932,15 +1063,24 @@ def train(dict_cfg: DictConfig):
                     continue  # just train more, only eval/log/save right before new env step
                 next_cycle_sample = trainer.num_samples_per_cycle
                 step_counter.update_to_then_record_alerts(env_steps)
+                if dynamics_diagnostics is not None:
+                    dynamics_diagnostics.finish_training_cycle(env_steps, optim_steps)
 
                 if step_counter.alerts.save:
                     validate_and_save(env_steps, optim_steps)
+                elif dynamics_diagnostics is not None:
+                    dynamics_diagnostics.record(env_steps, optim_steps, writer=writer)
 
                 if step_counter.alerts.log:
                     log_tensorboard(env_steps, data_info, 'data/')
                     log_tensorboard(env_steps, train_info, 'train_')
                     writer.add_scalar("train/iter_time", iter_time, env_steps)
                     writer.add_scalar("train/optim_steps", optim_steps, env_steps)
+                    if diagnostics is not None:
+                        diagnostics.record_training(env_steps, optim_steps,
+                                                    dict(train=train_info, data=data_info),
+                                                    iteration_seconds=iter_time,
+                                                    data=data, agent=trainer.agent)
                     profiler.log(writer=writer, step=env_steps, step_name='env_steps', extra=dict(optim_steps=optim_steps))
                 next_cycle_sample = 0
 
@@ -957,7 +1097,7 @@ def train(dict_cfg: DictConfig):
             validate_and_save(final_env_steps, optim_steps)
         final_checkpoint = None
         staged_final_checkpoint = None
-        if cfg.keep_only_best_and_final_checkpoints:
+        if cfg.keep_only_best_and_final_checkpoints and not cfg.logs_only:
             final_validation_summary = next(
                 summary for summary in val_summaries
                 if summary.get('env_steps') == final_env_steps
@@ -995,7 +1135,7 @@ def train(dict_cfg: DictConfig):
         else:
             evaluate_selected_best(final_env_steps, optim_steps)
         profiler.log(writer=writer, step=final_env_steps, step_name='env_steps', extra=dict(optim_steps=optim_steps))
-        if cfg.keep_only_best_and_final_checkpoints:
+        if cfg.keep_only_best_and_final_checkpoints and not cfg.logs_only:
             assert final_checkpoint is not None
             assert staged_final_checkpoint is not None
             retain_only_online_best_and_final_checkpoints(
@@ -1005,17 +1145,38 @@ def train(dict_cfg: DictConfig):
             )
             os.replace(staged_final_checkpoint, final_checkpoint)
             logging.info('Published final resumable checkpoint %s', final_checkpoint)
+        writer.flush()
         open(cfg.completion_file, 'a').close()
+        if diagnostics is not None:
+            diagnostics.finish('complete', env_steps=final_env_steps, optim_steps=optim_steps)
     except TrainingInterrupted as exc:
         env_steps = current_env_steps()
-        logging.warning(
-            f"Interrupted: {exc} at env_steps={env_steps} optim_steps={optim_steps}. "
-            "Discarding progress after the latest committed checkpoint."
+        recovery = (
+            'Checkpoint persistence is disabled; this run must restart from scratch.'
+            if cfg.logs_only else 'Discarding progress after the latest committed checkpoint.'
         )
+        logging.warning(
+            f"Interrupted: {exc} at env_steps={env_steps} optim_steps={optim_steps}. {recovery}"
+        )
+        if diagnostics is not None:
+            diagnostics.finish('interrupted', env_steps=env_steps, optim_steps=optim_steps,
+                               error=str(exc))
         raise SystemExit(130)
+    except Exception as exc:
+        if diagnostics is not None:
+            if 'data' in locals() and data is not None:
+                arrays = {field.name: getattr(data, field.name)
+                          for field in type(data).__attrs_attrs__
+                          if isinstance(getattr(data, field.name), torch.Tensor)}
+                diagnostics.record_probe('failure_batch', optim_steps, arrays,
+                                         env_steps=current_env_steps(), metadata={'error': str(exc)})
+            diagnostics.finish('failed', env_steps=current_env_steps(), optim_steps=optim_steps,
+                               error=f'{type(exc).__name__}: {exc}')
+        raise
     finally:
         signal.signal(signal.SIGTERM, old_sigterm)
         signal.signal(signal.SIGINT, old_sigint)
+        writer.close()
 
 
 if __name__ == '__main__':

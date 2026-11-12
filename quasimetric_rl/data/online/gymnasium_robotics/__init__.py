@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import gym
@@ -61,10 +62,9 @@ def _spec(
 
 
 TASK_SPECS = {
-    # Keep the requested v2 protocol exact. Gymnasium-Robotics 1.3.2 added a
-    # corrected v3 task, but silently substituting it would mix environment
-    # versions under one experiment name.
-    'HandReach-v2': _spec(
+    # v3 restores the configured initial hand pose before sampling goals. The
+    # v2 MuJoCo backend can reset to an all-zero pose and must not be used.
+    'HandReach-v3': _spec(
         episode_length=50,
         raw_goal_size=15,
         goal_encoding='vector',
@@ -183,10 +183,42 @@ def _make_backend(name: str):
             return gymnasium.make(backend_id, **kwargs), backend_id
         except Exception as exc:
             failures.append(f'{backend_id}: {exc}')
+    if name == 'HandReach-v3':
+        try:
+            return _make_hand_reach_v3_backport()
+        except Exception as exc:
+            failures.append(f'HandReach-v3-backport: {exc}')
     raise RuntimeError(
         f'Could not create Gymnasium-Robotics task {name!r}. Tried: '
         + '; '.join(failures)
     )
+
+
+def _make_hand_reach_v3_backport():
+    """Provide v3 reset semantics for an already-provisioned 1.3.1 stack."""
+    version = importlib.metadata.version('gymnasium-robotics')
+    if version != '1.3.1':
+        raise RuntimeError(
+            'the compatibility backend is restricted to gymnasium-robotics '
+            f'1.3.1, got {version}'
+        )
+
+    from gymnasium_robotics.envs.shadow_dexterous_hand.reach import (
+        MujocoHandReachEnv,
+    )
+
+    class HandReachV3Backport(MujocoHandReachEnv):
+        def _reset_sim(self):
+            self._mujoco.mj_resetData(self.model, self.data)
+            self.data.time = self.initial_time
+            self.data.qpos[:] = np.copy(self.initial_qpos)
+            self.data.qvel[:] = np.copy(self.initial_qvel)
+            if self.model.na != 0:
+                self.data.act[:] = None
+            self._mujoco.mj_forward(self.model, self.data)
+            return True
+
+    return HandReachV3Backport(reward_type='sparse'), 'HandReach-v3-backport'
 
 
 def _vector(value: Any, *, field: str) -> np.ndarray:
@@ -356,7 +388,35 @@ class GymnasiumRoboticsGoalEnv(gym.Env):
                     result = self._env.reset()
             else:
                 result = self._env.reset()
-        return unpack_reset_result(result)
+        raw_observation, info = unpack_reset_result(result)
+        if self.name == 'HandReach-v3' and self.backend_id != 'injected-test-backend':
+            self._validate_hand_reach_reset(raw_observation)
+        return raw_observation, info
+
+    def _validate_hand_reach_reset(self, raw_observation: Any) -> None:
+        backend = self.backend
+        state_errors = []
+        for field in ('qpos', 'qvel'):
+            actual = np.asarray(getattr(backend.data, field))
+            expected = np.asarray(getattr(backend, f'initial_{field}'))
+            if not np.allclose(actual, expected, rtol=0.0, atol=1e-10):
+                state_errors.append(
+                    f'{field} max error={float(np.max(np.abs(actual - expected))):.6g}'
+                )
+        if state_errors:
+            raise RuntimeError(
+                f'{self.backend_id} did not restore the HandReach initial state: '
+                + ', '.join(state_errors)
+            )
+        if not isinstance(raw_observation, dict) or 'achieved_goal' not in raw_observation:
+            raise RuntimeError(
+                f'{self.backend_id} did not return a HandReach achieved goal'
+            )
+        achieved_goal = np.asarray(raw_observation['achieved_goal'])
+        if np.allclose(achieved_goal, 0.0, rtol=0.0, atol=1e-8):
+            raise RuntimeError(
+                f'{self.backend_id} returned an all-zero HandReach achieved goal'
+            )
 
     def _state_and_goals(
             self, raw_observation: Any,
@@ -438,9 +498,15 @@ class GymnasiumRoboticsGoalEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options=None):
         if seed is not None:
             self.seed(seed)
-        raw_observation, _ = self._backend_reset(options=options)
+        raw_observation, info = self._backend_reset(options=options)
         self._elapsed_steps = 0
-        state, _, _, self._goal_values = self._state_and_goals(raw_observation)
+        state, raw_achieved, _, self._goal_values = self._state_and_goals(raw_observation)
+        can_check = any(key in info for key in ('is_success', 'success')) or callable(
+            getattr(self.backend, '_is_success', None)
+        )
+        self.initial_is_success = self._is_success(
+            raw_achieved, raw_observation['desired_goal'], info,
+        ) if can_check else None
         return self._pack(state)
 
     def _is_success(
